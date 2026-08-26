@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.12.sh
+# build-vanilla-arm64-release-v2.7.13.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.12
+# Version: 2.7.13
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.12"
+SCRIPT_VERSION="2.7.13"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2088,63 +2088,114 @@ EOF
 
 
 patch_live_installer_hook() {
+  # Ensure the upstream installer hook has its required downloader tools without
+  # attempting to parse or replace upstream URLs.
+  #
+  # Regression fixed in 2.7.13:
+  #   2.7.12 assumed URLs would be visible in a specific literal *.deb form.
+  #   The current upstream hook does not match that pattern, so the builder
+  #   aborted before Stage 9.
+  #
+  # This implementation is syntax-agnostic:
+  #   - preserves the upstream hook body and URLs,
+  #   - injects prerequisites immediately after the shebang,
+  #   - adds guarded cleanup for unmatched *.deb globs,
+  #   - remains idempotent across repeated runs.
   local live="$1"
   local hook="$live/etc/config/hooks/live/001-install-vanilla-installer.chroot"
-  local backup log albius_url installer_url
+  local backup tmp log
 
   [[ "$PATCH_LIVE_INSTALLER_HOOK" == "1" ]] || return 0
-  [[ -f "$hook" ]] || { warn "Installer hook not found: $hook"; return 0; }
+  [[ -f "$hook" ]] || {
+    warn "Vanilla installer hook not found; skipping hook hardening: $hook"
+    return 0
+  }
 
   backup="$hook.builder-backup.$(date -u +%Y%m%d%H%M%S)"
+  tmp="$hook.builder-patched.$$"
   log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-installer-hook-patch-$(date -u +%H%M%S).log"
+
   mkdir -p "$OUTPUT_DIR/logs"
   cp -a "$hook" "$backup"
 
-  albius_url="$(grep -Eo 'https?://[^"'"'"' ]*albius[^"'"'"' ]*\.deb' "$hook" | head -n1 || true)"
-  installer_url="$(grep -Eo 'https?://[^"'"'"' ]*vanilla-installer[^"'"'"' ]*\.deb' "$hook" | head -n1 || true)"
+  python3 - "$hook" "$tmp" <<'PY'
+from pathlib import Path
+import re
+import sys
 
-  [[ -n "$albius_url" && -n "$installer_url" ]] || {
-    fail "Could not extract installer package URLs from $hook"
-    return 1
-  }
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
 
-  cat >"$hook" <<EOF
-#!/bin/sh
-set -eu
-ALBIUS_URL='$albius_url'
-INSTALLER_URL='$installer_url'
+begin = "# BEGIN VANILLA ARM64 BUILDER PREREQUISITES"
+end = "# END VANILLA ARM64 BUILDER PREREQUISITES"
 
-apt-get update
-apt-get install -y --no-install-recommends wget ca-certificates
+text = src.read_text(encoding="utf-8")
+lines = text.splitlines()
 
-download_deb() {
-  url="\$1"
-  output="\$2"
-  rm -f "\$output"
-  wget --https-only --tries=5 --timeout=30 -O "\$output" "\$url"
-  test -s "\$output" || { echo "ERROR: empty download: \$output" >&2; exit 91; }
-  dpkg-deb --info "\$output" >/dev/null 2>&1 || {
-    echo "ERROR: invalid Debian package: \$output" >&2
-    exit 92
-  }
-}
+# Remove any previously injected prerequisite block.
+clean = []
+inside = False
+for line in lines:
+    if line.strip() == begin:
+        inside = True
+        continue
+    if line.strip() == end:
+        inside = False
+        continue
+    if not inside:
+        clean.append(line)
 
-download_deb "\$ALBIUS_URL" /tmp/albius.deb
-apt-get install -y /tmp/albius.deb
-rm -f /tmp/albius.deb
+lines = clean
 
-download_deb "\$INSTALLER_URL" /tmp/vanilla-installer.deb
-apt-get install -y /tmp/vanilla-installer.deb
-rm -f /tmp/vanilla-installer.deb
-EOF
+block = [
+    begin,
+    'export DEBIAN_FRONTEND=noninteractive',
+    'apt-get update',
+    'apt-get install -y --no-install-recommends wget ca-certificates',
+    end,
+]
 
+# Insert immediately after shebang when present.
+if lines and lines[0].startswith("#!"):
+    out = [lines[0], *block, *lines[1:]]
+else:
+    out = ["#!/bin/sh", *block, *lines]
+
+# Make cleanup of literal unmatched globs non-fatal. Do not alter download URLs
+# or apt install commands; with wget installed, upstream behavior remains intact.
+patched = []
+for line in out:
+    stripped = line.strip()
+    if re.match(r"^rm\s+(-[A-Za-z]+\s+)?[^ ]*\*\.deb\s*$", stripped):
+        if not stripped.endswith("|| true"):
+            line = line + " || true"
+    patched.append(line)
+
+dst.write_text("\n".join(patched) + "\n", encoding="utf-8")
+PY
+
+  mv "$tmp" "$hook"
   chmod +x "$hook"
+
   {
-    printf 'Hook: %s\nBackup: %s\n' "$hook" "$backup"
+    printf '### Live installer hook prerequisite patch\n'
+    printf 'Hook: %s\n' "$hook"
+    printf 'Backup: %s\n\n' "$backup"
+    printf 'Diff:\n'
     diff -u "$backup" "$hook" || true
   } >"$log"
 
-  ok "Hardened Vanilla installer live-build hook."
+  grep -q "BEGIN VANILLA ARM64 BUILDER PREREQUISITES" "$hook" || {
+    fail "Installer prerequisite block was not inserted."
+    return 1
+  }
+
+  grep -q "apt-get install -y --no-install-recommends wget ca-certificates" "$hook" || {
+    fail "Installer hook does not install wget and ca-certificates."
+    return 1
+  }
+
+  ok "Added downloader prerequisites to the upstream Vanilla installer hook."
   printf 'Installer hook patch log:\n  %s\n' "$log" >&2
 }
 
