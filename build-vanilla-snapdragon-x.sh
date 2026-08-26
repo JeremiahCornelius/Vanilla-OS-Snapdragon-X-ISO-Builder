@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.8.sh
+# build-vanilla-arm64-release-v2.4.9.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.8
+# Version: 2.4.9
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.8"
+SCRIPT_VERSION="2.4.9"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -89,10 +89,14 @@ command_failure_menu() {
   local choice
 
   fail "Command failed during stage ${CURRENT_STAGE}."
-  printf 'Command label: %s\n' "$label" >&2
-  printf 'Exit status:   %s\n' "$status" >&2
-  printf 'Working dir:   %s\n' "$workdir" >&2
-  printf 'Command log:   %s\n' "$log" >&2
+  printf 'Command label: %s
+' "$label" >&2
+  printf 'Exit status:   %s
+' "$status" >&2
+  printf 'Working dir:   %s
+' "$workdir" >&2
+  printf 'Command log:   %s
+' "$log" >&2
   print_failure_tail "$log"
 
   choice="$(menu "Build Command Failure
@@ -100,16 +104,22 @@ command_failure_menu() {
 The previous command failed. You can inspect the working directory and log before deciding whether to abort or retry." "1" \
     "1|Open an interactive shell in the failing working directory [RECOMMENDED]|Inspect recipe files, generated hooks, container state, and logs. Type 'exit' to return." \
     "2|Retry the failed command|Run the same command again after any manual corrections." \
-    "3|Abort build|Stop immediately and preserve logs/workspace for diagnosis.")"
+    "3|Run deep Vib diagnostics, then return to this menu|Use this when Vib exits with little or no output. Captures binary, plugin, recipe, runtime, and strace diagnostics." \
+    "4|Abort build|Stop immediately and preserve logs/workspace for diagnosis.")"
 
   case "$choice" in
-    1) printf '%s\n' "shell" ;;
-    2) printf '%s\n' "retry" ;;
-    3) printf '%s\n' "abort" ;;
-    *) printf '%s\n' "abort" ;;
+    1) printf '%s
+' "shell" ;;
+    2) printf '%s
+' "retry" ;;
+    3) printf '%s
+' "diagnose" ;;
+    4|*) printf '%s
+' "abort" ;;
   esac
   return 0
 }
+
 
 run_logged() {
   # Run a command with explicit per-command logging and failure diagnostics.
@@ -176,6 +186,13 @@ run_logged() {
         ;;
       retry)
         continue
+        ;;
+      diagnose)
+        if [[ "$label" == *"Vib"* || "$*" == *"vib"* ]]; then
+          vib_deep_diagnostics "$workdir" "$safe"
+        else
+          warn "Deep diagnostics are currently implemented for Vib commands only."
+        fi
         ;;
       abort|*)
         die "Build aborted after command failure. See log: $log"
@@ -701,7 +718,7 @@ check_dependencies() {
   fail "Missing required tools: ${missing[*]}"
   printf '\nSuggested Debian 13 packages for common tools:\n' >&2
   printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 podman docker.io xorriso genisoimage jq file rsync squashfs-tools gnupg zstd\n\n' >&2
+  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 podman docker.io xorriso genisoimage file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
   printf 'Additional builder requirement:\n' >&2
   printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
 
@@ -1364,6 +1381,80 @@ EOF
 }
 
 # ------------------------------- build --------------------------------
+
+vib_deep_diagnostics() {
+  local workdir="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-vib-deep-diagnostics-$(date -u +%H%M%S).log"
+  local old_errexit old_errtrace
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  LAST_COMMAND_LOG="$log"
+
+  info "Running deep Vib diagnostics for $label"
+  printf 'Deep diagnostic log: %s\n' "$log" >&2
+
+  case "$-" in *e*) old_errexit=1 ;; *) old_errexit=0 ;; esac
+  case "$-" in *E*) old_errtrace=1 ;; *) old_errtrace=0 ;; esac
+  trap - ERR
+  set +e
+  set +E
+
+  (
+    cd "$workdir" || exit 97
+    printf '### Deep Vib diagnostics for %s\n' "$label"
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### PWD: %s\n\n' "$workdir"
+
+    printf '## Vib binary\n'
+    command -v vib || true
+    ls -l "$(command -v vib)" 2>/dev/null || true
+    file "$(command -v vib)" 2>/dev/null || true
+    ldd "$(command -v vib)" 2>/dev/null || true
+    printf '\n'
+
+    printf '## Recipe header\n'
+    sed -n '1,160p' recipe.yml 2>/dev/null || true
+    printf '\n'
+
+    printf '## Plugin files\n'
+    find plugins -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null | sort || true
+    printf '\n'
+
+    printf '## Container runtimes\n'
+    command -v podman && podman --version || true
+    command -v docker && docker --version || true
+    printf '\n'
+
+    printf '## Direct vib execution\n'
+    vib build recipe.yml
+    printf '\nDirect exit status: %s\n\n' "$?"
+
+    printf '## Vib execution with debug-ish environment\n'
+    VIB_LOG_LEVEL=debug RUST_BACKTRACE=1 vib build recipe.yml
+    printf '\nDebug-env exit status: %s\n\n' "$?"
+
+    if command -v strace >/dev/null 2>&1; then
+      printf '## strace vib build, last 160 lines\n'
+      strace -f -o /tmp/vib-build.strace vib build recipe.yml
+      printf 'strace-wrapped exit status: %s\n\n' "$?"
+      tail -n 160 /tmp/vib-build.strace || true
+      printf '\n'
+    else
+      printf 'strace not installed; skipping syscall trace.\n'
+    fi
+
+    printf '## Files generated/changed in repo root after Vib attempts\n'
+    find . -maxdepth 2 -type f -printf '%TY-%Tm-%Td %TH:%TM %p %s bytes\n' | sort | tail -n 250 || true
+  ) >"$log" 2>&1
+
+  if [[ "$old_errtrace" -eq 1 ]]; then set -E; else set +E; fi
+  if [[ "$old_errexit" -eq 1 ]]; then set -e; else set +e; fi
+  trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
+
+  print_failure_tail "$log"
+  warn "Deep Vib diagnostics complete. Review: $log"
+}
 
 vib_preflight() {
   # Emit a detailed, command-log-friendly Vib diagnostic before invoking
