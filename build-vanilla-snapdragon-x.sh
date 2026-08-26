@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.1.sh
+# build-vanilla-arm64-release-v2.7.2.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.1
+# Version: 2.7.2
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.1"
+SCRIPT_VERSION="2.7.2"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2545,6 +2545,9 @@ run_vib_build_with_diagnostics() {
   local label="$1"
   local workdir="$2"
   local action
+  local safe
+
+  safe="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
 
   while true; do
     patch_known_unavailable_packages_before_vib "$workdir" "$safe"
