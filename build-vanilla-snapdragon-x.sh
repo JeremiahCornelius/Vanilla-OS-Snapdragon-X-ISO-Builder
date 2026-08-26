@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.6.sh
+# build-vanilla-arm64-release-v2.6.7.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.6
+# Version: 2.6.7
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.6"
+SCRIPT_VERSION="2.6.7"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -37,6 +37,7 @@ VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
 DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD:-auto}"  # auto|1|0
 PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
 RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK:-1}"
+PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -2602,7 +2603,7 @@ EOF
   printf 'Probe log: %s\n' "$probe_log" >&2
 
   set +e
-  podman image build --no-cache -t "local/${label}-includes-probe:$BUILD_DATE" "$probe_dir" >"$probe_log" 2>&1
+  podman image build $(podman_network_args) --no-cache -t "local/${label}-includes-probe:$BUILD_DATE" "$probe_dir" >"$probe_log" 2>&1
   status=$?
   set -e
 
@@ -2640,7 +2641,7 @@ RUN /bin/sh -c 'echo POST_ADD_SHELL_OK'
 EOF
 
   set +e
-  podman image build --no-cache -t "local/${label}-single-include-probe:$(date +%s)" "$probe_dir" >"$log" 2>&1
+  podman image build $(podman_network_args) --no-cache -t "local/${label}-single-include-probe:$(date +%s)" "$probe_dir" >"$log" 2>&1
   status=$?
   set -e
 
@@ -2779,14 +2780,132 @@ EOF
   return 0
 }
 
+
+podman_network_args() {
+  case "${PODMAN_BUILD_NETWORK,,}" in
+    host)
+      printf '%s\n' "--network=host"
+      ;;
+    default|"")
+      printf '%s\n' ""
+      ;;
+    none)
+      printf '%s\n' "--network=none"
+      ;;
+    *)
+      printf '%s\n' "--network=$PODMAN_BUILD_NETWORK"
+      ;;
+  esac
+}
+
+preflight_podman_build_dns() {
+  local label="$1"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-podman-build-dns-preflight-$(date -u +%H%M%S).log"
+  local network_arg
+  local status=0
+  local choice
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  network_arg="$(podman_network_args)"
+
+  info "Running Podman build-network DNS preflight for $label"
+  printf 'DNS preflight log: %s\n' "$log" >&2
+  printf 'Podman build network policy: %s\n' "$PODMAN_BUILD_NETWORK" >&2
+
+  {
+    printf '### Podman build DNS preflight for %s\n' "$label"
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### network arg: %s\n\n' "${network_arg:-default}"
+
+    printf '## Host resolver\n'
+    cat /etc/resolv.conf || true
+    printf '\n'
+
+    printf '## Container DNS checks\n'
+    podman run --rm ${network_arg:+$network_arg} ghcr.io/vanilla-os/pico:dev /bin/sh -lc '
+      set -e
+      echo "container /etc/resolv.conf:"
+      cat /etc/resolv.conf || true
+      echo
+      for h in repo3.vanillaos.org deb.debian.org github.com ghcr.io; do
+        echo "checking $h"
+        if command -v getent >/dev/null 2>&1; then
+          getent hosts "$h"
+        elif command -v python3 >/dev/null 2>&1; then
+          python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$h"
+        else
+          ping -c 1 "$h"
+        fi
+      done
+    '
+  } >"$log" 2>&1 || status=$?
+
+  if [[ "$status" -ne 0 ]]; then
+    fail "Podman build-network DNS preflight failed."
+    warn "This predicts apt failures inside podman image build."
+    warn "Current PODMAN_BUILD_NETWORK=$PODMAN_BUILD_NETWORK"
+    print_failure_tail "$log"
+
+    choice="$(menu "Podman Build DNS Failure
+
+DNS resolution failed inside a disposable container using the same network mode
+that will be used for podman image build. Host DNS may still be fine; the issue
+is container networking." "1" \
+      "1|Retry using host networking [DEFAULT]|Set PODMAN_BUILD_NETWORK=host and re-run DNS preflight." \
+      "2|Continue anyway|Attempt the build despite failed DNS preflight." \
+      "3|Open shell to repair Podman/DNS|Inspect resolv.conf, podman network, firewalls, or VM DNS." \
+      "4|Abort build|Stop before the expensive container build.")"
+
+    case "$choice" in
+      1)
+        PODMAN_BUILD_NETWORK="host"
+        preflight_podman_build_dns "$label"
+        return $?
+        ;;
+      2)
+        warn "Continuing despite failed Podman DNS preflight."
+        return 0
+        ;;
+      3)
+        open_shell "$WORKDIR"
+        preflight_podman_build_dns "$label"
+        return $?
+        ;;
+      4|*)
+        return 1
+        ;;
+    esac
+  fi
+
+  ok "Podman build-network DNS preflight passed."
+  return 0
+}
+
 podman_build_with_optional_no_cache() {
   local label="$1"
   local repo="$2"
   local tag="$3"
+  local network_arg
+  local safe_label
+
+  safe_label="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
+  network_arg="$(podman_network_args)"
+
+  preflight_podman_build_dns "$safe_label" \
+    || die "Podman build DNS preflight failed. Set PODMAN_BUILD_NETWORK=host or repair container DNS."
+
   if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
-    run_logged "$label" "$repo" podman image build --no-cache -t "$tag" .
+    if [[ -n "$network_arg" ]]; then
+      run_logged "$label" "$repo" podman image build "$network_arg" --no-cache -t "$tag" .
+    else
+      run_logged "$label" "$repo" podman image build --no-cache -t "$tag" .
+    fi
   else
-    run_logged "$label" "$repo" podman image build -t "$tag" .
+    if [[ -n "$network_arg" ]]; then
+      run_logged "$label" "$repo" podman image build "$network_arg" -t "$tag" .
+    else
+      run_logged "$label" "$repo" podman image build -t "$tag" .
+    fi
   fi
 }
 
