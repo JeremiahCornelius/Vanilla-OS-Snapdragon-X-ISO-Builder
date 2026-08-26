@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.2.sh
+# build-vanilla-arm64-release-v2.7.3.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.2
+# Version: 2.7.3
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.2"
+SCRIPT_VERSION="2.7.3"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2416,14 +2416,29 @@ patch_known_unavailable_packages_before_vib() {
   # Vib consumes modules/*.yml before it generates the Containerfile. Therefore
   # unavailable package removal must happen before `vib build recipe.yml`.
   #
-  # This function is deliberately narrower than the post-Vib generated-context
-  # patcher: it touches only Vib input YAML files and validates apt module shape
-  # immediately. This prevents:
-  #   json: cannot unmarshal string into Go struct field AptModule.sources of type api.Source
+  # Regression fixed in 2.7.3:
+  #   Some upstream apt modules use a shorthand:
+  #
+  #     sources:
+  #       - packages:
+  #       - pkg-a
+  #       - pkg-b
+  #
+  #   which PyYAML reads as:
+  #     [{"packages": null}, "pkg-a", "pkg-b"]
+  #
+  #   Vib's apt plugin accepts/normalizes this shorthand internally, but our
+  #   validator rejected it. This function now normalizes shorthand into the
+  #   canonical Vib shape before removing optional packages:
+  #
+  #     sources:
+  #       - packages:
+  #           - pkg-a
+  #           - pkg-b
   local repo="$1"
   local label="$2"
   local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-pre-vib-unavailable-package-patch-$(date -u +%H%M%S).log"
-  local pkg file backup tmp changed_any=0
+  local pkg file backup tmp changed_any=0 normalized_any=0
 
   [[ "$ALLOW_MISSING_OPTIONAL_PACKAGES" == "1" ]] || return 0
   mkdir -p "$OUTPUT_DIR/logs"
@@ -2433,21 +2448,17 @@ patch_known_unavailable_packages_before_vib() {
   printf 'Repository: %s\n' "$repo" >>"$log"
   printf 'Packages: %s\n\n' "$KNOWN_UNAVAILABLE_PACKAGES" >>"$log"
 
-  for pkg in $KNOWN_UNAVAILABLE_PACKAGES; do
-    while IFS= read -r file; do
-      [[ -f "$file" ]] || continue
-      grep -qw -- "$pkg" "$file" || continue
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    tmp="$file.builder-patched.$$"
 
-      backup="$file.builder-backup-previb-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
-      tmp="$file.builder-patched.$$"
-
-      if python3 - "$file" "$tmp" "$pkg" <<'PY'
+    if python3 - "$file" "$tmp" "$KNOWN_UNAVAILABLE_PACKAGES" <<'PY'
 import sys
 from pathlib import Path
 
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
-pkg = sys.argv[3]
+packages_to_remove = set(sys.argv[3].split())
 
 try:
     import yaml
@@ -2455,15 +2466,67 @@ except Exception as exc:
     print(f"ERROR: PyYAML import failed: {exc}", file=sys.stderr)
     sys.exit(10)
 
-data = yaml.safe_load(src.read_text(encoding="utf-8"))
+try:
+    data = yaml.safe_load(src.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"ERROR: YAML parse failed for {src}: {exc}", file=sys.stderr)
+    sys.exit(11)
+
 changed = False
+normalized = False
+
+def normalize_apt_sources(obj):
+    global changed, normalized
+
+    if isinstance(obj, dict):
+        if obj.get("type") == "apt" and isinstance(obj.get("sources"), list):
+            sources = obj["sources"]
+            canonical = []
+            pending_packages = []
+            changed_here = False
+
+            for item in sources:
+                if isinstance(item, dict):
+                    # If there is a pending shorthand package list, flush it as
+                    # its own source before starting a new mapping.
+                    if pending_packages:
+                        canonical.append({"packages": pending_packages})
+                        pending_packages = []
+                        changed_here = True
+
+                    if "packages" in item and item["packages"] is None:
+                        item = dict(item)
+                        item["packages"] = []
+                        changed_here = True
+
+                    canonical.append(item)
+                elif isinstance(item, str):
+                    pending_packages.append(item)
+                    changed_here = True
+                else:
+                    canonical.append(item)
+
+            if pending_packages:
+                canonical.append({"packages": pending_packages})
+                changed_here = True
+
+            if changed_here:
+                obj["sources"] = canonical
+                changed = True
+                normalized = True
+
+        for value in obj.values():
+            normalize_apt_sources(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            normalize_apt_sources(item)
 
 def remove_pkg(obj):
     global changed
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "packages" and isinstance(v, list):
-                nv = [x for x in v if x != pkg]
+                nv = [x for x in v if x not in packages_to_remove]
                 if len(nv) != len(v):
                     obj[k] = nv
                     changed = True
@@ -2472,11 +2535,6 @@ def remove_pkg(obj):
     elif isinstance(obj, list):
         for item in obj:
             remove_pkg(item)
-
-remove_pkg(data)
-
-if not changed:
-    sys.exit(2)
 
 def validate_apt_shape(obj, path="root"):
     if isinstance(obj, dict):
@@ -2496,50 +2554,58 @@ def validate_apt_shape(obj, path="root"):
         for i, item in enumerate(obj):
             validate_apt_shape(item, f"{path}[{i}]")
 
+normalize_apt_sources(data)
+remove_pkg(data)
 validate_apt_shape(data)
 
-# Use block style. PyYAML may alter comments/formatting, but preserves structure.
+if not changed:
+    sys.exit(2)
+
 dst.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False), encoding="utf-8")
+if normalized:
+    print("NORMALIZED_APT_SOURCES_SHORTHAND", file=sys.stderr)
 sys.exit(0)
 PY
-      then
-        cp -a "$file" "$backup"
-        mv "$tmp" "$file"
-        changed_any=1
-        {
-          printf 'PATCHED pre-Vib YAML package: %s\n' "$pkg"
-          printf 'File: %s\n' "$file"
-          printf 'Backup: %s\n' "$backup"
-          printf 'Diff:\n'
-          diff -u "$backup" "$file" || true
-          printf '\n'
-        } >>"$log"
-        warn "Pre-Vib removed optional unavailable package '$pkg' from $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
-      else
-        rc=$?
-        rm -f "$tmp"
-        if [[ "$rc" -ne 2 ]]; then
-          fail "Pre-Vib YAML package patch failed for $file"
-          print_failure_tail "$log"
-          return "$rc"
-        fi
-      fi
-    done < <(
+    then
+      backup="$file.builder-backup-previb-normalize.$(date -u +%Y%m%d%H%M%S)"
+      cp -a "$file" "$backup"
+      mv "$tmp" "$file"
+      changed_any=1
       {
-        [[ -d "$repo/modules" ]] && grep -RIl -- "$pkg" "$repo/modules" 2>/dev/null || true
-        [[ -f "$repo/recipe.yml" ]] && grep -Il -- "$pkg" "$repo/recipe.yml" 2>/dev/null || true
-      } | grep -E '\.(ya?ml)$' | sort -u
-    )
-  done
+        printf 'PATCHED/NORMALIZED pre-Vib YAML\n'
+        printf 'File: %s\n' "$file"
+        printf 'Backup: %s\n' "$backup"
+        printf 'Diff:\n'
+        diff -u "$backup" "$file" || true
+        printf '\n'
+      } >>"$log"
+      warn "Pre-Vib normalized/removed optional package tokens in $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+    else
+      rc=$?
+      rm -f "$tmp"
+      if [[ "$rc" -ne 2 ]]; then
+        fail "Pre-Vib YAML package normalization/removal failed for $file"
+        print_failure_tail "$log"
+        return "$rc"
+      fi
+    fi
+  done < <(
+    {
+      [[ -d "$repo/modules" ]] && find "$repo/modules" -type f \( -name '*.yml' -o -name '*.yaml' \) || true
+      [[ -f "$repo/recipe.yml" ]] && printf '%s\n' "$repo/recipe.yml"
+    } | sort -u
+  )
 
   validate_vib_apt_module_yaml_shapes "$repo" "$label" "$log" || return $?
 
   if [[ "$changed_any" -eq 1 ]]; then
-    warn "Pre-Vib unavailable package patch applied. Log: $log"
+    warn "Pre-Vib unavailable package patch/normalization applied. Log: $log"
   else
-    ok "No pre-Vib unavailable package tokens found for $label."
+    ok "No pre-Vib unavailable package tokens or shorthand apt sources found for $label."
   fi
 }
+
+
 
 run_vib_build_with_diagnostics() {
   local label="$1"
@@ -2863,12 +2929,42 @@ except Exception as exc:
 
 bad = []
 
+def normalize_shape_for_validation(obj):
+    if isinstance(obj, dict):
+        if obj.get("type") == "apt" and isinstance(obj.get("sources"), list):
+            sources = obj["sources"]
+            canonical = []
+            pending = []
+            for item in sources:
+                if isinstance(item, dict):
+                    if pending:
+                        canonical.append({"packages": pending})
+                        pending = []
+                    if item.get("packages") is None and "packages" in item:
+                        item = dict(item)
+                        item["packages"] = []
+                    canonical.append(item)
+                elif isinstance(item, str):
+                    pending.append(item)
+                else:
+                    canonical.append(item)
+            if pending:
+                canonical.append({"packages": pending})
+            obj["sources"] = canonical
+        for v in obj.values():
+            normalize_shape_for_validation(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            normalize_shape_for_validation(item)
+
 def validate_file(path: Path):
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception as exc:
         bad.append((str(path), f"YAML parse error: {exc}"))
         return
+
+    normalize_shape_for_validation(data)
 
     def walk(obj, trail):
         if isinstance(obj, dict):
@@ -2913,33 +3009,6 @@ PY
   fi
   ok "Vib apt module YAML shape validation passed for $label."
   return 0
-}
-
-
-classify_container_build_failure() {
-  # Provide concise classification for common generated-container failures.
-  local log="$1"
-
-  [[ -f "$log" ]] || return 0
-
-  if grep -q "has no installation candidate" "$log"; then
-    fail "Container build failed because an apt package has no installation candidate."
-    grep -nE "Package .* is not available|has no installation candidate|E: Package" "$log" >&2 || true
-    warn "If the package is optional, add it to KNOWN_UNAVAILABLE_PACKAGES and rerun."
-    warn "Current KNOWN_UNAVAILABLE_PACKAGES=$KNOWN_UNAVAILABLE_PACKAGES"
-  elif grep -q "Temporary failure resolving" "$log"; then
-    fail "Container build failed because DNS resolution failed inside the build container."
-    grep -n "Temporary failure resolving" "$log" >&2 || true
-    warn "Current PODMAN_BUILD_NETWORK=$PODMAN_BUILD_NETWORK"
-  elif grep -q "Could not parse timestamp" "$log"; then
-    fail "Container build failed because a Debian changelog has a non-policy timestamp."
-    grep -nE "Could not parse timestamp|uses full .* instead of abbreviated month name|debian/changelog" "$log" >&2 || true
-    warn "The builder can patch known changelog date issues when PATCH_KNOWN_DEBIAN_CHANGELOG_DATES=1."
-  elif grep -q "cannot unmarshal string into Go struct field AptModule.sources" "$log"; then
-    fail "Vib failed because an apt module YAML file has an invalid sources shape."
-    grep -n "cannot unmarshal string into Go struct field AptModule.sources" "$log" >&2 || true
-    warn "The optional package patcher is now YAML-aware and validates apt module shape before Vib."
-  fi
 }
 
 diagnose_generated_container_context() {
