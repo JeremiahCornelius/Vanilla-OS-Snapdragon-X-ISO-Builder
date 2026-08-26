@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.7.sh
+# build-vanilla-arm64-release-v2.7.8.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.7
+# Version: 2.7.8
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.7"
+SCRIPT_VERSION="2.7.8"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -42,8 +42,9 @@ NORMALIZE_FIRMWARE_TO_USR_LIB="${NORMALIZE_FIRMWARE_TO_USR_LIB:-1}"
 STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
-LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:main}"
+LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
+LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.io/vanilla-os/pico:dev ghcr.io/vanilla-os/pico:latest debian:trixie}"
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -3748,6 +3749,69 @@ live_iso_runtime_cmd() {
   esac
 }
 
+
+image_architecture_matches_platform() {
+  local runtime="$1"
+  local image="$2"
+  local expected_platform="$3"
+  local expected_arch actual_arch
+
+  expected_arch="${expected_platform#linux/}"
+  case "$expected_arch" in
+    arm64) expected_arch="arm64" ;;
+    amd64) expected_arch="amd64" ;;
+  esac
+
+  actual_arch="$("$runtime" image inspect "$image" --format '{{.Architecture}}' 2>/dev/null | head -n1 || true)"
+  [[ -n "$actual_arch" ]] || return 1
+  [[ "$actual_arch" == "$expected_arch" ]]
+}
+
+select_live_iso_helper_image() {
+  # Pick the first image that can actually run /bin/bash for the requested
+  # platform. This avoids the observed failure where pico:main resolves to amd64
+  # on an aarch64 host and then fails with Exec format error.
+  local runtime="$1"
+  local candidate log status
+
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-helper-selection-$(date -u +%H%M%S).log"
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  {
+    printf '### Live ISO helper image selection\n'
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### runtime: %s\n' "$runtime"
+    printf '### requested platform: %s\n' "$LIVE_ISO_CONTAINER_PLATFORM"
+    printf '### initial image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf '### candidates: %s\n\n' "$LIVE_ISO_CONTAINER_FALLBACK_IMAGES"
+  } >"$log"
+
+  for candidate in "$LIVE_ISO_CONTAINER_IMAGE" $LIVE_ISO_CONTAINER_FALLBACK_IMAGES; do
+    printf 'Testing live ISO helper image candidate: %s\n' "$candidate" >&2
+    {
+      printf '\n## Candidate: %s\n' "$candidate"
+      "$runtime" pull --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$candidate"
+      "$runtime" image inspect "$candidate" --format 'architecture={{.Architecture}} os={{.Os}}' || true
+      "$runtime" run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$candidate" /bin/bash -lc 'uname -m; command -v bash; echo LIVE_ISO_HELPER_OK'
+    } >>"$log" 2>&1
+    status=$?
+
+    if [[ "$status" -eq 0 ]] && image_architecture_matches_platform "$runtime" "$candidate" "$LIVE_ISO_CONTAINER_PLATFORM"; then
+      LIVE_ISO_CONTAINER_IMAGE="$candidate"
+      ok "Selected live ISO helper image: $LIVE_ISO_CONTAINER_IMAGE"
+      printf 'Selection log:\n  %s\n' "$log" >&2
+      return 0
+    fi
+
+    warn "Rejected live ISO helper image candidate: $candidate"
+  done
+
+  fail "No usable live ISO helper image found for $LIVE_ISO_CONTAINER_PLATFORM."
+  warn "Selection log: $log"
+  print_failure_tail "$log"
+  return 1
+}
+
 preflight_live_iso_container() {
   local live="$1"
   local runtime
@@ -3757,6 +3821,8 @@ preflight_live_iso_container() {
 
   runtime="$(live_iso_runtime_cmd)"
   mkdir -p "$OUTPUT_DIR/logs"
+
+  select_live_iso_helper_image "$runtime" || return $?
 
   info "Running live ISO container architecture preflight."
   printf 'Live ISO runtime: %s\n' "$runtime" >&2
@@ -3782,6 +3848,10 @@ preflight_live_iso_container() {
 
     printf '## local image inspection\n'
     "$runtime" image inspect "$LIVE_ISO_CONTAINER_IMAGE" 2>&1 || true
+    printf '\n'
+
+    printf '## architecture check\n'
+    "$runtime" image inspect "$LIVE_ISO_CONTAINER_IMAGE" --format 'architecture={{.Architecture}} os={{.Os}}'
     printf '\n'
 
     printf '## execution probe\n'
