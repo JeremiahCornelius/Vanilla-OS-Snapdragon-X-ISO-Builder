@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.15.sh
+# build-vanilla-arm64-release-v2.7.16.sh
 #
-# Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.15
+# Conception Vanilla ARM64 Release Builder
+# Version: 2.7.16
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.15"
+SCRIPT_VERSION="2.7.16"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -53,6 +53,11 @@ ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
+BOOT_DEFAULT_DIAGNOSTIC="${BOOT_DEFAULT_DIAGNOSTIC:-1}"
+BOOT_DIAGNOSTIC_ARGS="${BOOT_DIAGNOSTIC_ARGS:-console=tty0 earlycon keep_bootcon ignore_loglevel loglevel=8 initcall_debug systemd.show_status=1 rd.systemd.show_status=1 systemd.log_target=console rd.systemd.log_target=console plymouth.enable=0 rd.plymouth=0 vt.global_cursor_default=1}"
+BOOT_NORMAL_ARGS="${BOOT_NORMAL_ARGS:-quiet splash bgrt_disable}"
+BOOT_FIRMWARE_FB_ARGS="${BOOT_FIRMWARE_FB_ARGS:-console=tty0 keep_bootcon ignore_loglevel loglevel=7 systemd.show_status=1 rd.systemd.show_status=1 plymouth.enable=0 rd.plymouth=0 nomodeset}"
+INITRAMFS_MODULES_POLICY="${INITRAMFS_MODULES_POLICY:-most}"
 
 # ----------------------------- UI helpers -----------------------------
 
@@ -596,7 +601,7 @@ prompt_existing_file_optional() {
 WORKDIR="${WORKDIR:-$HOME/src/vanilla-arm64-build-system}"
 PROFILE="${PROFILE:-hp-omnibook-5}"
 ARCH="${ARCH:-arm64}"
-RELEASE_PREFIX="${RELEASE_PREFIX:-Constructive-VanillaOS-Orchid}"
+RELEASE_PREFIX="${RELEASE_PREFIX:-Conception-VanillaOS-Orchid}"
 QCOM_DEVICE_PATH_DEFAULT="x1p42100/hp/omnibook-5"
 
 SOURCES_DIR="$WORKDIR/sources"
@@ -1709,9 +1714,19 @@ resolve_custom_kernel_release() {
 }
 
 patch_live_iso_grub_for_custom_dtb() {
-  # The upstream ARM live-ISO GRUB template may be minified onto one physical
-  # line. Patch the complete file as text instead of requiring a line beginning
-  # with "linux".
+  # Patch the upstream live-ISO GRUB template as a complete text document.
+  # The upstream file may be minified onto one physical line, so line-oriented
+  # sed insertion is deliberately avoided.
+  #
+  # Boot strategy in v2.7.16:
+  #   1. Preserve every existing menuentry and its proven kernel/initrd paths.
+  #   2. Preserve the selected board DTB before every live initrd command.
+  #   3. Make the first live entry diagnostic by removing quiet/splash and
+  #      retaining the firmware boot console for observable failures.
+  #   4. Add a separate normal-graphics entry rather than sacrificing the
+  #      diagnostic default.
+  #   5. Convert the obsolete Nouveau entry into a firmware-framebuffer entry;
+  #      Nouveau is irrelevant to the Qualcomm target.
   local live="$1"
   local dtb_name="$2"
   local grub="$live/etc/config/bootloaders/grub-pc/grub.cfg"
@@ -1721,27 +1736,29 @@ patch_live_iso_grub_for_custom_dtb() {
 
   backup="$grub.builder-backup-custom-dtb.$(date -u +%Y%m%d%H%M%S)"
   tmp="$grub.builder-patched.$$"
-  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-grub-dtb-patch-$(date -u +%H%M%S).log"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-grub-boot-patch-$(date -u +%H%M%S).log"
   mkdir -p "$OUTPUT_DIR/logs"
   cp -a "$grub" "$backup"
 
   expected_entries="$(grep -oE 'initrd(efi)?[[:space:]]+INITRD_LIVE' "$grub" | wc -l | awk '{print $1}')"
+  if [[ "${expected_entries:-0}" -eq 0 ]]; then
+    fail "The live ISO GRUB template contains no INITRD_LIVE commands."
+    return 1
+  fi
 
   {
     printf 'GRUB template: %s\n' "$grub"
     printf 'DTB: %s\n' "$dtb_name"
-    printf 'INITRD_LIVE entries: %s\n\n' "$expected_entries"
-    sed -n '1,240p' "$grub"
+    printf 'INITRD_LIVE entries: %s\n' "$expected_entries"
+    printf 'Diagnostic args: %s\n' "$BOOT_DIAGNOSTIC_ARGS"
+    printf 'Normal args: %s\n' "$BOOT_NORMAL_ARGS"
+    printf 'Firmware-FB args: %s\n\n' "$BOOT_FIRMWARE_FB_ARGS"
+    sed -n '1,260p' "$grub"
   } >"$log"
 
-  if [[ "${expected_entries:-0}" -eq 0 ]]; then
-    fail "The live ISO GRUB template contains no INITRD_LIVE commands."
-    warn "GRUB patch log: $log"
-    return 1
-  fi
-
   set +e
-  python3 - "$grub" "$tmp" "$dtb_name" <<'PY'
+  python3 - "$grub" "$tmp" "$dtb_name" \
+    "$BOOT_DIAGNOSTIC_ARGS" "$BOOT_NORMAL_ARGS" "$BOOT_FIRMWARE_FB_ARGS" <<'PYGRUB'
 import re
 import sys
 from pathlib import Path
@@ -1749,39 +1766,148 @@ from pathlib import Path
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 dtb = sys.argv[3]
+diag_args = sys.argv[4].strip()
+normal_args = sys.argv[5].strip()
+firmware_fb_args = sys.argv[6].strip()
 marker = "CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER"
 
 data = src.read_text(encoding="utf-8")
 
-# Remove directives from previous builder runs.
+# Normalize the known accidental standalone token if present. The actual
+# platform test remains: if [ "$grub_platform" = "efi" ]; then
+# This replacement is harmless when the token is absent.
+data = re.sub(r"(?m)^[ \t]*grub_platform[ \t]*\n", "", data)
+
+# Remove only builder-managed DTB directives from previous runs.
 data = re.sub(
-    r"\s*devicetree\s+/boot/dtbs/[^\s;}\n]+"
-    r"(?:\s+#\s*CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER)?\s*",
-    " ",
+    r"[ \t]*devicetree[ \t]+/boot/dtbs/[^\s;}\n]+"
+    r"(?:[ \t]+#[ \t]*CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER)?[ \t]*\n?",
+    "",
     data,
 )
 
-# Insert before every live initrd placeholder, regardless of one-line or
-# multi-line formatting.
+# Insert the DTB before every live initrd placeholder. Put the marker on its
+# own line so it cannot become part of the DTB pathname on strict parsers.
 pattern = re.compile(r"\b(initrd(?:efi)?\s+INITRD_LIVE)\b")
-replacement = (
-    f"\n    devicetree /boot/dtbs/{dtb} # {marker}\n"
-    r"    \1"
+data, dtb_count = pattern.subn(
+    f"# {marker}\n    devicetree /boot/dtbs/{dtb}\n    " + r"\1",
+    data,
 )
-data, count = pattern.subn(replacement, data)
+if dtb_count == 0:
+    raise SystemExit(20)
 
-if count == 0:
-    sys.exit(20)
+# Parse menuentry blocks with brace-depth tracking. This remains robust when
+# the upstream template is minified or uses multiline entries.
+entry_re = re.compile(r'menuentry\s+(["\'])(.*?)\1\s*\{', re.S)
+entries = []
+pos = 0
+while True:
+    m = entry_re.search(data, pos)
+    if not m:
+        break
+    depth = 1
+    i = m.end()
+    quote = None
+    escape = False
+    while i < len(data) and depth:
+        ch = data[i]
+        if escape:
+            escape = False
+        elif ch == "\\":
+            escape = True
+        elif quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    if depth:
+        raise SystemExit("unbalanced menuentry braces")
+    entries.append((m.start(), i, m.group(2)))
+    pos = i
+
+live_entries = [(s, e, title) for s, e, title in entries if "INITRD_LIVE" in data[s:e]]
+if not live_entries:
+    raise SystemExit("no live menuentry blocks found")
+
+
+def rewrite_linux_args(block: str, desired: str) -> str:
+    # Keep LINUX_LIVE and all upstream-required boot=live/config/user/findiso
+    # tokens. Replace only presentation/debug tokens controlled by this builder.
+    linux_re = re.compile(r"(?m)(^[ \t]*linux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)(.*?)([ \t]+---[ \t]*$)")
+    m = linux_re.search(block)
+    if not m:
+        raise SystemExit("live menuentry lacks expected LINUX_LIVE ... --- command")
+    args = m.group(2)
+    controlled = {
+        "quiet", "splash", "bgrt_disable", "nomodeset", "initcall_debug",
+        "keep_bootcon", "ignore_loglevel", "earlycon",
+        "plymouth.enable=0", "rd.plymouth=0", "vt.global_cursor_default=1",
+        "systemd.show_status=1", "rd.systemd.show_status=1",
+        "systemd.log_target=console", "rd.systemd.log_target=console",
+    }
+    kept = []
+    for token in args.split():
+        if token in controlled:
+            continue
+        if token.startswith("loglevel=") or token.startswith("console="):
+            continue
+        if token.startswith("modprobe.blacklist=nouveau"):
+            continue
+        kept.append(token)
+    merged = " ".join(kept + desired.split())
+    return block[:m.start(2)] + merged + block[m.end(2):]
+
+# Rewrite from the end so offsets remain valid.
+blocks = []
+for index, (s, e, title) in enumerate(live_entries):
+    block = data[s:e]
+    if index == 0:
+        block = rewrite_linux_args(block, diag_args)
+        block = re.sub(r'(menuentry\s+["\']).*?(["\']\s*\{)',
+                       r'\1Install Vanilla OS 2 (Diagnostic Boot)\2', block, count=1, flags=re.S)
+    elif "Safe Graphics" in title:
+        block = rewrite_linux_args(block, firmware_fb_args)
+        block = block.replace("Install Vanilla OS 2 (Safe Graphics)",
+                              "Install Vanilla OS 2 (Firmware Framebuffer)", 1)
+    elif "Nouveau unloaded" in title:
+        block = rewrite_linux_args(block, normal_args)
+        block = block.replace("Install Vanilla OS 2 (Nouveau unloaded)",
+                              "Install Vanilla OS 2 (Normal Graphics)", 1)
+    else:
+        block = rewrite_linux_args(block, normal_args)
+    blocks.append((s, e, block))
+
+for s, e, block in reversed(blocks):
+    data = data[:s] + block + data[e:]
+
+# Require all three intended modes. This deliberately fails the build rather
+# than silently producing an ambiguous menu after an upstream template change.
+required = (
+    "Install Vanilla OS 2 (Diagnostic Boot)",
+    "Install Vanilla OS 2 (Firmware Framebuffer)",
+    "Install Vanilla OS 2 (Normal Graphics)",
+)
+for title in required:
+    if title not in data:
+        raise SystemExit(f"required GRUB entry missing after patch: {title}")
+
+# Menu remains visible long enough to select a fallback entry.
+data = re.sub(r"(?m)^set timeout=\d+[ \t]*$", "set timeout=10", data, count=1)
 
 dst.write_text(data, encoding="utf-8")
-print(count)
-PY
+print(dtb_count)
+PYGRUB
   rc=$?
   set -e
 
   if [[ "$rc" -ne 0 ]]; then
     rm -f "$tmp"
-    fail "Unable to patch live ISO GRUB template with custom DTB."
+    fail "Unable to patch live ISO GRUB template for diagnostic ARM64 boot."
     warn "GRUB patch log: $log"
     return "$rc"
   fi
@@ -1790,18 +1916,23 @@ PY
   patched_entries="$(grep -c "devicetree /boot/dtbs/$dtb_name" "$grub" || true)"
 
   {
-    printf '\nPatched directive count: %s\n' "$patched_entries"
+    printf '\nPatched DTB directive count: %s\n' "$patched_entries"
     printf '\nDiff:\n'
     diff -u "$backup" "$grub" || true
   } >>"$log"
 
-  if [[ "${patched_entries:-0}" -ne "${expected_entries:-0}" ]]; then
+  [[ "${patched_entries:-0}" -eq "${expected_entries:-0}" ]] || {
     fail "DTB directive count mismatch: expected $expected_entries, patched $patched_entries."
-    warn "GRUB patch log: $log"
     return 1
-  fi
+  }
 
-  ok "Patched $patched_entries live ISO GRUB entries to load DTB: $dtb_name"
+  grep -q 'Install Vanilla OS 2 (Diagnostic Boot)' "$grub" || return 1
+  grep -q 'Install Vanilla OS 2 (Firmware Framebuffer)' "$grub" || return 1
+  grep -q 'Install Vanilla OS 2 (Normal Graphics)' "$grub" || return 1
+  grep -q 'keep_bootcon' "$grub" || return 1
+  grep -q 'plymouth.enable=0' "$grub" || return 1
+
+  ok "Patched GRUB with diagnostic, firmware-framebuffer, and normal-graphics boot modes."
   printf 'GRUB patch log:\n  %s\n' "$log" >&2
 }
 
@@ -1850,6 +1981,21 @@ verify_live_iso_source_integration() {
 
   grep -q "devicetree /boot/dtbs/$dtb_name" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
     fail "GRUB template does not load expected DTB: $dtb_name"
+    failed=1
+  }
+
+  grep -q 'Install Vanilla OS 2 (Diagnostic Boot)' "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB template is missing the diagnostic boot entry."
+    failed=1
+  }
+
+  grep -q 'keep_bootcon' "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB diagnostic entry does not retain the boot console."
+    failed=1
+  }
+
+  grep -q 'plymouth.enable=0' "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB diagnostic entry does not disable Plymouth."
     failed=1
   }
 
@@ -1990,6 +2136,22 @@ verify_built_iso_custom_boot_artifacts() {
   if [[ -f "$grub_extract" && -s "$grub_extract" ]]; then
     grep -q "devicetree /boot/dtbs/$dtb_name" "$grub_extract" || {
       fail "Generated ISO GRUB config does not contain expected devicetree directive."
+      warn "Verification log: $log"
+      return 1
+    }
+
+    grep -q 'Install Vanilla OS 2 (Diagnostic Boot)' "$grub_extract" || {
+      fail "Generated ISO GRUB config lacks the diagnostic boot entry."
+      warn "Verification log: $log"
+      return 1
+    }
+    grep -q 'keep_bootcon' "$grub_extract" || {
+      fail "Generated ISO diagnostic entry does not retain boot console output."
+      warn "Verification log: $log"
+      return 1
+    }
+    grep -q 'plymouth.enable=0' "$grub_extract" || {
+      fail "Generated ISO diagnostic entry does not disable Plymouth."
       warn "Verification log: $log"
       return 1
     }
@@ -2421,6 +2583,13 @@ fi
 
 # Generate an initramfs specifically for the custom kernel. A generic '-k all'
 # can leave live-build selecting the wrong kernel/initrd pair.
+#
+# Make broad hardware discovery explicit for the live ISO. This retains the
+# proven update-initramfs path while reducing the chance that USB, storage,
+# filesystem, display, or Qualcomm platform modules are omitted as host-only.
+mkdir -p /etc/initramfs-tools/conf.d
+printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-live-modules
+
 rm -f "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL"
 update-initramfs -c -k "\$EXPECTED_CUSTOM_KERNEL"
 
@@ -2428,6 +2597,13 @@ test -s "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" || {
   echo "ERROR: custom initramfs was not generated." >&2
   exit 84
 }
+
+# Record initramfs contents for post-build diagnosis. Missing individual module
+# names are not fatal because a driver may be built into the custom kernel.
+if command -v lsinitramfs >/dev/null 2>&1; then
+  lsinitramfs "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" \
+    > "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL.contents" 2>/dev/null || true
+fi
 
 # Make the intended kernel explicit for tools that follow the standard links.
 ln -sfn "boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL" /vmlinuz
@@ -4825,7 +5001,7 @@ fi
 
 cat >&2 <<EOF
 
-Constructive Vanilla ARM64 Release Builder
+Conception Vanilla ARM64 Release Builder
 Version: $SCRIPT_VERSION
 
 Primary host assumption:
