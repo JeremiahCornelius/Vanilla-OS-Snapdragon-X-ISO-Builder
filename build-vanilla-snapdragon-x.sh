@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.20.sh
+# build-vanilla-arm64-release-v2.8.0.sh
 #
 # Conception Vanilla ARM64 Release Builder
-# Version: 2.7.20
+# Version: 2.8.0
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.20"
+SCRIPT_VERSION="2.8.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -58,6 +58,7 @@ BOOT_DIAGNOSTIC_ARGS="${BOOT_DIAGNOSTIC_ARGS:-console=tty0 earlycon keep_bootcon
 BOOT_NORMAL_ARGS="${BOOT_NORMAL_ARGS:-quiet splash bgrt_disable}"
 BOOT_FIRMWARE_FB_ARGS="${BOOT_FIRMWARE_FB_ARGS:-console=tty0 keep_bootcon ignore_loglevel loglevel=7 systemd.show_status=1 rd.systemd.show_status=1 plymouth.enable=0 rd.plymouth=0 nomodeset}"
 INITRAMFS_MODULES_POLICY="${INITRAMFS_MODULES_POLICY:-most}"
+REQUIRED_CUSTOM_KERNEL_RELEASE="${REQUIRED_CUSTOM_KERNEL_RELEASE:-7.1.1-jg-1}"
 
 # ----------------------------- UI helpers -----------------------------
 
@@ -1693,10 +1694,11 @@ the expected Qualcomm package, or additional manual interaction is required." "1
 
 
 resolve_custom_kernel_release() {
-  # Determine the kernel release expected from the supplied linux-image .deb.
-  # Prefer the package name because Debian kernel packages conventionally use:
-  #   linux-image-<kernel-release>
-  local deb pkg release
+  # Determine and validate the exact boot kernel release supplied as a local
+  # linux-image package. This project intentionally targets one known custom
+  # kernel release; silently selecting another package would recreate the
+  # standard-kernel regression that v2.8.0 is designed to prevent.
+  local deb pkg release found=""
 
   for deb in "${KERNEL_DEBS[@]:-}"; do
     [[ -f "$deb" ]] || continue
@@ -1704,13 +1706,23 @@ resolve_custom_kernel_release() {
     case "$pkg" in
       linux-image-*)
         release="${pkg#linux-image-}"
-        printf '%s\n' "$release"
-        return 0
+        if [[ -n "$found" && "$found" != "$release" ]]; then
+          fail "Multiple different linux-image releases were supplied: $found and $release"
+          return 1
+        fi
+        found="$release"
         ;;
     esac
   done
 
-  return 1
+  [[ -n "$found" ]] || return 1
+
+  if [[ -n "${REQUIRED_CUSTOM_KERNEL_RELEASE:-}" && "$found" != "$REQUIRED_CUSTOM_KERNEL_RELEASE" ]]; then
+    fail "Supplied linux-image package resolves to '$found', but this build requires '$REQUIRED_CUSTOM_KERNEL_RELEASE'."
+    return 1
+  fi
+
+  printf '%s\n' "$found"
 }
 
 patch_live_iso_grub_for_custom_dtb() {
@@ -1718,7 +1730,7 @@ patch_live_iso_grub_for_custom_dtb() {
   # The upstream file may be minified onto one physical line, so line-oriented
   # sed insertion is deliberately avoided.
   #
-  # Boot strategy in v2.7.20:
+  # Boot strategy in v2.8.0:
   #   1. Preserve every existing menuentry and its proven kernel/initrd paths.
   #   2. Preserve the selected board DTB before every live initrd command.
   #   3. Make the first live entry diagnostic by removing quiet/splash and
@@ -1933,7 +1945,6 @@ if data.count(custom_initrd) < len(live_entries):
 data = re.sub(r"(?m)^set timeout=\d+[ \t]*$", "set timeout=10", data, count=1)
 
 dst.write_text(data, encoding="utf-8")
-print(dtb_count)
 PYGRUB
   rc=$?
   set -e
@@ -1964,8 +1975,8 @@ PYGRUB
   grep -q 'Install Vanilla OS 2 (Normal Graphics)' "$grub" || return 1
   grep -q 'keep_bootcon' "$grub" || return 1
   grep -q 'plymouth.enable=0' "$grub" || return 1
-  grep -Fq "linux $custom_kernel_path" "$grub" || return 1
-  grep -Fq "initrd $custom_initrd_path" "$grub" || return 1
+  grep -Eq "linux(efi)?[[:space:]]+$custom_kernel_path([[:space:]]|$)" "$grub" || return 1
+  grep -Eq "initrd(efi)?[[:space:]]+$custom_initrd_path([[:space:]]|$)" "$grub" || return 1
   ! grep -Eq 'KERNEL_LIVE|LINUX_LIVE|INITRD_LIVE' "$grub" || return 1
 
   ok "Patched GRUB to boot the exact custom kernel with diagnostic, firmware-framebuffer, and normal-graphics modes."
@@ -2020,12 +2031,12 @@ verify_live_iso_source_integration() {
     failed=1
   }
 
-  grep -Fq "linux /live/vmlinuz-$expected_kver" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+  grep -Eq "linux(efi)?[[:space:]]+/live/vmlinuz-$expected_kver([[:space:]]|$)" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
     fail "GRUB template does not reference exact custom kernel: /live/vmlinuz-$expected_kver"
     failed=1
   }
 
-  grep -Fq "initrd /live/initrd.img-$expected_kver" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+  grep -Eq "initrd(efi)?[[:space:]]+/live/initrd.img-$expected_kver([[:space:]]|$)" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
     fail "GRUB template does not reference exact custom initramfs: /live/initrd.img-$expected_kver"
     failed=1
   }
@@ -2593,7 +2604,8 @@ EOF
   if [[ -d "$live" ]]; then
     local expected_kver dtb_name
     expected_kver="$(resolve_custom_kernel_release || true)"
-    [[ -n "$expected_kver" ]] || die "Unable to determine custom kernel release from supplied linux-image .deb."
+    [[ -n "$expected_kver" ]] || die "Unable to determine and validate the required custom kernel release from supplied linux-image .deb."
+    ok "Required custom boot kernel selected: $expected_kver"
     [[ -n "${PRIMARY_DTB:-}" ]] || die "A primary DTB is required for the ARM64 live ISO."
     dtb_name="$(basename "$PRIMARY_DTB")"
 
