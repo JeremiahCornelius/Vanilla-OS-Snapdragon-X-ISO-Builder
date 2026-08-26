@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r1
+# Version 8.5-r2
+#
+# v8.5-r2 Reunion Distrobox coherence-gate correction
+# -----------------------------------------------------
+# Field building of r1 completed the target OCI but failed during target
+# verification because current upstream Distrobox reported:
+#     distrobox version dev
+# r1 incorrectly required the final version token to contain a numeric major.
+# Upstream Distrobox 2.0.0-rc.4 defines its build-time default Version as
+# "dev" and replaces it only when Git-derived VERSION metadata is available to
+# make. Vanilla core-image builds Distrobox from source through Vib's make
+# module, so an opaque token such as "dev" is a valid upstream build result.
+# APX 3.1.1 likewise treats the final --version token as opaque; it requires the
+# modern --version interface but does not parse semantic version components.
+# r2 therefore verifies the interface APX actually consumes. Numeric releases
+# remain range-checked (2.x, and rc.4+ for the 2.0.0 release-candidate line);
+# opaque source-build tokens are accepted only when the v2 command surface and
+# Vanilla's APX Distrobox helper/symlink layout are also present. No runtime
+# compatibility shim is added, and all r1 installation-path corrections remain.
 #
 # v8.5-r1 installation-path regression correction
 # -------------------------------------------------
@@ -292,7 +310,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r1"
+SCRIPT_VERSION="8.5-r2"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -5391,34 +5409,77 @@ test -x /usr/bin/setup-vso-terminal || {
   exit 1
 }
 
+# APX 3.1.1 calls `distrobox --version` and treats the final whitespace-
+# separated token as opaque. Do not impose a semantic-version requirement that
+# upstream itself does not guarantee: Distrobox 2.0.0-rc.4 defaults Version to
+# "dev" and its Makefile replaces that value only when build-time VERSION/Git
+# metadata is available. Vib source staging can therefore legitimately produce
+# `distrobox version dev`.
 distrobox_version="$(/usr/bin/distrobox --version)" || {
   echo "Distrobox --version failed; APX 3.1.1+ requires this interface" >&2
   exit 1
 }
 case "$distrobox_version" in
-  'distrobox version '*) : ;;
+  'distrobox version '?*) : ;;
   *)
     echo "Unexpected Distrobox version interface: $distrobox_version" >&2
     exit 1
     ;;
 esac
 distrobox_release="${distrobox_version##* }"
-distrobox_major="${distrobox_release%%.*}"
-[[ "$distrobox_major" =~ ^[0-9]+$ ]] || {
-  echo "Unable to parse Distrobox major version: $distrobox_release" >&2
+[[ -n "$distrobox_release" ]] || {
+  echo "Distrobox --version returned an empty release token" >&2
   exit 1
 }
-(( distrobox_major >= 2 )) || {
-  echo "Distrobox is older than the Reunion-compatible 2.x generation: $distrobox_release" >&2
-  exit 1
-}
-if [[ "$distrobox_release" == 2.0.0-rc.* ]]; then
-  distrobox_rc="${distrobox_release#2.0.0-rc.}"
-  [[ "$distrobox_rc" =~ ^[0-9]+$ ]] && (( distrobox_rc >= 4 )) || {
-    echo "Distrobox release candidate predates the required additional-flags fix: $distrobox_release" >&2
+
+# When upstream supplies a numeric release, retain the stronger r1 range checks.
+# For source-build identifiers such as `dev` or a Git-derived opaque token,
+# validate the modern Distrobox v2 CLI and the APX helper layout installed by
+# current Vanilla core-image instead of rejecting a valid upstream build.
+if [[ "$distrobox_release" =~ ^[0-9]+([.][0-9]+)*([-.][0-9A-Za-z.]+)*$ ]]; then
+  distrobox_major="${distrobox_release%%.*}"
+  [[ "$distrobox_major" =~ ^[0-9]+$ ]] || {
+    echo "Unable to parse numeric Distrobox major version: $distrobox_release" >&2
     exit 1
   }
+  (( distrobox_major >= 2 )) || {
+    echo "Distrobox is older than the Reunion-compatible 2.x generation: $distrobox_release" >&2
+    exit 1
+  }
+  if [[ "$distrobox_release" == 2.0.0-rc.* ]]; then
+    distrobox_rc="${distrobox_release#2.0.0-rc.}"
+    [[ "$distrobox_rc" =~ ^[0-9]+$ ]] && (( distrobox_rc >= 4 )) || {
+      echo "Distrobox release candidate predates the required additional-flags fix: $distrobox_release" >&2
+      exit 1
+    }
+  fi
+else
+  for distrobox_subcommand in create enter list rm; do
+    /usr/bin/distrobox "$distrobox_subcommand" --help >/dev/null 2>&1 || {
+      echo "Opaque Distrobox build token '$distrobox_release' lacks v2 subcommand: $distrobox_subcommand" >&2
+      exit 1
+    }
+  done
 fi
+
+# Current Vanilla core-image installs these APX-facing helpers explicitly.
+# Validate their resolved targets so an opaque source-build token cannot mask the
+# historical /usr/local path skew or an incomplete Distrobox installation.
+test -L /usr/share/apx/distrobox/distrobox-enter && \
+  [[ "$(readlink -f /usr/share/apx/distrobox/distrobox-enter)" == /usr/bin/distrobox ]] || {
+  echo "APX Distrobox enter helper does not resolve to /usr/bin/distrobox" >&2
+  exit 1
+}
+for distrobox_helper in distrobox-export distrobox-host-exec distrobox-init; do
+  test -L "/usr/share/apx/distrobox/$distrobox_helper" || {
+    echo "APX Distrobox helper symlink is absent: $distrobox_helper" >&2
+    exit 1
+  }
+  [[ "$(readlink -f "/usr/share/apx/distrobox/$distrobox_helper")" == "/usr/bin/$distrobox_helper" ]] || {
+    echo "APX Distrobox helper resolves unexpectedly: $distrobox_helper" >&2
+    exit 1
+  }
+done
 
 # Current Reunion exposes the managed System Operator subsystem as `native`,
 # not the transitional Pico-generation command surface.
@@ -6442,7 +6503,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r1.
+# Managed by VanillaOS-SnapdragonX v8.5-r2.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -6516,7 +6577,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r1-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r2-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
