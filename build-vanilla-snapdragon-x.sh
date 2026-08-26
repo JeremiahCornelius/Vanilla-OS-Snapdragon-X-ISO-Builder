@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.6.sh
+# build-vanilla-arm64-release-v2.7.7.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.6
+# Version: 2.7.7
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.6"
+SCRIPT_VERSION="2.7.7"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -43,6 +43,7 @@ STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:main}"
+LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -3736,19 +3737,29 @@ build_images() {
   fi
 }
 
+live_iso_runtime_cmd() {
+  case "${LIVE_ISO_CONTAINER_RUNTIME,,}" in
+    docker) printf '%s\n' "docker" ;;
+    podman|"") printf '%s\n' "podman" ;;
+    *)
+      warn "Unknown LIVE_ISO_CONTAINER_RUNTIME=$LIVE_ISO_CONTAINER_RUNTIME; using podman."
+      printf '%s\n' "podman"
+      ;;
+  esac
+}
+
 preflight_live_iso_container() {
-  # Verify that the container used to build the live ISO can execute /bin/bash
-  # on this ARM64 build host. The observed failure:
-  #   exec container process `/bin/bash`: Exec format error
-  # means Docker selected or received a non-ARM64 image for the live ISO
-  # builder. Force --platform and fail early with a clear message.
   local live="$1"
+  local runtime
   local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-container-preflight-$(date -u +%H%M%S).log"
   local status=0
+  local choice
 
+  runtime="$(live_iso_runtime_cmd)"
   mkdir -p "$OUTPUT_DIR/logs"
 
   info "Running live ISO container architecture preflight."
+  printf 'Live ISO runtime: %s\n' "$runtime" >&2
   printf 'Live ISO container image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE" >&2
   printf 'Live ISO container platform: %s\n' "$LIVE_ISO_CONTAINER_PLATFORM" >&2
   printf 'Preflight log: %s\n' "$log" >&2
@@ -3757,27 +3768,63 @@ preflight_live_iso_container() {
     printf '### Live ISO container preflight\n'
     printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '### host uname: %s\n' "$(uname -m)"
+    printf '### runtime: %s\n' "$runtime"
     printf '### image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
     printf '### platform: %s\n\n' "$LIVE_ISO_CONTAINER_PLATFORM"
 
-    printf '## docker version\n'
-    docker version 2>&1 || true
+    printf '## runtime version\n'
+    "$runtime" version 2>&1 || true
     printf '\n'
 
-    printf '## image manifest/platform metadata if available\n'
-    docker buildx imagetools inspect "$LIVE_ISO_CONTAINER_IMAGE" 2>&1 || true
+    printf '## image pull\n'
+    "$runtime" pull --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE"
+    printf '\n'
+
+    printf '## local image inspection\n'
+    "$runtime" image inspect "$LIVE_ISO_CONTAINER_IMAGE" 2>&1 || true
     printf '\n'
 
     printf '## execution probe\n'
-    docker run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -lc 'uname -m; echo LIVE_ISO_CONTAINER_EXEC_OK'
+    "$runtime" run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -lc 'uname -m; echo LIVE_ISO_CONTAINER_EXEC_OK'
   } >"$log" 2>&1 || status=$?
 
   if [[ "$status" -ne 0 ]]; then
     fail "Live ISO container preflight failed."
-    warn "This predicts the Stage 9 /bin/bash Exec format error."
+    warn "This predicts Stage 9 live ISO container execution failure."
+    warn "Runtime: $runtime"
     warn "Log: $log"
     print_failure_tail "$log"
-    return "$status"
+
+    choice="$(menu "Live ISO Container Preflight Failure
+
+The live ISO helper container could not be pulled or executed with the selected
+runtime/platform. Stage 8 image builds have already completed, so this is
+isolated to Stage 9." "1" \
+      "1|Open shell in live-iso directory [DEFAULT]|Inspect runtime image cache and live-iso scripts, then exit to resume." \
+      "2|Retry with Podman runtime|Set LIVE_ISO_CONTAINER_RUNTIME=podman and retry preflight." \
+      "3|Retry with Docker runtime|Set LIVE_ISO_CONTAINER_RUNTIME=docker and retry preflight." \
+      "4|Abort build|Stop and preserve logs/artifacts.")"
+
+    case "$choice" in
+      1)
+        open_shell "$live"
+        preflight_live_iso_container "$live"
+        return $?
+        ;;
+      2)
+        LIVE_ISO_CONTAINER_RUNTIME="podman"
+        preflight_live_iso_container "$live"
+        return $?
+        ;;
+      3)
+        LIVE_ISO_CONTAINER_RUNTIME="docker"
+        preflight_live_iso_container "$live"
+        return $?
+        ;;
+      4|*)
+        return "$status"
+        ;;
+    esac
   fi
 
   ok "Live ISO container preflight passed."
@@ -3795,13 +3842,75 @@ patch_live_conf() {
 
 build_iso() {
   local live="$SOURCES_DIR/live-iso"
+  local runtime
+  local log
+  local status
+  local action
+
   [[ -d "$live" ]] || die "live-iso source missing."
   patch_live_conf
-  preflight_live_iso_container "$live"
-  # Use bash -lc so the input redirection into build.sh is logged and failures are diagnosed.
-  # Force the platform because Docker may otherwise pull/run the wrong manifest
-  # for the live ISO helper image on Apple Silicon / ARM64 VMs.
-  run_logged "Build live ISO" "$live" bash -lc 'docker run --privileged --platform "$LIVE_ISO_CONTAINER_PLATFORM" -i -v /proc:/proc -v "$PWD":/working_dir -w /working_dir "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -s etc/terraform.conf < build.sh'
+  preflight_live_iso_container "$live" || die "Live ISO container preflight failed. See log above."
+
+  runtime="$(live_iso_runtime_cmd)"
+  mkdir -p "$OUTPUT_DIR/logs"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-build-live-iso-$(date -u +%H%M%S).log"
+  LAST_COMMAND_LOG="$log"
+
+  info "Build live ISO"
+  printf 'Working directory: %s\n' "$live" >&2
+  printf 'Runtime: %s\n' "$runtime" >&2
+  printf 'Container image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE" >&2
+  printf 'Platform: %s\n' "$LIVE_ISO_CONTAINER_PLATFORM" >&2
+  printf 'Command log: %s\n' "$log" >&2
+
+  {
+    printf '### Build live ISO\n'
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### PWD: %s\n' "$live"
+    printf '### RUNTIME: %s\n' "$runtime"
+    printf '### IMAGE: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf '### PLATFORM: %s\n\n' "$LIVE_ISO_CONTAINER_PLATFORM"
+  } >"$log"
+
+  set +e
+  (
+    cd "$live" || exit 97
+    "$runtime" run --privileged --platform "$LIVE_ISO_CONTAINER_PLATFORM" \
+      --network host \
+      -i \
+      -v /proc:/proc \
+      -v "$PWD":/working_dir \
+      -w /working_dir \
+      "$LIVE_ISO_CONTAINER_IMAGE" \
+      /bin/bash -s etc/terraform.conf < build.sh
+  ) 2>&1 | tee -a "$log"
+  status=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$status" -eq 0 ]]; then
+    ok "Build live ISO completed successfully."
+    return 0
+  fi
+
+  if grep -q "Exec format error" "$log"; then
+    fail "Live ISO build failed because the helper container architecture is wrong."
+    grep -n "Exec format error" "$log" >&2 || true
+    warn "Current LIVE_ISO_CONTAINER_RUNTIME=$LIVE_ISO_CONTAINER_RUNTIME"
+    warn "Current LIVE_ISO_CONTAINER_PLATFORM=$LIVE_ISO_CONTAINER_PLATFORM"
+  elif grep -q "image not known\|no such image" "$log"; then
+    fail "Live ISO build failed because the selected runtime could not resolve the helper image locally/remotely."
+    grep -nE "image not known|no such image" "$log" >&2 || true
+    warn "Current runtime: $runtime"
+  fi
+
+  action="$(command_failure_menu "Build live ISO" "$live" "$log" "$status")"
+  case "$action" in
+    shell) open_shell "$live" ;;
+    logshell) open_shell "$OUTPUT_DIR/logs" ;;
+    retry) build_iso; return $? ;;
+    diagnose) warn "Deep diagnostics are currently implemented for Vib commands only." ;;
+    abort|*) die "Build aborted after live ISO failure. See log: $log" ;;
+  esac
 }
 # ---------------------------- release ---------------------------------
 
