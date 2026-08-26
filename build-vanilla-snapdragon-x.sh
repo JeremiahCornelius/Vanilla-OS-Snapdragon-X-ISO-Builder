@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.19.sh
+# build-vanilla-arm64-release-v2.7.20.sh
 #
 # Conception Vanilla ARM64 Release Builder
-# Version: 2.7.19
+# Version: 2.7.20
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.19"
+SCRIPT_VERSION="2.7.20"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -1718,7 +1718,7 @@ patch_live_iso_grub_for_custom_dtb() {
   # The upstream file may be minified onto one physical line, so line-oriented
   # sed insertion is deliberately avoided.
   #
-  # Boot strategy in v2.7.19:
+  # Boot strategy in v2.7.20:
   #   1. Preserve every existing menuentry and its proven kernel/initrd paths.
   #   2. Preserve the selected board DTB before every live initrd command.
   #   3. Make the first live entry diagnostic by removing quiet/splash and
@@ -1729,6 +1729,9 @@ patch_live_iso_grub_for_custom_dtb() {
   #      Nouveau is irrelevant to the Qualcomm target.
   local live="$1"
   local dtb_name="$2"
+  local expected_kver="$3"
+  local custom_kernel_path="/live/vmlinuz-$expected_kver"
+  local custom_initrd_path="/live/initrd.img-$expected_kver"
   local grub="$live/etc/config/bootloaders/grub-pc/grub.cfg"
   local backup tmp log expected_entries patched_entries rc
 
@@ -1757,8 +1760,8 @@ patch_live_iso_grub_for_custom_dtb() {
   } >"$log"
 
   set +e
-  python3 - "$grub" "$tmp" "$dtb_name" \
-    "$BOOT_DIAGNOSTIC_ARGS" "$BOOT_NORMAL_ARGS" "$BOOT_FIRMWARE_FB_ARGS" <<'PYGRUB'
+  python3 - "$grub" "$tmp" "$dtb_name" "$custom_kernel_path" "$custom_initrd_path" \
+    "$BOOT_DIAGNOSTIC_ARGS" "$BOOT_NORMAL_ARGS" "$BOOT_FIRMWARE_FB_ARGS" <<'PYGRUB' 
 import re
 import sys
 from pathlib import Path
@@ -1766,9 +1769,11 @@ from pathlib import Path
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 dtb = sys.argv[3]
-diag_args = sys.argv[4].strip()
-normal_args = sys.argv[5].strip()
-firmware_fb_args = sys.argv[6].strip()
+custom_kernel = sys.argv[4]
+custom_initrd = sys.argv[5]
+diag_args = sys.argv[6].strip()
+normal_args = sys.argv[7].strip()
+firmware_fb_args = sys.argv[8].strip()
 marker = "CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER"
 
 data = src.read_text(encoding="utf-8")
@@ -1795,6 +1800,15 @@ data, dtb_count = pattern.subn(
 )
 if dtb_count == 0:
     raise SystemExit(20)
+
+# Replace the live initrd placeholder directly with the exact custom initramfs.
+data, initrd_count = re.subn(
+    r"\b(initrd(?:efi)?\s+)INITRD_LIVE\b",
+    lambda m: m.group(1) + custom_initrd,
+    data,
+)
+if initrd_count != dtb_count:
+    raise SystemExit(21)
 
 # Parse menuentry blocks with brace-depth tracking. This remains robust when
 # the upstream template is minified or uses multiline entries.
@@ -1830,22 +1844,16 @@ while True:
     entries.append((m.start(), i, m.group(2)))
     pos = i
 
-live_entries = [(s, e, title) for s, e, title in entries if "INITRD_LIVE" in data[s:e]]
+live_entries = [(s, e, title) for s, e, title in entries if custom_initrd in data[s:e]]
 if not live_entries:
     raise SystemExit("no live menuentry blocks found")
 
 
 def rewrite_linux_args(block: str, desired: str) -> str:
-    # Preserve the upstream live-build placeholders exactly. The current
-    # Vanilla ARM template uses:
-    #
-    #   linux KERNEL_LIVE APPEND_LIVE ---
-    #
-    # Older revisions may use LINUX_LIVE with explicit arguments. Diagnostic
-    # arguments are appended immediately before `---`, so APPEND_LIVE continues
-    # to supply the proven boot=live/config/user/findiso command line.
+    # Replace only the kernel placeholder/path. Preserve APPEND_LIVE exactly.
     linux_re = re.compile(
-        r"(\blinux(?:efi)?[ \t]+(?:KERNEL_LIVE|LINUX_LIVE)\b)"
+        r"(\blinux(?:efi)?[ \t]+)"
+        r"(?:KERNEL_LIVE|LINUX_LIVE|/live/vmlinuz-[^\s]+)"
         r"(.*?)"
         r"([ \t]+---)",
         re.S,
@@ -1853,13 +1861,9 @@ def rewrite_linux_args(block: str, desired: str) -> str:
     m = linux_re.search(block)
     if not m:
         compact = " ".join(block.split())[:500]
-        raise SystemExit(
-            "live menuentry lacks a parseable KERNEL_LIVE/LINUX_LIVE "
-            f"kernel command; entry excerpt: {compact}"
-        )
+        raise SystemExit(f"live menuentry lacks a parseable kernel command; entry excerpt: {compact}")
 
-    middle = m.group(2)
-    tokens = middle.split()
+    tokens = m.group(2).split()
     controlled = {
         "quiet", "splash", "bgrt_disable", "nomodeset", "initcall_debug",
         "keep_bootcon", "ignore_loglevel", "earlycon",
@@ -1869,22 +1873,20 @@ def rewrite_linux_args(block: str, desired: str) -> str:
     }
     kept = []
     for token in tokens:
-        # APPEND_LIVE is an opaque upstream placeholder and must never be
-        # removed or expanded by this builder.
         if token == "APPEND_LIVE":
             kept.append(token)
+        elif token in controlled:
             continue
-        if token in controlled:
+        elif token.startswith("loglevel=") or token.startswith("console="):
             continue
-        if token.startswith("loglevel=") or token.startswith("console="):
+        elif token.startswith("modprobe.blacklist=nouveau"):
             continue
-        if token.startswith("modprobe.blacklist=nouveau"):
-            continue
-        kept.append(token)
+        else:
+            kept.append(token)
 
     merged_tokens = kept + desired.split()
     merged = " " + " ".join(merged_tokens) if merged_tokens else ""
-    return block[:m.start(2)] + merged + block[m.end(2):]
+    return block[:m.start()] + m.group(1) + custom_kernel + merged + m.group(3) + block[m.end():]
 
 # Rewrite from the end so offsets remain valid.
 blocks = []
@@ -1919,6 +1921,13 @@ required = (
 for title in required:
     if title not in data:
         raise SystemExit(f"required GRUB entry missing after patch: {title}")
+
+if any(token in data for token in ("KERNEL_LIVE", "LINUX_LIVE", "INITRD_LIVE")):
+    raise SystemExit("unresolved live kernel/initrd placeholder remains after patch")
+if data.count(custom_kernel) < len(live_entries):
+    raise SystemExit("not every live entry references the exact custom kernel")
+if data.count(custom_initrd) < len(live_entries):
+    raise SystemExit("not every live entry references the exact custom initramfs")
 
 # Menu remains visible long enough to select a fallback entry.
 data = re.sub(r"(?m)^set timeout=\d+[ \t]*$", "set timeout=10", data, count=1)
@@ -1955,8 +1964,11 @@ PYGRUB
   grep -q 'Install Vanilla OS 2 (Normal Graphics)' "$grub" || return 1
   grep -q 'keep_bootcon' "$grub" || return 1
   grep -q 'plymouth.enable=0' "$grub" || return 1
+  grep -Fq "linux $custom_kernel_path" "$grub" || return 1
+  grep -Fq "initrd $custom_initrd_path" "$grub" || return 1
+  ! grep -Eq 'KERNEL_LIVE|LINUX_LIVE|INITRD_LIVE' "$grub" || return 1
 
-  ok "Patched GRUB with diagnostic, firmware-framebuffer, and normal-graphics boot modes."
+  ok "Patched GRUB to boot the exact custom kernel with diagnostic, firmware-framebuffer, and normal-graphics modes."
   printf 'GRUB patch log:\n  %s\n' "$log" >&2
 }
 
@@ -2007,6 +2019,21 @@ verify_live_iso_source_integration() {
     fail "GRUB template does not load expected DTB: $dtb_name"
     failed=1
   }
+
+  grep -Fq "linux /live/vmlinuz-$expected_kver" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB template does not reference exact custom kernel: /live/vmlinuz-$expected_kver"
+    failed=1
+  }
+
+  grep -Fq "initrd /live/initrd.img-$expected_kver" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB template does not reference exact custom initramfs: /live/initrd.img-$expected_kver"
+    failed=1
+  }
+
+  if grep -Eq 'KERNEL_LIVE|LINUX_LIVE|INITRD_LIVE' "$live/etc/config/bootloaders/grub-pc/grub.cfg"; then
+    fail "GRUB template retains unresolved live kernel/initrd placeholders."
+    failed=1
+  fi
 
   grep -q 'Install Vanilla OS 2 (Diagnostic Boot)' "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
     fail "GRUB template is missing the diagnostic boot entry."
@@ -2127,6 +2154,18 @@ verify_built_iso_custom_boot_artifacts() {
     return 1
   fi
 
+  if ! grep -q "/live/vmlinuz-$expected_kver" "$listing"; then
+    fail "Generated ISO does not contain exact custom boot kernel /live/vmlinuz-$expected_kver"
+    warn "Verification log: $log"
+    return 1
+  fi
+
+  if ! grep -q "/live/initrd.img-$expected_kver" "$listing"; then
+    fail "Generated ISO does not contain exact custom initramfs /live/initrd.img-$expected_kver"
+    warn "Verification log: $log"
+    return 1
+  fi
+
   grub_path="$(grep -E '/boot/grub/grub.cfg$|/EFI/BOOT/grub.cfg$' "$listing" | head -n1 || true)"
   squash_path="$(grep -E '/live/filesystem\.squashfs$' "$listing" | head -n1 || true)"
 
@@ -2163,6 +2202,24 @@ verify_built_iso_custom_boot_artifacts() {
       warn "Verification log: $log"
       return 1
     }
+
+    grep -Fq "linux /live/vmlinuz-$expected_kver" "$grub_extract" || {
+      fail "Generated ISO GRUB config does not reference exact custom kernel."
+      warn "Verification log: $log"
+      return 1
+    }
+
+    grep -Fq "initrd /live/initrd.img-$expected_kver" "$grub_extract" || {
+      fail "Generated ISO GRUB config does not reference exact custom initramfs."
+      warn "Verification log: $log"
+      return 1
+    }
+
+    if grep -Eq 'KERNEL_LIVE|LINUX_LIVE|INITRD_LIVE' "$grub_extract"; then
+      fail "Generated ISO GRUB config retains unresolved kernel/initramfs placeholders."
+      warn "Verification log: $log"
+      return 1
+    fi
 
     grep -q 'Install Vanilla OS 2 (Diagnostic Boot)' "$grub_extract" || {
       fail "Generated ISO GRUB config lacks the diagnostic boot entry."
@@ -2622,6 +2679,17 @@ test -s "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" || {
   exit 84
 }
 
+# Leave only the custom boot pair in /boot so Vanilla/live-build cannot export
+# its standard kernel while constructing the ISO's /live directory.
+for candidate in /boot/vmlinuz-* /boot/initrd.img-*; do
+  [ -e "\$candidate" ] || continue
+  case "\$candidate" in
+    "/boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL"|
+    "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL") ;;
+    *) rm -f -- "\$candidate" ;;
+  esac
+done
+
 # Record initramfs contents for post-build diagnosis. Missing individual module
 # names are not fatal because a driver may be built into the custom kernel.
 if command -v lsinitramfs >/dev/null 2>&1; then
@@ -2640,8 +2708,8 @@ echo "Custom ARM64 kernel and DTB validated successfully."
 EOF
     chmod +x "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot"
 
-    patch_live_iso_grub_for_custom_dtb "$live" "$dtb_name" \
-      || die "Unable to integrate the custom DTB into the live ISO GRUB template."
+    patch_live_iso_grub_for_custom_dtb "$live" "$dtb_name" "$expected_kver" \
+      || die "Unable to integrate the custom kernel and DTB into the live ISO GRUB template."
     verify_live_iso_source_integration "$live" "$expected_kver" "$dtb_name" \
       || die "Live ISO custom kernel/DTB source verification failed."
   fi
