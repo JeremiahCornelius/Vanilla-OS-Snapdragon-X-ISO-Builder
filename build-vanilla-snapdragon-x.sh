@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.1.sh
+# build-vanilla-arm64-release-v2.4.4.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.1
+# Version: 2.4.4
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.3"
+SCRIPT_VERSION="2.4.4"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -58,10 +58,96 @@ die()   { fail "$*"; exit 1; }
 
 stage() {
   local n="$1" total="$2" msg="$3"
+  CURRENT_STAGE="$n/$total: $msg"
   printf '\n%s[Stage %s of %s]%s %s\n' "$C_BOLD" "$n" "$total" "$C_RESET" "$msg" >&2
 }
 
 hr() { printf '%s\n' '==================================================================' >&2; }
+
+
+# Current high-level stage, used by failure diagnostics.
+CURRENT_STAGE="startup"
+LAST_COMMAND_LOG=""
+
+print_failure_tail() {
+  local log="$1"
+  if [[ -n "$log" && -f "$log" ]]; then
+    printf '\n%sLast 80 lines from failing command log:%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf 'Log file: %s\n' "$log" >&2
+    printf '%s\n' '------------------------------------------------------------------' >&2
+    tail -n 80 "$log" >&2 || true
+    printf '%s\n' '------------------------------------------------------------------' >&2
+  fi
+}
+
+command_failure_menu() {
+  local label="$1" workdir="$2" log="$3" status="$4"
+  fail "Command failed during stage ${CURRENT_STAGE}."
+  printf 'Command label: %s\n' "$label" >&2
+  printf 'Exit status:   %s\n' "$status" >&2
+  printf 'Working dir:   %s\n' "$workdir" >&2
+  printf 'Command log:   %s\n' "$log" >&2
+  print_failure_tail "$log"
+
+  local choice
+  choice="$(menu "Build Command Failure
+
+The previous command failed. You can inspect the working directory and log before deciding whether to abort or retry." "1" \
+    "1|Open an interactive shell in the failing working directory [RECOMMENDED]|Inspect recipe files, generated hooks, container state, and logs. Type 'exit' to return." \
+    "2|Retry the failed command|Run the same command again after any manual corrections." \
+    "3|Abort build|Stop immediately and preserve logs/workspace for diagnosis.")"
+  case "$choice" in
+    1) open_shell "$workdir"; return 10 ;;
+    2) return 11 ;;
+    3) die "Build aborted after command failure. See log: $log" ;;
+  esac
+}
+
+run_logged() {
+  # Run a command with explicit per-command logging and failure diagnostics.
+  # Usage: run_logged "human label" "/working/dir" command arg ...
+  local label="$1" workdir="$2"; shift 2
+  local safe log status
+  safe="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-|-$//g')"
+  mkdir -p "$OUTPUT_DIR/logs"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-${safe}-$(date -u +%H%M%S).log"
+  LAST_COMMAND_LOG="$log"
+
+  while true; do
+    info "$label"
+    printf 'Working directory: %s\n' "$workdir" >&2
+    printf 'Command: ' >&2
+    printf '%q ' "$@" >&2
+    printf '\nCommand log: %s\n' "$log" >&2
+
+    set +e
+    (
+      cd "$workdir" || exit 97
+      printf '### %s\n' "$label"
+      printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '### PWD: %s\n' "$PWD"
+      printf '### COMMAND:'
+      printf ' %q' "$@"
+      printf '\n\n'
+      "$@"
+    ) 2>&1 | tee -a "$log"
+    status="${PIPESTATUS[0]}"
+    set -e
+
+    if [[ "$status" -eq 0 ]]; then
+      ok "$label completed successfully."
+      return 0
+    fi
+
+    command_failure_menu "$label" "$workdir" "$log" "$status"
+    case "$?" in
+      10) continue ;;
+      11) continue ;;
+    esac
+  done
+}
+
+trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
 
 # -------------------------- string/path helpers ------------------------
 
@@ -1111,14 +1197,16 @@ build_images() {
   local core="$SOURCES_DIR/core-image"
   local desktop="$SOURCES_DIR/desktop-image"
   if [[ -d "$core" ]]; then
-    info "Building core image with Vib."
-    (cd "$core" && vib build recipe.yml)
-    (cd "$core" && podman image build -t "local/vanilla-core:$PROFILE-$BUILD_DATE" .)
+    run_logged "Build core image with Vib" "$core" vib build recipe.yml
+    run_logged "Build local core container image" "$core" podman image build -t "local/vanilla-core:$PROFILE-$BUILD_DATE" .
+  else
+    warn "core-image source directory is missing; skipping core image build."
   fi
   if [[ -d "$desktop" ]]; then
-    info "Building desktop image with Vib."
-    (cd "$desktop" && vib build recipe.yml)
-    (cd "$desktop" && podman image build -t "local/vanilla-desktop:$PROFILE-$BUILD_DATE" .)
+    run_logged "Build desktop image with Vib" "$desktop" vib build recipe.yml
+    run_logged "Build local desktop container image" "$desktop" podman image build -t "local/vanilla-desktop:$PROFILE-$BUILD_DATE" .
+  else
+    warn "desktop-image source directory is missing; skipping desktop image build."
   fi
 }
 
@@ -1134,14 +1222,9 @@ build_iso() {
   local live="$SOURCES_DIR/live-iso"
   [[ -d "$live" ]] || die "live-iso source missing."
   patch_live_conf
-  info "Building live ISO."
-  (cd "$live" && docker run --privileged -i -v /proc:/proc \
-    -v "$PWD":/working_dir \
-    -w /working_dir \
-    ghcr.io/vanilla-os/pico:main \
-    /bin/bash -s etc/terraform.conf < build.sh)
+  # Use bash -lc so the input redirection into build.sh is logged and failures are diagnosed.
+  run_logged "Build live ISO" "$live" bash -lc 'docker run --privileged -i -v /proc:/proc -v "$PWD":/working_dir -w /working_dir ghcr.io/vanilla-os/pico:main /bin/bash -s etc/terraform.conf < build.sh'
 }
-
 # ---------------------------- release ---------------------------------
 
 next_release_id() {
@@ -1355,6 +1438,25 @@ stage_qcom_firmware
 stage 6 11 "Preparing build summary."
 release_id="$(next_release_id)"
 release_dir_preview="$RELEASES_DIR/${BUILD_DATE}-${release_id}-${PROFILE}"
+mkdir -p "$release_dir_preview/logs"
+cat >"$release_dir_preview/BUILD-PLAN.md" <<EOF
+# Vanilla ARM64 Build Plan
+
+Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+Profile: $PROFILE
+Architecture: $ARCH
+Primary DTB: ${PRIMARY_DTB:-none selected}
+Artifact directory: $ARTIFACT_DIR
+Root overlay directory: $ROOT_OVERLAY_DIR
+Qualcomm firmware mode: ${QCOM_MODE:-skip}
+Qualcomm device path: ${QCOM_DEVICE_PATH:-not applicable}
+
+This file is written before the long-running build begins so the stamped
+release directory exists during pre-build inspection.
+EOF
+info "Prepared stamped release directory before build: $release_dir_preview"
+
 summary_choice="$(menu "Build Summary
 
 Profile:
