@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.1.sh
+# build-vanilla-arm64-release-v2.6.2.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.1
+# Version: 2.6.2
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.1"
+SCRIPT_VERSION="2.6.2"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -169,6 +169,82 @@ The previous command failed. If the command produced no useful output, the build
 }
 
 
+
+ensure_user_can_traverse_path() {
+  # Ensure the non-root Vib user can traverse every parent directory needed to
+  # reach the build workspace. This matters when the builder is executed as root
+  # and WORKDIR defaults under /root. Even if WORKDIR itself is chowned to the
+  # Vib user, /root is usually mode 0700, so runuser cannot `cd` into
+  # /root/src/vanilla-arm64-build-system/...
+  #
+  # Preferred method:
+  #   setfacl -m u:<user>:--x <parent>
+  #
+  # Fallback:
+  #   chmod o+x <parent>
+  #
+  # The fallback is intentionally limited to execute/search permission on parent
+  # directories. It does not grant read permission, and it does not expose files
+  # inside /root. It only allows path traversal to the explicitly chowned
+  # workspace.
+  local user="$1"
+  local target="$2"
+  local path parent
+  local changed_log="$OUTPUT_DIR/logs/${BUILD_DATE}-vib-path-traversal-$(date -u +%H%M%S).log"
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  : > "$changed_log"
+
+  target="$(readlink -f "$target")"
+  [[ -n "$target" && -d "$target" ]] || die "Cannot resolve Vib workspace path for traversal setup: $target"
+
+  info "Checking parent-directory traversal for Vib user $user."
+  printf 'Target path: %s\n' "$target" >>"$changed_log"
+  printf 'User: %s\n\n' "$user" >>"$changed_log"
+
+  parent="/"
+  IFS='/' read -r -a parts <<< "${target#/}"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    parent="${parent%/}/$part"
+
+    # Stop after the target itself; ownership/permissions for contents are
+    # handled separately by chown -R.
+    if [[ "$parent" == "$target" ]]; then
+      break
+    fi
+
+    if runuser -u "$user" -- test -x "$parent" 2>/dev/null; then
+      printf 'PASS traverse: %s\n' "$parent" >>"$changed_log"
+      continue
+    fi
+
+    printf 'NEEDS traverse permission: %s\n' "$parent" >>"$changed_log"
+
+    if command -v setfacl >/dev/null 2>&1; then
+      info "Granting execute-only ACL for $user on parent directory: $parent"
+      setfacl -m "u:${user}:--x" "$parent" \
+        || die "Failed to grant ACL traversal permission on $parent"
+      printf 'ACTION setfacl -m u:%s:--x %s\n' "$user" "$parent" >>"$changed_log"
+    else
+      warn "setfacl is not available; using chmod o+x on parent directory: $parent"
+      chmod o+x "$parent" \
+        || die "Failed to grant execute/search permission on $parent"
+      printf 'ACTION chmod o+x %s\n' "$parent" >>"$changed_log"
+    fi
+  done
+
+  if ! runuser -u "$user" -- test -x "$target" 2>/dev/null; then
+    fail "Vib user still cannot traverse to workspace after permission setup."
+    warn "Traversal log: $changed_log"
+    return 1
+  fi
+
+  ok "Vib user can traverse to workspace."
+  printf '\nRESULT: Vib user can traverse target workspace.\n' >>"$changed_log"
+  printf 'Traversal log:\n  %s\n' "$changed_log" >&2
+}
+
 ensure_vib_run_user() {
   # Vib appears to exit immediately when executed as UID 0. Strace showed:
   #   getuid() = 0
@@ -197,6 +273,8 @@ ensure_vib_run_user() {
   info "Ensuring build workspace is writable by $VIB_RUN_USER for Vib stages."
   chown -R "$VIB_RUN_USER:$VIB_RUN_USER" "$WORKDIR" \
     || die "Unable to chown build workspace to $VIB_RUN_USER: $WORKDIR"
+
+  ensure_user_can_traverse_path "$VIB_RUN_USER" "$WORKDIR"
 }
 
 run_as_vib_user() {
@@ -206,7 +284,13 @@ run_as_vib_user() {
 
   if [[ "$(id -u)" -eq 0 && "$VIB_ALLOW_ROOT" != "1" ]]; then
     if command -v runuser >/dev/null 2>&1; then
-      runuser -u "$VIB_RUN_USER" -- bash -lc "cd $(printf '%q' "$workdir") && PATH=$(printf '%q' "$PATH") exec $(printf '%q ' "$@")"
+      local cmd
+      cmd="cd $(printf '%q' "$workdir") && PATH=$(printf '%q' "$PATH") exec"
+      local arg
+      for arg in "$@"; do
+        cmd+=" $(printf '%q' "$arg")"
+      done
+      runuser -u "$VIB_RUN_USER" -- bash -lc "$cmd"
     elif command -v su >/dev/null 2>&1; then
       su -s /bin/bash "$VIB_RUN_USER" -c "cd $(printf '%q' "$workdir") && PATH=$(printf '%q' "$PATH") exec $(printf '%q ' "$@")"
     else
@@ -973,7 +1057,7 @@ check_dependencies() {
   fail "Missing required tools: ${missing[*]}"
   printf '\nSuggested Debian 13 packages for common tools:\n' >&2
   printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace bsdutils util-linux file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
+  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace bsdutils util-linux acl file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
   printf 'Additional builder requirement:\n' >&2
   printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
 
