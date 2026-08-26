@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.5.sh
+# build-vanilla-arm64-release-v2.4.6.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.5
+# Version: 2.4.6
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.5"
+SCRIPT_VERSION="2.4.6"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -115,11 +115,14 @@ run_logged() {
   # Run a command with explicit per-command logging and failure diagnostics.
   # Usage: run_logged "human label" "/working/dir" command arg ...
   #
-  # Important: expected subprocess failures are handled locally here. The global
-  # ERR trap remains useful for unexpected script bugs, but it must not fire
-  # while we are intentionally collecting a command's non-zero exit status.
+  # Trap-safety note:
+  #   This function intentionally disables both errexit and the global ERR trap
+  #   while the child command executes. A failing Vib/container command is an
+  #   expected condition that must be captured, logged, and presented to the
+  #   operator. If the ERR trap remains active here, Bash can recursively invoke
+  #   the global failure handler before the actual command output is preserved.
   local label="$1" workdir="$2"; shift 2
-  local safe log status action
+  local safe log status action old_errexit old_errtrace
   safe="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-|-$//g')"
   mkdir -p "$OUTPUT_DIR/logs"
 
@@ -133,27 +136,39 @@ run_logged() {
     printf '%q ' "$@" >&2
     printf '\nCommand log: %s\n' "$log" >&2
 
-    set +e
-    (
-      cd "$workdir" || exit 97
+    {
       printf '### %s\n' "$label"
       printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      printf '### PWD: %s\n' "$PWD"
+      printf '### PWD: %s\n' "$workdir"
       printf '### COMMAND:'
       printf ' %q' "$@"
       printf '\n\n'
+    } > "$log"
+
+    # Save shell option state for the two options we are about to relax.
+    case "$-" in *e*) old_errexit=1 ;; *) old_errexit=0 ;; esac
+    case "$-" in *E*) old_errtrace=1 ;; *) old_errtrace=0 ;; esac
+
+    # Disable ERR trap and errexit for the expected-failure boundary only.
+    trap - ERR
+    set +e
+    set +E
+    (
+      cd "$workdir" || exit 97
       "$@"
-    ) > >(tee -a "$log") 2> >(tee -a "$log" >&2)
+    ) >> "$log" 2>&1
     status=$?
-    set -e
+
+    # Restore shell behavior for the rest of the builder.
+    if [[ "$old_errtrace" -eq 1 ]]; then set -E; else set +E; fi
+    if [[ "$old_errexit" -eq 1 ]]; then set -e; else set +e; fi
+    trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
 
     if [[ "$status" -eq 0 ]]; then
       ok "$label completed successfully."
       return 0
     fi
 
-    # command_failure_menu writes only the action token to stdout. Its status is
-    # always zero by design, avoiding recursive ERR-trap diagnostics.
     action="$(command_failure_menu "$label" "$workdir" "$log" "$status")"
     case "$action" in
       shell)
