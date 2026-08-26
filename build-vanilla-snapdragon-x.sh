@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.4.2"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -798,6 +798,14 @@ apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl unzip p7zip-full zstd rsync bash coreutils findutils file
 
+# qcom-firmware-updater is designed for a live target system and uses sudo
+# only for installation steps. Inside this disposable container we are already
+# root and /lib/firmware belongs to the container, not the build host. Provide
+# a harmless sudo shim so the updater can copy into the container firmware tree
+# without requiring the sudo package or touching the host.
+printf '#!/usr/bin/env bash\nexec "$@"\n' >/usr/local/bin/sudo
+chmod +x /usr/local/bin/sudo
+
 mkdir -p /out/lib/firmware /work
 cp -a /updater /work/qcom-firmware-updater
 cd /work/qcom-firmware-updater
@@ -806,11 +814,14 @@ log "Running qcom-firmware-updater in disposable container."
 log "Device path: ${QCOM_DEVICE_PATH:-unset}"
 
 if [[ -n "${QCOM_URL:-}" ]]; then
-  bash ./qcom-firmware-updater.sh --url "$QCOM_URL" "$QCOM_DEVICE_PATH" || true
+  # Current qcom-firmware-updater syntax accepts the target path via
+  # --device-path, not as a second positional argument. Passing the device path
+  # positionally causes: "ERROR: Only one input file allowed".
+  bash ./qcom-firmware-updater.sh --device-path "$QCOM_DEVICE_PATH" --url "$QCOM_URL" || true
 elif compgen -G "/input/*" >/dev/null; then
   local_file="$(find /input -maxdepth 1 -type f | sort | head -n1)"
   log "Using local driver archive: $local_file"
-  bash ./qcom-firmware-updater.sh "$local_file" "$QCOM_DEVICE_PATH" || true
+  bash ./qcom-firmware-updater.sh --device-path "$QCOM_DEVICE_PATH" "$local_file" || true
 else
   log "No local archive or URL was supplied to the container."
 fi
