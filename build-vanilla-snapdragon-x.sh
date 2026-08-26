@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.2
+# Version 7.0.3
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,23 +11,25 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.2 corrections after the v7.0.1 source-handling field test:
-#   - Repository policy selection is no longer deferred until after final build
-#     confirmation. In execute mode, the official repositories are checked,
-#     cloned/refreshed, validated, and retained in sources/ immediately after
-#     the host dependency preflight.
-#   - Empty sources/ is an explicit supported and tested condition.
-#   - Aborting after source validation preserves the synchronized repositories.
-#   - Plan mode remains non-mutating and clearly reports that it does not clone
-#     or refresh repositories.
-#   - Preserves the v7.0.1 interactive artifact, firmware, target-image, Git
-#     validation, package-removal safety, kernel metadata, Vib custom-image,
-#     and live graphical package-closure logic.
+# v7.0.3 corrections after the v7.0.2 Vib field test:
+#   - Normalizes Vib execution when the builder is run from a direct root shell.
+#     Current Vib requires SUDO_UID, SUDO_GID, and SUDO_USER whenever uid 0 is
+#     detected; without them Vib returns status 1 before Cobra can run.
+#   - Runs Vib through a dedicated wrapper that supplies a deterministic root
+#     identity and cache/home context without changing the host user database.
+#   - Validates the selected Vib binary before recipe generation and refuses a
+#     silent or incompatible executable.
+#   - Captures recipe, modules, plugin inventory, executable metadata, and Vib
+#     version into a diagnostic directory when recipe generation fails.
+#   - Corrects the stale "Resolved v7.0.1 plan" heading to use SCRIPT_VERSION.
+#   - Preserves all v7.0.2 source synchronization, interactive questions,
+#     firmware alternatives, dependency safeguards, custom-image architecture,
+#     and live graphical package-closure protections.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.2"
+SCRIPT_VERSION="7.0.3"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -62,6 +64,7 @@ PUSH_TARGET_IMAGE="${PUSH_TARGET_IMAGE:-0}"
 
 VIB_VERSION="${VIB_VERSION:-latest}"
 VIB_BIN="${VIB_BIN:-}"
+VIB_DETECTED_VERSION=""
 
 REPO_POLICY="${REPO_POLICY:-ask-once}"
 FIRMWARE_MODE="${FIRMWARE_MODE:-ask}"
@@ -258,7 +261,11 @@ on_error() {
   fail "Line: ${BASH_LINENO[0]:-unknown}; exit status: $rc"
   if [[ -n "$CURRENT_LOG" && -f "$CURRENT_LOG" ]]; then
     fail "Last 80 log lines: $CURRENT_LOG"
-    tail -n 80 "$CURRENT_LOG" >&2 || true
+    if [[ -s "$CURRENT_LOG" ]]; then
+      tail -n 80 "$CURRENT_LOG" >&2 || true
+    else
+      fail "The failing command produced an empty log."
+    fi
   fi
   exit "$rc"
 }
@@ -390,7 +397,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.2-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.3-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -1362,7 +1369,7 @@ print_plan() {
   preview_id="$(peek_next_release_id)"
   cat <<EOF
 
-Resolved v7.0.1 plan
+Resolved v$SCRIPT_VERSION plan
 --------------------
 Work directory:             $WORKDIR
 Profile:                    $PROFILE
@@ -1424,8 +1431,137 @@ host_arch() {
   esac
 }
 
+version_ge() {
+  local actual="$1" required="$2"
+  [[ -n "$actual" && -n "$required" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | sed -n '1p')" == "$required" ]]
+}
+
+vib_exec() {
+  # Vib currently expects sudo identity variables whenever it detects uid 0.
+  # Direct root shells do not provide them, which causes Vib to return status 1
+  # before executing its Cobra command. Normalize the execution environment to
+  # a deterministic root identity so Vib can write the root-owned worktree.
+  local vib_home="/home/root"
+  local vib_cache="$CACHE_DIR/vib-root"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    mkdir -p "$vib_home"
+  fi
+  mkdir -p "$vib_cache"
+
+  env \
+    SUDO_UID=0 \
+    SUDO_GID=0 \
+    SUDO_USER=root \
+    HOME="$vib_home" \
+    XDG_CACHE_HOME="$vib_cache" \
+    "$VIB_BIN" "$@"
+}
+
+probe_vib_binary() {
+  local output rc detected
+  set +e
+  output="$(vib_exec --version 2>&1)"
+  rc=$?
+  set -e
+
+  if (( rc != 0 )); then
+    warn "Vib preflight failed with exit status $rc: $VIB_BIN"
+    [[ -n "$output" ]] && warn "$output" || warn "Vib produced no diagnostic output."
+    return 1
+  fi
+
+  detected="$(printf '%s\n' "$output" | grep -Eo '[0-9]+(\.[0-9]+){2}' | sed -n '1p' || true)"
+  [[ -n "$detected" ]] || {
+    warn "Unable to parse a semantic version from Vib output: ${output:-<empty>}"
+    return 1
+  }
+
+  version_ge "$detected" "1.0.7" || {
+    warn "Selected Vib version $detected is older than recipe requirement 1.0.7."
+    return 1
+  }
+
+  VIB_DETECTED_VERSION="$detected"
+  info "Vib version output: $output"
+  ok "Vib preflight passed with normalized root execution context."
+}
+
+download_builder_local_vib() {
+  local arch="$1" release_base="$2"
+  VIB_BIN="$WORKDIR/tools/vib"
+  mkdir -p "$(dirname "$VIB_BIN")"
+  info "Downloading Vib $VIB_VERSION for $arch to $VIB_BIN"
+  curl -fL "$release_base/vib-$arch" -o "$VIB_BIN"
+  chmod 0755 "$VIB_BIN"
+}
+
+capture_vib_diagnostics() {
+  local reason="$1"
+  local diag="$LOG_DIR/${SESSION_ID}-vib-diagnostics"
+  mkdir -p "$diag"
+
+  printf '%s\n' "$reason" > "$diag/FAILURE.txt"
+  printf '%s\n' "$VIB_BIN" > "$diag/vib-executable.path"
+  file "$VIB_BIN" > "$diag/vib-executable.file" 2>&1 || true
+  sha256sum "$VIB_BIN" > "$diag/vib-executable.sha256" 2>/dev/null || true
+
+  set +e
+  vib_exec --version > "$diag/vib-version.txt" 2>&1
+  printf '%s\n' "$?" > "$diag/vib-version.exit-status"
+  set -e
+
+  [[ -f "$CUSTOM_PROJECT/recipe.yml" ]] && cp -a "$CUSTOM_PROJECT/recipe.yml" "$diag/"
+  [[ -f "$CUSTOM_PROJECT/Containerfile" ]] && cp -a "$CUSTOM_PROJECT/Containerfile" "$diag/"
+  [[ -f "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" ]] && cp -a "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" "$diag/"
+
+  if [[ -d "$CUSTOM_PROJECT/modules" ]]; then
+    mkdir -p "$diag/modules"
+    cp -a "$CUSTOM_PROJECT/modules/." "$diag/modules/"
+  fi
+
+  if [[ -d "$CUSTOM_PROJECT/plugins" ]]; then
+    find "$CUSTOM_PROJECT/plugins" -printf '%M %u:%g %s %p\n' \
+      > "$diag/plugin-inventory.txt" 2>&1 || true
+  fi
+
+  (
+    printf 'uid=%s gid=%s user=%s\n' "$(id -u)" "$(id -g)" "$(id -un)"
+    printf 'SUDO_UID=%q\n' "${SUDO_UID:-}"
+    printf 'SUDO_GID=%q\n' "${SUDO_GID:-}"
+    printf 'SUDO_USER=%q\n' "${SUDO_USER:-}"
+    printf 'PWD=%q\n' "$PWD"
+    printf 'CUSTOM_PROJECT=%q\n' "$CUSTOM_PROJECT"
+    printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
+  ) > "$diag/execution-context.txt"
+
+  warn "Vib diagnostic bundle retained at: $diag"
+}
+
+run_logged_vib() {
+  local name="$1"; shift
+  local rc
+  CURRENT_LOG="$LOG_DIR/${SESSION_ID}-${name}.log"
+  mkdir -p "$LOG_DIR"
+  info "Log: $CURRENT_LOG"
+
+  set +e
+  vib_exec "$@" 2>&1 | tee "$CURRENT_LOG"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  if (( rc != 0 )); then
+    if [[ ! -s "$CURRENT_LOG" ]]; then
+      fail "Vib exited with status $rc and produced no output."
+      fail "This is consistent with failure before Cobra command execution."
+    fi
+    capture_vib_diagnostics "Vib command failed: $*; exit status: $rc"
+    return "$rc"
+  fi
+}
+
 install_vib_and_plugins() {
-  local arch release_base choice
+  local arch release_base choice selected_system=0
   arch="$(host_arch)"
   if [[ "$VIB_VERSION" == "latest" ]]; then
     release_base="https://github.com/Vanilla-OS/Vib/releases/latest/download"
@@ -1435,27 +1571,49 @@ install_vib_and_plugins() {
 
   if command_exists vib && [[ ! -x "$VIB_BIN" ]]; then
     if is_interactive; then
-      choice="$(menu "Vib Executable Selection\n\nSystem Vib detected:\n  $(command -v vib)\nBuilder-local default:\n  $VIB_BIN" "1" \
-        "1|Use the existing system Vib|Do not download another binary." \
+      choice="$(menu "Vib Executable Selection\n\nSystem Vib detected:\n  $(command -v vib)\nBuilder-local default:\n  $WORKDIR/tools/vib\n\nThe selected binary is validated using the same normalized execution context used for recipe generation." "1" \
+        "1|Use and validate the existing system Vib|Do not download another binary unless validation fails." \
         "2|Download a builder-local Vib binary|Pin execution to WORKDIR/tools/vib." \
         "3|Open a shell|Inspect Vib versions manually." \
         "4|Abort|Stop.")"
       case "$choice" in
-        1) VIB_BIN="$(command -v vib)" ;;
-        2) : ;;
+        1) VIB_BIN="$(command -v vib)"; selected_system=1 ;;
+        2) VIB_BIN="$WORKDIR/tools/vib" ;;
         3) open_shell "$WORKDIR"; install_vib_and_plugins; return ;;
         4) die "Vib selection aborted." ;;
       esac
     else
       VIB_BIN="$(command -v vib)"
+      selected_system=1
     fi
   fi
 
+  [[ -n "$VIB_BIN" ]] || VIB_BIN="$WORKDIR/tools/vib"
+
   if [[ ! -x "$VIB_BIN" ]]; then
-    mkdir -p "$(dirname "$VIB_BIN")"
-    info "Downloading Vib $VIB_VERSION for $arch to $VIB_BIN"
-    curl -fL "$release_base/vib-$arch" -o "$VIB_BIN"
-    chmod 0755 "$VIB_BIN"
+    download_builder_local_vib "$arch" "$release_base"
+  fi
+
+  if ! probe_vib_binary; then
+    if (( selected_system == 1 )); then
+      if is_interactive; then
+        choice="$(menu "System Vib Validation Failed\n\nThe existing system Vib could not pass the normalized version preflight." "1" \
+          "1|Download and use builder-local Vib [RECOMMENDED]|Continue with a freshly downloaded official binary." \
+          "2|Open a shell|Inspect the system Vib manually." \
+          "3|Abort|Stop.")"
+        case "$choice" in
+          1) download_builder_local_vib "$arch" "$release_base" ;;
+          2) open_shell "$WORKDIR"; install_vib_and_plugins; return ;;
+          3) die "Vib validation failed." ;;
+        esac
+      else
+        warn "System Vib validation failed; switching to builder-local official Vib."
+        download_builder_local_vib "$arch" "$release_base"
+      fi
+      probe_vib_binary || die "Builder-local Vib failed validation."
+    else
+      die "Selected Vib executable failed validation: $VIB_BIN"
+    fi
   fi
 
   local plugin_dir="$CUSTOM_PROJECT/plugins"
@@ -1467,10 +1625,12 @@ install_vib_and_plugins() {
     mkdir -p "$plugin_dir"
     tar -xzf "$archive" -C "$plugin_dir" --strip-components=2
   fi
-  find "$plugin_dir" -type f -print -quit | grep -q . || die "Vib plugin bundle extraction produced no project-local plugins."
+  find "$plugin_dir" -type f -print -quit | grep -q . || \
+    die "Vib plugin bundle extraction produced no project-local plugins."
 
-  "$VIB_BIN" --version || true
   ok "Vib executable: $VIB_BIN"
+  ok "Vib detected version: $VIB_DETECTED_VERSION"
+  ok "Vib execution identity: uid=0 gid=0 user=root through normalized SUDO_* context"
   ok "Project-local Vib plugins: $plugin_dir"
 }
 
@@ -1666,8 +1826,13 @@ EOF_INPUTS
 
 build_target_oci() {
   pushd "$CUSTOM_PROJECT" >/dev/null
-  run_logged "vib-generate-containerfile" "$VIB_BIN" build recipe.yml
-  [[ -s Containerfile ]] || die "Vib did not generate Containerfile."
+  if ! run_logged_vib "vib-generate-containerfile" build recipe.yml; then
+    die "Vib failed to generate Containerfile. Review the retained diagnostic bundle."
+  fi
+  [[ -s Containerfile ]] || {
+    capture_vib_diagnostics "Vib returned success but did not generate Containerfile."
+    die "Vib did not generate Containerfile."
+  }
 
   local -a build_cmd=("$OCI_RUNTIME" build --pull=always --tag "$TARGET_IMAGE_REF" --file Containerfile)
   [[ -n "$OCI_BUILD_NETWORK" ]] && build_cmd+=(--network "$OCI_BUILD_NETWORK")
