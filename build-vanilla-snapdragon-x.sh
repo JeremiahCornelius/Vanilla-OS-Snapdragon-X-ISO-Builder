@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.4.sh
+# build-vanilla-arm64-release-v2.4.5.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.4
+# Version: 2.4.5
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.4"
+SCRIPT_VERSION="2.4.5"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -81,7 +81,13 @@ print_failure_tail() {
 }
 
 command_failure_menu() {
+  # Print diagnostics for a failed subprocess and return the operator's desired
+  # next action on stdout. This function must return status 0 so that callers
+  # running under `set -e` do not trigger the global ERR trap while handling an
+  # expected command failure.
   local label="$1" workdir="$2" log="$3" status="$4"
+  local choice
+
   fail "Command failed during stage ${CURRENT_STAGE}."
   printf 'Command label: %s\n' "$label" >&2
   printf 'Exit status:   %s\n' "$status" >&2
@@ -89,31 +95,38 @@ command_failure_menu() {
   printf 'Command log:   %s\n' "$log" >&2
   print_failure_tail "$log"
 
-  local choice
   choice="$(menu "Build Command Failure
 
 The previous command failed. You can inspect the working directory and log before deciding whether to abort or retry." "1" \
     "1|Open an interactive shell in the failing working directory [RECOMMENDED]|Inspect recipe files, generated hooks, container state, and logs. Type 'exit' to return." \
     "2|Retry the failed command|Run the same command again after any manual corrections." \
     "3|Abort build|Stop immediately and preserve logs/workspace for diagnosis.")"
+
   case "$choice" in
-    1) open_shell "$workdir"; return 10 ;;
-    2) return 11 ;;
-    3) die "Build aborted after command failure. See log: $log" ;;
+    1) printf '%s\n' "shell" ;;
+    2) printf '%s\n' "retry" ;;
+    3) printf '%s\n' "abort" ;;
+    *) printf '%s\n' "abort" ;;
   esac
+  return 0
 }
 
 run_logged() {
   # Run a command with explicit per-command logging and failure diagnostics.
   # Usage: run_logged "human label" "/working/dir" command arg ...
+  #
+  # Important: expected subprocess failures are handled locally here. The global
+  # ERR trap remains useful for unexpected script bugs, but it must not fire
+  # while we are intentionally collecting a command's non-zero exit status.
   local label="$1" workdir="$2"; shift 2
-  local safe log status
+  local safe log status action
   safe="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-|-$//g')"
   mkdir -p "$OUTPUT_DIR/logs"
-  log="$OUTPUT_DIR/logs/${BUILD_DATE}-${safe}-$(date -u +%H%M%S).log"
-  LAST_COMMAND_LOG="$log"
 
   while true; do
+    log="$OUTPUT_DIR/logs/${BUILD_DATE}-${safe}-$(date -u +%H%M%S).log"
+    LAST_COMMAND_LOG="$log"
+
     info "$label"
     printf 'Working directory: %s\n' "$workdir" >&2
     printf 'Command: ' >&2
@@ -130,8 +143,8 @@ run_logged() {
       printf ' %q' "$@"
       printf '\n\n'
       "$@"
-    ) 2>&1 | tee -a "$log"
-    status="${PIPESTATUS[0]}"
+    ) > >(tee -a "$log") 2> >(tee -a "$log" >&2)
+    status=$?
     set -e
 
     if [[ "$status" -eq 0 ]]; then
@@ -139,10 +152,19 @@ run_logged() {
       return 0
     fi
 
-    command_failure_menu "$label" "$workdir" "$log" "$status"
-    case "$?" in
-      10) continue ;;
-      11) continue ;;
+    # command_failure_menu writes only the action token to stdout. Its status is
+    # always zero by design, avoiding recursive ERR-trap diagnostics.
+    action="$(command_failure_menu "$label" "$workdir" "$log" "$status")"
+    case "$action" in
+      shell)
+        open_shell "$workdir"
+        ;;
+      retry)
+        continue
+        ;;
+      abort|*)
+        die "Build aborted after command failure. See log: $log"
+        ;;
     esac
   done
 }
