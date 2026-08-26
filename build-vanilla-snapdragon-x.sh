@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.5.sh
+# build-vanilla-arm64-release-v2.6.6.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.5
+# Version: 2.6.6
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,13 +29,14 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.5"
+SCRIPT_VERSION="2.6.6"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
 VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
 DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD:-auto}"  # auto|1|0
 PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
+RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK:-1}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -2616,6 +2617,115 @@ EOF
   return 0
 }
 
+
+file_breaks_shell_when_added() {
+  # Return 0 if adding exactly one file from includes.container into the pico
+  # base image causes /bin/sh to become unusable. This identifies the actual
+  # runtime-breaking file instead of guessing.
+  local repo="$1"
+  local rel="$2"
+  local label="$3"
+  local probe_dir="$TMP_DIR/include-file-probe-${label}-$(printf '%s' "$rel" | sed -E 's/[^A-Za-z0-9_.-]+/_/g')-$$"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-include-file-probe-$(printf '%s' "$rel" | sed -E 's/[^A-Za-z0-9_.-]+/_/g')-$(date -u +%H%M%S).log"
+  local status
+
+  mkdir -p "$probe_dir/includes.container/$(dirname "$rel")" "$OUTPUT_DIR/logs"
+  cp -a "$repo/includes.container/$rel" "$probe_dir/includes.container/$rel"
+
+  cat > "$probe_dir/Containerfile" <<'EOF'
+FROM ghcr.io/vanilla-os/pico:dev
+RUN /bin/sh -c 'echo PRE_ADD_SHELL_OK'
+ADD includes.container /
+RUN /bin/sh -c 'echo POST_ADD_SHELL_OK'
+EOF
+
+  set +e
+  podman image build --no-cache -t "local/${label}-single-include-probe:$(date +%s)" "$probe_dir" >"$log" 2>&1
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$log" > "$probe_dir/failing-log-path.txt"
+    return 0
+  fi
+
+  return 1
+}
+
+reconstruct_includes_container_safely() {
+  # If the full includes.container tree breaks /bin/sh, test each top-level file
+  # independently and reconstruct includes.container without the files that
+  # poison the runtime. This is slower, but deterministic and produces an audit
+  # trail listing the excluded paths.
+  local repo="$1"
+  local label="$2"
+  local original="$repo/includes.container"
+  local backup="$repo/includes.container.builder-original.$(date -u +%Y%m%d%H%M%S)"
+  local rebuilt="$repo/includes.container.builder-rebuilt.$$"
+  local manifest="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-includes-container-reconstruction-$(date -u +%H%M%S).txt"
+  local rel broken_count=0 total_count=0
+
+  [[ "$RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK" == "1" ]] || return 1
+  [[ -d "$original" ]] || return 1
+
+  mkdir -p "$rebuilt" "$OUTPUT_DIR/logs"
+  : > "$manifest"
+
+  warn "Reconstructing includes.container by probing each file."
+  warn "This is slower, but it will identify the file(s) that break /bin/sh."
+  printf 'Original includes.container: %s\n' "$original" >>"$manifest"
+  printf 'Backup will be: %s\n\n' "$backup" >>"$manifest"
+
+  while IFS= read -r rel; do
+    total_count=$((total_count + 1))
+    printf 'Testing include file: %s\n' "$rel" >&2
+    printf 'TEST %s\n' "$rel" >>"$manifest"
+
+    if file_breaks_shell_when_added "$repo" "$rel" "$label"; then
+      broken_count=$((broken_count + 1))
+      printf 'EXCLUDE runtime-breaking file: %s\n' "$rel" | tee -a "$manifest" >&2
+      continue
+    fi
+
+    mkdir -p "$rebuilt/$(dirname "$rel")"
+    cp -a "$original/$rel" "$rebuilt/$rel"
+    printf 'KEEP %s\n' "$rel" >>"$manifest"
+  done < <(cd "$original" && find . -type f -printf '%P\n' | sort)
+
+  mv "$original" "$backup"
+  mv "$rebuilt" "$original"
+
+  cat > "$original/BUILDER-INCLUDES-RECONSTRUCTION.txt" <<EOF
+This includes.container tree was reconstructed by $SCRIPT_NAME $SCRIPT_VERSION.
+
+Reason:
+  The original includes.container made /bin/sh unusable immediately after:
+    ADD includes.container /
+
+Original backup:
+  $backup
+
+Reconstruction manifest:
+  $manifest
+
+Files excluded:
+EOF
+
+  grep '^EXCLUDE ' "$manifest" >> "$original/BUILDER-INCLUDES-RECONSTRUCTION.txt" || true
+
+  warn "includes.container reconstruction complete."
+  warn "Files tested: $total_count"
+  warn "Files excluded: $broken_count"
+  warn "Manifest: $manifest"
+
+  if [[ "$broken_count" -eq 0 ]]; then
+    warn "No single file broke /bin/sh by itself. The breakage may require file interaction."
+    return 1
+  fi
+
+  return 0
+}
+
 quarantine_runtime_breaking_includes_files() {
   # Conservative remediation for the observed failure. If the includes probe
   # fails even after ld.so.preload is disabled, move remaining known dynamic
@@ -2695,8 +2805,16 @@ build_container_image_with_context_workarounds() {
     warn "Attempting conservative quarantine of remaining runtime-risk include files."
     quarantine_runtime_breaking_includes_files "$repo"
     diagnose_generated_container_context "$repo" "${safe_label}-after-quarantine"
-    probe_includes_container_runtime_effect "$repo" "${safe_label}-after-quarantine" \
-      || die "includes.container still breaks /bin/sh after quarantine. Review probe logs before continuing."
+    if ! probe_includes_container_runtime_effect "$repo" "${safe_label}-after-quarantine"; then
+      warn "includes.container still breaks /bin/sh after quarantine."
+      if reconstruct_includes_container_safely "$repo" "$safe_label"; then
+        diagnose_generated_container_context "$repo" "${safe_label}-after-reconstruction"
+        probe_includes_container_runtime_effect "$repo" "${safe_label}-after-reconstruction" \
+          || die "Reconstructed includes.container still breaks /bin/sh. Review reconstruction manifest and probe logs."
+      else
+        die "includes.container still breaks /bin/sh and safe reconstruction did not resolve it. Review probe logs before continuing."
+      fi
+    fi
   fi
 
   podman_build_with_optional_no_cache "$label" "$repo" "$tag"
