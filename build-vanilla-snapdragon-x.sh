@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.0.0
+# Version: 2.1.1
 #
 # Purpose:
 #   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
@@ -35,7 +35,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.1"
 SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
 
 # -----------------------------
@@ -67,6 +67,7 @@ VERBOSE=0
 ENABLE_QCOM_FW=1
 ALLOW_DIRTY_REPOS=0
 CLEAN_STAGING=1
+CLEANUP_BAD_PROMPT_DIRS=0
 
 # Repository defaults. These are intentionally centralized for traceability.
 CORE_REPO_URL="https://github.com/vanilla-arm/core-image"
@@ -152,6 +153,7 @@ Options:
   --allow-dirty-repos       Continue if repository has uncommitted changes.
   --dry-run                 Print plan and validations without modifying files.
   --verbose                 More logging.
+  --cleanup-bad-prompt-dirs  Remove known accidental prompt-text directories from <workdir>.
   -h, --help                Show this help.
 
 Examples:
@@ -164,9 +166,31 @@ USAGE
 # -----------------------------
 # Input prompting helpers
 # -----------------------------
+# IMPORTANT IMPLEMENTATION NOTE:
+# Prompt functions may be called through command substitution, e.g.:
+#   ARTIFACT_DIR="$(prompt_existing_dir_or_create ...)"
+# Therefore, all human-readable prompt/menu text MUST go to stderr, while stdout
+# is reserved exclusively for the returned machine-readable value. Earlier
+# revisions printed menu text to stdout; if execution was interrupted, callers
+# could capture multi-line prompt text as a path and create directories with
+# names such as $'\n'Custom kernel...'. This revision prevents that class of bug.
+
+ui_line() { printf '%s\n' "$*" >&2; }
+ui_blank() { printf '\n' >&2; }
+
+open_interactive_shell() {
+  local dir="${1:-$PWD}"
+  ui_blank
+  ui_line "*** Opening interactive shell. Type 'exit' to return to the builder. ***"
+  ui_line "Directory: $dir"
+  ( cd "$dir" 2>/dev/null || cd "$PWD"; "${SHELL:-/bin/bash}" ) || true
+}
+
 prompt_value() {
   local label="$1" default="$2" value=""
-  printf '\n%s\nDefault: %s\n' "$label" "$default"
+  ui_blank
+  ui_line "$label"
+  ui_line "Default: $default"
   read -r -p "$label [$default]: " value || true
   if [[ -z "$value" ]]; then
     value="$default"
@@ -184,7 +208,13 @@ prompt_yes_no() {
     case "$reply" in
       y|Y|yes|YES) return 0 ;;
       n|N|no|NO) return 1 ;;
-      *) echo "Please answer yes or no." ;;
+      \?)
+        ui_line "Enter yes/y to enable or no/n to disable. Press ENTER to accept the default."
+        ;;
+      !)
+        open_interactive_shell "$PWD"
+        ;;
+      *) ui_line "Invalid response: '$reply'. Please answer yes or no." ;;
     esac
   done
 }
@@ -195,6 +225,8 @@ prompt_existing_dir_or_create() {
   #   - offers to create non-existing directories
   #   - allows retry
   #   - allows a temporary shell escape for manual preparation
+  #   - uses numbered, self-describing menu choices
+  # Stdout returns only the selected directory path.
   local label="$1" default="$2" path="" choice=""
   while true; do
     path="$(prompt_value "$label" "$default")"
@@ -203,34 +235,68 @@ prompt_existing_dir_or_create() {
       printf '%s' "$path"
       return 0
     fi
-    echo
-    warn "Directory does not exist: $path"
-    echo "Options:"
-    echo "  c = create it"
-    echo "  r = retry path"
-    echo "  s = shell escape to prepare files, then retry"
-    echo "  q = quit"
-    read -r -p "Choose [c/r/s/q]: " choice || true
-    case "$choice" in
-      c|C)
-        [[ "$DRY_RUN" -eq 1 ]] || mkdir -p "$path"
-        printf '%s' "$path"
-        return 0
-        ;;
-      s|S)
-        echo "Opening a temporary shell. Type 'exit' to return."
-        "${SHELL:-/bin/bash}" || true
-        ;;
-      q|Q)
-        fail "User cancelled while selecting directory."
-        exit "$EX_USAGE"
-        ;;
-      *) ;;
-    esac
+
+    while true; do
+      cat >&2 <<EOF
+
+==================================================================
+Directory Required
+
+$label
+
+The selected directory does not exist:
+  $path
+
+Select an action:
+
+  1) Create this directory and continue [DEFAULT]
+     The builder will create the directory now.
+
+  2) Enter a different directory path
+     Return to the path prompt.
+
+  3) Open an interactive shell
+     Prepare files/directories manually, then type 'exit' to resume.
+
+  4) Quit the builder
+     Stop without continuing this build.
+
+Special commands:
+  ?  Show this menu again
+  !  Open an interactive shell
+==================================================================
+EOF
+      read -r -p "Selection [1]: " choice || true
+      choice="${choice:-1}"
+      case "$choice" in
+        1)
+          [[ "$DRY_RUN" -eq 1 ]] || mkdir -p "$path"
+          printf '%s' "$path"
+          return 0
+          ;;
+        2|b|B)
+          break
+          ;;
+        3|!)
+          open_interactive_shell "$(dirname "$path")"
+          ;;
+        4|q|Q)
+          fail "User cancelled while selecting directory."
+          exit "$EX_USAGE"
+          ;;
+        \?)
+          ;;
+        *)
+          ui_blank
+          ui_line "Invalid selection: '$choice'. Please enter a number from 1 through 4."
+          ;;
+      esac
+    done
   done
 }
 
 prompt_file_optional() {
+  # Optional file prompt. Stdout returns only the selected file path or blank.
   local label="$1" default="$2" path="" choice=""
   while true; do
     path="$(prompt_value "$label" "$default")"
@@ -243,13 +309,125 @@ prompt_file_optional() {
       printf '%s' "$path"
       return 0
     fi
-    warn "File does not exist: $path"
-    echo "Options: r = retry, s = shell escape, blank = skip"
-    read -r -p "Choose [r/s/skip]: " choice || true
+
+    while true; do
+      cat >&2 <<EOF
+
+==================================================================
+Optional File Not Found
+
+$label
+
+The selected file does not exist:
+  $path
+
+Select an action:
+
+  1) Retry the file path [DEFAULT]
+     Return to the file prompt.
+
+  2) Open an interactive shell
+     Download, move, or inspect files manually, then type 'exit' to resume.
+
+  3) Skip this optional file
+     Continue without setting this value.
+
+  4) Abort the build
+     Stop immediately.
+
+Special commands:
+  ?  Show this menu again
+  !  Open an interactive shell
+==================================================================
+EOF
+      read -r -p "Selection [1]: " choice || true
+      choice="${choice:-1}"
+      case "$choice" in
+        1|r|R|b|B)
+          break
+          ;;
+        2|!)
+          open_interactive_shell "$(dirname "$path")"
+          ;;
+        3|s|S|skip|SKIP)
+          printf ''
+          return 0
+          ;;
+        4|q|Q)
+          fail "User cancelled while selecting optional file."
+          exit "$EX_USAGE"
+          ;;
+        \?)
+          ;;
+        *)
+          ui_blank
+          ui_line "Invalid selection: '$choice'. Please enter a number from 1 through 4."
+          ;;
+      esac
+    done
+  done
+}
+
+print_build_summary_prompt() {
+  cat >&2 <<EOF
+
+==================================================================
+Build Summary
+
+Profile:
+  $PROFILE
+
+Architecture:
+  $ARCH
+
+Work directory:
+  $WORKDIR
+
+Sources directory:
+  $SOURCES_DIR
+
+Artifact directory:
+  $ARTIFACT_DIR
+
+Root overlay directory:
+  $ROOT_OVERLAY_DIR
+
+Release prefix:
+  $RELEASE_PREFIX
+
+Planned release:
+  $BUILD_ID
+
+Qualcomm firmware updater:
+  $( [[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo "Enabled" || echo "Disabled" )
+
+qcom device path:
+  $QCOM_DEVICE_PATH
+
+Output release directory:
+  $CURRENT_RELEASE_DIR
+
+Select an action:
+
+  1) Begin build [DEFAULT]
+  2) Open an interactive shell before build
+  3) Abort build
+
+Special commands:
+  ?  Show this summary again
+  !  Open an interactive shell
+==================================================================
+EOF
+  local choice=""
+  while true; do
+    read -r -p "Selection [1]: " choice || true
+    choice="${choice:-1}"
     case "$choice" in
-      s|S) "${SHELL:-/bin/bash}" || true ;;
-      r|R) ;;
-      *) printf ''; return 0 ;;
+      1) return 0 ;;
+      2|!) open_interactive_shell "$WORKDIR" ;;
+      3|q|Q) fail "User aborted before build start."; exit "$EX_USAGE" ;;
+      \?) print_build_summary_prompt; return $? ;;
+      *) ui_line "Invalid selection: '$choice'. Please enter 1, 2, or 3." ;;
     esac
   done
 }
@@ -272,12 +450,24 @@ while [[ $# -gt 0 ]]; do
     --allow-dirty-repos) ALLOW_DIRTY_REPOS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
+    --cleanup-bad-prompt-dirs) CLEANUP_BAD_PROMPT_DIRS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1"; usage; exit "$EX_USAGE" ;;
   esac
 done
 
 WORKDIR="${WORKDIR/#\~/$HOME}"
+
+cleanup_bad_prompt_dirs() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -mindepth 1 -maxdepth 3 -type d \( -name "*Custom kernel*" -o -name "*Default:*" -o -name "*Choose [*" -o -name "*Optional /root overlay*" \) -print -exec rm -rf {} +
+}
+
+if [[ "$CLEANUP_BAD_PROMPT_DIRS" -eq 1 ]]; then
+  cleanup_bad_prompt_dirs "$WORKDIR"
+fi
+
 SOURCES_DIR="$WORKDIR/sources"
 OUTPUT_DIR="$WORKDIR/output"
 RELEASES_DIR="$OUTPUT_DIR/releases"
@@ -361,6 +551,8 @@ log "Planned release: $BUILD_ID"
 log "Workdir: $WORKDIR"
 log "Artifacts: $ARTIFACT_DIR"
 log "Root overlay: $ROOT_OVERLAY_DIR"
+
+print_build_summary_prompt
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   warn "Dry-run mode is enabled. No files should be modified beyond initial log/workdir creation."
