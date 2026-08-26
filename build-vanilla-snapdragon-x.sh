@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.0.4-r4
+# Version 8.0.4-r4.1
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,22 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.4-r4.1 final-artifact verification correction:
+#   - Corrects a stage-12 category error that attempted to read the installed
+#     target's ABRoot /var unlock hook from the live installer squashfs. The
+#     hook is target-OCI content and is not required in the live environment.
+#   - Imports the exported OCI layout under a temporary verification tag,
+#     exports and validates the hook from that exact content-addressed image,
+#     records its SHA-256, binds the evidence to the exported OCI manifest
+#     digest, and requires the final ISO's embedded manifest to match that exact
+#     digest. This proves the accepted hook is in the embedded target
+#     without duplicating it into or incorrectly inspecting the live squashfs.
+#   - Adds a required squashfs-file extraction helper so genuinely missing live
+#     installer overlay files fail with a contextual message rather than a raw
+#     unsquashfs "cat: no matches" termination.
+#   - Preserves the r4 firmware schema, r3 kernel intake, r2 storage guard,
+#     installer patches, package manifests, and generated target image content.
 #
 # v8.0.4-r4 profile-driven firmware package and board-data contract:
 #   - Promotes the hardware profile to schema version 2 and replaces the
@@ -186,7 +202,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4-r4"
+SCRIPT_VERSION="8.0.4-r4.1"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -415,6 +431,9 @@ FIRMWARE_MERGE_REPORT=""
 FIRMWARE_STAGED_INVENTORY=""
 LIVE_KERNEL_CMDLINE_JSON=""
 LIVE_KERNEL_CMDLINE_EVIDENCE=""
+TARGET_STORAGE_HOOK_FILE=""
+TARGET_STORAGE_HOOK_SHA256_FILE=""
+TARGET_STORAGE_HOOK_EVIDENCE_JSON=""
 
 # Discovered inputs.
 declare -a KERNEL_DEBS=()
@@ -889,7 +908,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.4-r4-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.4-r4.1-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -918,6 +937,9 @@ recompute_paths() {
   FIRMWARE_PACKAGE_LOCK_FILE="$FIRMWARE_PROVENANCE_DIR/firmware-package-lock.json"
   LIVE_KERNEL_CMDLINE_JSON="$TMP_ROOT/live-kernel-command-line.json"
   LIVE_KERNEL_CMDLINE_EVIDENCE="$TMP_ROOT/live-kernel-command-line-evidence.txt"
+  TARGET_STORAGE_HOOK_FILE="$TMP_ROOT/target-090-abroot-unlock-var.sh"
+  TARGET_STORAGE_HOOK_SHA256_FILE="$TMP_ROOT/target-090-abroot-unlock-var.sh.sha256"
+  TARGET_STORAGE_HOOK_EVIDENCE_JSON="$TMP_ROOT/target-storage-hook-evidence.json"
   KERNEL_PACKAGE_CLOSURE_JSON="$TMP_ROOT/kernel-package-closure.json"
 }
 
@@ -5305,6 +5327,50 @@ hash_tree_manifest() {
   )
 }
 
+verify_exported_oci_storage_hook() {
+  # Validate the hook from the exported OCI layout itself, not from the live
+  # squashfs and not merely from the mutable source tag used before export.
+  # Importing the layout under a temporary private tag makes the hook evidence
+  # directly attributable to the manifest digest recorded in index.json.
+  local verify_ref="localhost/vanillaos-snapdragonx/exported-oci-verify:${SESSION_ID}"
+  local destination_ref=""
+
+  case "$OCI_RUNTIME" in
+    podman) destination_ref="containers-storage:$verify_ref" ;;
+    docker) destination_ref="docker-daemon:$verify_ref" ;;
+    *) die "Unsupported OCI runtime for exported-layout verification: $OCI_RUNTIME" ;;
+  esac
+
+  "$OCI_RUNTIME" image rm -f "$verify_ref" >/dev/null 2>&1 || true
+  run_logged "import-exported-oci-for-storage-hook-verification" \
+    skopeo copy "oci:$EMBEDDED_OCI_LAYOUT:$EMBEDDED_IMAGE_TAG" "$destination_ref"
+
+  rm -f "$TARGET_STORAGE_HOOK_FILE" "$TARGET_STORAGE_HOOK_SHA256_FILE"
+  if ! "$OCI_RUNTIME" run --rm \
+      --entrypoint /bin/cat \
+      "$verify_ref" \
+      /usr/share/init.d/090-abroot-unlock-var.sh \
+      > "$TARGET_STORAGE_HOOK_FILE"; then
+    "$OCI_RUNTIME" image rm -f "$verify_ref" >/dev/null 2>&1 || true
+    die "Unable to export the ABRoot /var unlock hook from the exported OCI layout."
+  fi
+  "$OCI_RUNTIME" image rm -f "$verify_ref" >/dev/null 2>&1 || true
+
+  [[ -s "$TARGET_STORAGE_HOOK_FILE" ]] ||
+    die "Exported OCI layout contains an empty ABRoot /var unlock hook."
+  grep -Fq '/dev/mapper/vos--var-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Exported target hook lacks automatic LVM encrypted /var discovery."
+  grep -Fq '/dev/disk/by-partlabel/vos-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Exported target hook lacks manual encrypted /var PARTLABEL discovery."
+  grep -Fq '/dev/disk/by-label/vos-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Exported target hook lacks unencrypted /var filesystem-label discovery."
+
+  (
+    cd "$(dirname "$TARGET_STORAGE_HOOK_FILE")"
+    sha256sum "$(basename "$TARGET_STORAGE_HOOK_FILE")"
+  ) > "$TARGET_STORAGE_HOOK_SHA256_FILE"
+}
+
 export_target_oci_for_installer() {
   local source_ref descriptor digest_hex manifest_blob
   source_ref="$(local_image_transport_ref)"
@@ -5335,6 +5401,8 @@ export_target_oci_for_installer() {
   [[ -s "$manifest_blob" ]] || die "Embedded OCI manifest blob is missing: $manifest_blob"
   [[ "sha256:$(sha256sum "$manifest_blob" | awk '{print $1}')" == "$TARGET_IMAGE_MANIFEST_DIGEST" ]] || \
     die "Embedded OCI manifest blob digest mismatch."
+
+  verify_exported_oci_storage_hook
 
   {
     printf 'path\tbytes\tsha256\n'
@@ -5370,6 +5438,32 @@ export_target_oci_for_installer() {
       installer_reference:$installer_ref,
       delivery_mode:$delivery, kernel_release:$kernel, dtb:$dtb}' \
     > "$TMP_ROOT/embedded-target-image.json"
+
+  [[ -s "$TARGET_STORAGE_HOOK_FILE" && -s "$TARGET_STORAGE_HOOK_SHA256_FILE" ]] ||
+    die "Target storage-hook evidence was not produced before OCI export."
+  local target_storage_hook_sha
+  target_storage_hook_sha="$(awk 'NR == 1 {print $1}' "$TARGET_STORAGE_HOOK_SHA256_FILE")"
+  [[ "$target_storage_hook_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    die "Target storage-hook SHA-256 evidence is malformed."
+  [[ "$target_storage_hook_sha" == "$(sha256sum "$TARGET_STORAGE_HOOK_FILE" | awk '{print $1}')" ]] ||
+    die "Target storage-hook SHA-256 evidence no longer matches the verified hook."
+
+  jq -n \
+    --arg profile "$PROFILE" \
+    --arg target_image "$TARGET_IMAGE_REF" \
+    --arg manifest_digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
+    --arg hook_path "/usr/share/init.d/090-abroot-unlock-var.sh" \
+    --arg hook_sha256 "$target_storage_hook_sha" \
+    --arg verified_at "$(date -u --iso-8601=seconds)" \
+    '{schema:1, profile:$profile, target_image:$target_image,
+      manifest_digest:$manifest_digest, hook_path:$hook_path,
+      hook_sha256:$hook_sha256, verified_at:$verified_at,
+      verification_basis:[
+        "exported OCI layout imported under an isolated verification tag",
+        "hook exported from and content-validated in that imported layout",
+        "hook digest bound to the exported OCI manifest digest",
+        "final ISO must embed the identical OCI manifest digest"
+      ]}' > "$TARGET_STORAGE_HOOK_EVIDENCE_JSON"
 
   ok "Exported verified target OCI layout: $TARGET_IMAGE_MANIFEST_DIGEST"
   ok "Installer image source: $INSTALLER_DEFAULT_IMAGE_REF"
@@ -5886,6 +5980,25 @@ extract_iso_file() {
   local iso="$1" iso_path="$2" destination="$3"
   rm -f "$destination"
   xorriso -osirrox on -indev "$iso" -extract "$iso_path" "$destination" >/dev/null 2>&1
+}
+
+extract_required_squashfs_file() {
+  # Extract one file that is required to exist in the live installer squashfs.
+  # Do not use this helper for target-OCI content: the live squashfs and the
+  # installed target image are separate artifacts with different responsibilities.
+  local squash="$1" member="${2#/}" destination="$3" description="${4:-$2}"
+  local stderr_file="${destination}.unsquashfs.stderr" detail=""
+
+  rm -f "$destination" "$stderr_file"
+  if ! unsquashfs -cat "$squash" "$member" > "$destination" 2> "$stderr_file"; then
+    detail="$(tr '\n' ' ' < "$stderr_file" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    rm -f "$destination"
+    die "Unable to extract required live-squashfs ${description} at /${member}${detail:+: $detail}"
+  fi
+
+  [[ -s "$destination" ]] ||
+    die "Required live-squashfs ${description} is empty at /${member}"
+  rm -f "$stderr_file"
 }
 
 verify_arm64_graphical_iso() {
@@ -8365,15 +8478,18 @@ verify_final_release() {
       die "Final squashfs lacks required firmware probe: $firmware_probe"
   done
 
-  unsquashfs -cat "$final_squash" \
-    "usr/share/init.d/090-abroot-unlock-var.sh" \
-    > "$verify_dir/090-abroot-unlock-var.sh"
-  grep -Fq '/dev/mapper/vos--var-var' "$verify_dir/090-abroot-unlock-var.sh" || \
-    die "Final target hook lacks automatic LVM encrypted /var discovery."
-  grep -Fq '/dev/disk/by-partlabel/vos-var' "$verify_dir/090-abroot-unlock-var.sh" || \
-    die "Final target hook lacks manual encrypted /var PARTLABEL discovery."
-  grep -Fq '/dev/disk/by-label/vos-var' "$verify_dir/090-abroot-unlock-var.sh" || \
-    die "Final target hook lacks unencrypted /var filesystem-label discovery."
+  # Do not search the live installer squashfs for the installed target's
+  # ABRoot unlock hook. The hook was validated in the target OCI before export;
+  # below, the final ISO is required to carry that exact OCI manifest digest.
+  [[ -s "$TARGET_STORAGE_HOOK_FILE" && -s "$TARGET_STORAGE_HOOK_SHA256_FILE" &&
+     -s "$TARGET_STORAGE_HOOK_EVIDENCE_JSON" ]] ||
+    die "Target storage-hook verification evidence is incomplete."
+  grep -Fq '/dev/mapper/vos--var-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Recorded target hook lacks automatic LVM encrypted /var discovery."
+  grep -Fq '/dev/disk/by-partlabel/vos-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Recorded target hook lacks manual encrypted /var PARTLABEL discovery."
+  grep -Fq '/dev/disk/by-label/vos-var' "$TARGET_STORAGE_HOOK_FILE" ||
+    die "Recorded target hook lacks unencrypted /var filesystem-label discovery."
 
   # Verify the embedded OCI layout and exact manifest digest.
   local embedded_verify="$verify_dir/embedded-oci"
@@ -8399,25 +8515,40 @@ verify_final_release() {
   [[ "sha256:$(sha256sum "$embedded_verify/manifest.blob" | awk '{print $1}')" == "$embedded_digest" ]] || \
     die "Final ISO embedded OCI manifest blob failed digest validation."
 
+  local evidence_manifest_digest evidence_hook_sha recorded_hook_sha
+  evidence_manifest_digest="$(jq -r '.manifest_digest // empty' "$TARGET_STORAGE_HOOK_EVIDENCE_JSON")"
+  evidence_hook_sha="$(jq -r '.hook_sha256 // empty' "$TARGET_STORAGE_HOOK_EVIDENCE_JSON")"
+  recorded_hook_sha="$(sha256sum "$TARGET_STORAGE_HOOK_FILE" | awk '{print $1}')"
+  [[ "$evidence_manifest_digest" == "$embedded_digest" ]] ||
+    die "Target storage-hook evidence is bound to a different OCI manifest digest."
+  [[ "$evidence_hook_sha" == "$recorded_hook_sha" ]] ||
+    die "Target storage-hook evidence SHA-256 differs from the recorded verified hook."
+  ok "Verified target storage hook through embedded OCI manifest identity: $embedded_digest"
+
   # Verify the profile-specific recipe and installer patch inside squashfs.
-  unsquashfs -cat "$final_squash" \
+  extract_required_squashfs_file "$final_squash" \
     "etc/vanilla-installer/profiles/$PROFILE/recipe.json" \
-    > "$verify_dir/installer-recipe.json"
+    "$verify_dir/installer-recipe.json" \
+    "profile installer recipe"
   jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     '.images.default == $image' "$verify_dir/installer-recipe.json" >/dev/null || \
     die "Final ISO installer recipe does not default to the resolved profile image."
-  unsquashfs -cat "$final_squash" \
+  extract_required_squashfs_file "$final_squash" \
     "usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" \
-    > "$verify_dir/installer-wrapper"
-  unsquashfs -cat "$final_squash" \
+    "$verify_dir/installer-wrapper" \
+    "profile installer wrapper"
+  extract_required_squashfs_file "$final_squash" \
     "usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
-    > "$verify_dir/storage-guard"
-  unsquashfs -cat "$final_squash" \
+    "$verify_dir/storage-guard" \
+    "external storage guard"
+  extract_required_squashfs_file "$final_squash" \
     "usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" \
-    > "$verify_dir/storage-validator"
-  unsquashfs -cat "$final_squash" \
+    "$verify_dir/storage-validator" \
+    "installed-storage validator"
+  extract_required_squashfs_file "$final_squash" \
     "usr/local/sbin/albius" \
-    > "$verify_dir/albius-wrapper"
+    "$verify_dir/albius-wrapper" \
+    "Albius guard launcher"
   grep -Fq "VANILLA_CUSTOM_RECIPE" "$verify_dir/installer-wrapper" || \
     die "Final ISO lacks the profile installer wrapper."
   grep -Fq "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1" "$verify_dir/storage-guard" || \
@@ -8434,9 +8565,10 @@ verify_final_release() {
     die "Final ISO storage guard failed its synthetic regression suite."
   bash -n "$verify_dir/installer-wrapper" "$verify_dir/storage-validator" \
     "$verify_dir/albius-wrapper"
-  unsquashfs -cat "$final_squash" \
+  extract_required_squashfs_file "$final_squash" \
     "usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json" \
-    > "$verify_dir/profile.resolved.json"
+    "$verify_dir/profile.resolved.json" \
+    "resolved installer hardware profile"
   jq -e --arg profile "$PROFILE" '.profile == $profile' \
     "$verify_dir/profile.resolved.json" >/dev/null || \
     die "Final ISO embedded installer profile does not match $PROFILE."
@@ -8473,6 +8605,9 @@ verify_final_release() {
   cp -a "$EMBEDDED_OCI_INVENTORY" "$RELEASE_DIR/embedded-image-inventory.tsv"
   cp -a "$EMBEDDED_OCI_TREE_HASH" "$RELEASE_DIR/target-image-layout.sha256"
   cp -a "$TMP_ROOT/embedded-target-image.json" "$RELEASE_DIR/"
+  cp -a "$TARGET_STORAGE_HOOK_FILE" "$RELEASE_DIR/target-090-abroot-unlock-var.sh"
+  cp -a "$TARGET_STORAGE_HOOK_SHA256_FILE" "$RELEASE_DIR/target-090-abroot-unlock-var.sh.sha256"
+  cp -a "$TARGET_STORAGE_HOOK_EVIDENCE_JSON" "$RELEASE_DIR/target-storage-hook-evidence.json"
   cp -a "$INSTALLED_BOOT_EXPECTED_JSON" "$RELEASE_DIR/installed-boot-expected.json"
   [[ -f "$INSTALLER_PATCH_MANIFEST" ]] && cp -a "$INSTALLER_PATCH_MANIFEST" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/installer-processor.diff" ]] && cp -a "$TMP_ROOT/installer-processor.diff" "$RELEASE_DIR/"
@@ -8496,6 +8631,7 @@ Custom VanillaOS target image
 ==============================
 Build reference:          $TARGET_IMAGE_REF
 Manifest digest:          $TARGET_IMAGE_MANIFEST_DIGEST
+Storage hook evidence:    target-storage-hook-evidence.json
 ABRoot image name:        $ABROOT_IMAGE_NAME
 Base image:               $CUSTOM_IMAGE_BASE
 Profile:                  $PROFILE
@@ -8564,6 +8700,7 @@ Firmware provenance:         firmware-provenance/
 Target /root source:         ${ROOT_SOURCE:-none}
 Target OCI:                  $TARGET_IMAGE_REF
 Target OCI manifest digest:  $TARGET_IMAGE_MANIFEST_DIGEST
+Target storage hook evidence: target-storage-hook-evidence.json
 ABRoot image name:           $ABROOT_IMAGE_NAME
 Installer delivery mode:     $DELIVERY_MODE
 Installer storage guard:     $INSTALLER_STORAGE_GUARD_POLICY
