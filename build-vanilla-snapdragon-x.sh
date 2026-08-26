@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Conception VanillaOS ARM64 Builder
-# Version 8.0.4-r1
+# VanillaOS-SnapdragonX ARM64 Builder
+# Version 8.0.4-r2
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,33 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.4-r2 encrypted custom-layout correction and project taxonomy:
+#   - Records the successful HP OmniBook 5 field milestone: encrypted /var now
+#     prompts correctly, all target volumes mount, and Adreno X1-45 is active.
+#   - Adds an external Albius recipe storage guard instead of modifying Vanilla
+#     Installer or Albius storage logic. The guard is compatible with an
+#     eventual upstream fix: correct storage metadata is preserved without
+#     duplicate operations, missing manual /var GPT metadata is repaired
+#     atomically, and ambiguous layouts fail.
+#   - Preflights custom/manual target identity, GPT partition-table support,
+#     partition number, parent disk, and existing vos-var PARTLABEL conflicts
+#     before Albius performs destructive setup operations.
+#   - Distinguishes automatic LVM /var (vos-var/var) from manual encrypted
+#     partition /var layouts and validates the correct initramfs discovery path
+#     for each topology before Albius can report installation success.
+#   - Adds synthetic regression tests for repaired, already-correct, automatic
+#     LVM, unencrypted, conflicting-label, duplicate-/var, and strict-policy
+#     recipes. Diagnostic recipe evidence is redacted, the live raw recipe is
+#     owner-readable only and removed after Albius exits, and LUKS passphrases
+#     are never copied into the support archive.
+#   - Renames project-owned comments, prompts, paths, services, evidence, OCI
+#     metadata, and artifacts from the retired project identity to
+#     VanillaOS-SnapdragonX. Vanilla-owned repository paths and ref names remain
+#     byte-for-byte compatible.
+#   - Uses the Vanilla OS 3.0 Reunion release taxonomy in project-facing text
+#     and artifact names while retaining Vanilla-owned upstream ref identifiers
+#     wherever changing them would break builds.
 #
 # v8.0.4-r1 checksum-bootstrap correction:
 #   - Keeps non-interactive execution fail-closed when the pinned Qualcomm
@@ -65,9 +92,9 @@
 #     VTE now runs Albius through root-owned bash/tee with pipefail, preserving
 #     the visible console output and the actual Albius exit status.
 #   - Persists the generated Albius recipe at
-#     /tmp/conception-albius-install-recipe.json for deterministic diagnosis.
+#     /tmp/vanillaos-snapdragonx-albius-install-recipe.json for deterministic diagnosis.
 #   - Generates a live-system diagnostic collector at
-#     /usr/local/sbin/conception-collect-installer-diagnostics.
+#     /usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics.
 #   - Rebuilds the profile launcher generator without the unquoted-heredoc
 #     expansion defect from v8.0.1 and without the duplicated runtime body that
 #     was present in the superseded v8.0.2 draft.
@@ -78,7 +105,7 @@
 # v8.0.1 corrections after the first offline-installer field test:
 #   - Separates the logical image name consumed by Albius from the physical
 #     loopback endpoint. The installer now uses a port-free logical reference
-#     under oci.conception.invalid, remapped by containers/image to
+#     under oci.vanillaos-snapdragonx.invalid, remapped by containers/image to
 #     127.0.0.1:<port>.
 #   - Avoids an Albius/Prometheus storage-name defect. Prometheus replaces '/'
 #     but not ':' when creating its containers-storage destination name; a
@@ -107,7 +134,7 @@
 #     The embedded hardware image is the default; IGNORE_CPU=1 is applied by the
 #     wrapper and the custom-image screen remains available as an override.
 #   - Patches the live installer processor so installed ABRoot state uses the
-#     explicit conception kernel/DTB/profile markers rather than module-directory
+#     explicit vanillaos-snapdragonx kernel/DTB/profile markers rather than module-directory
 #     sort order, copies the selected DTB into the A/B init-volume layout, writes
 #     a DTB-aware A-state abroot.cfg, and validates installed boot artifacts.
 #   - Preserves the v7.0.13 graphical closure, source provenance, ARM64 package
@@ -116,7 +143,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4-r1"
+SCRIPT_VERSION="8.0.4-r2"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -162,6 +189,7 @@ ENV_TARGET_IMAGE_SET="${TARGET_IMAGE_REF+x}"
 ENV_TARGET_REPOSITORY_SET="${TARGET_IMAGE_REPOSITORY+x}"
 ENV_ABROOT_IMAGE_SET="${ABROOT_IMAGE_NAME+x}"
 ENV_DELIVERY_MODE_SET="${DELIVERY_MODE+x}"
+ENV_INSTALLER_STORAGE_GUARD_POLICY_SET="${INSTALLER_STORAGE_GUARD_POLICY+x}"
 ENV_REGISTRY_IMAGE_SET="${REGISTRY_IMAGE_REF+x}"
 ENV_ISO_LAYOUT_PATH_SET="${ISO_IMAGE_LAYOUT_PATH+x}"
 ENV_MIN_FREE_GIB_SET="${MIN_FREE_GIB+x}"
@@ -213,7 +241,7 @@ SOURCE_STALE_WARN_DAYS="${SOURCE_STALE_WARN_DAYS:-180}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 
-# The current orchid installer list is shared with AMD64. These exact x86,
+# The current Reunion installer list is shared with AMD64. These exact x86,
 # AMD64 EFI, and unavailable VirtualBox entries are incompatible with the
 # configured ARM64 snapshot. The value is intentionally
 # explicit and environment-overridable; broad "remove every unavailable
@@ -241,11 +269,12 @@ ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-}"
 EMBEDDED_IMAGE_TAG="${EMBEDDED_IMAGE_TAG:-}"
 LOCAL_REGISTRY_HOST="${LOCAL_REGISTRY_HOST:-127.0.0.1}"
 LOCAL_REGISTRY_PORT="${LOCAL_REGISTRY_PORT:-5000}"
-LOCAL_REGISTRY_LOGICAL_HOST="${LOCAL_REGISTRY_LOGICAL_HOST:-oci.conception.invalid}"
-LOCAL_REGISTRY_NAMESPACE="${LOCAL_REGISTRY_NAMESPACE:-conception}"
+LOCAL_REGISTRY_LOGICAL_HOST="${LOCAL_REGISTRY_LOGICAL_HOST:-oci.vanillaos-snapdragonx.invalid}"
+LOCAL_REGISTRY_NAMESPACE="${LOCAL_REGISTRY_NAMESPACE:-vanillaos-snapdragonx}"
 INSTALLER_AUTOSTART="${INSTALLER_AUTOSTART:-1}"
 INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="${INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE:-1}"
+INSTALLER_STORAGE_GUARD_POLICY="${INSTALLER_STORAGE_GUARD_POLICY:-repair}"
 
 VIB_VERSION="${VIB_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
@@ -605,7 +634,12 @@ Checksum pin behavior:
   --local-registry-logical-host HOST
                                   Port-free logical registry hostname remapped
                                   to the loopback bridge. Default:
-                                  oci.conception.invalid
+                                  oci.vanillaos-snapdragonx.invalid
+  --storage-guard-policy POLICY   Encrypted /var recipe policy: repair, strict,
+                                  or off. Default: repair. "repair" preserves
+                                  an upstream-correct namepart operation and
+                                  inserts it only when manual encrypted /var
+                                  lacks GPT PARTLABEL vos-var.
   --live-ref REF                  live-iso branch, tag, or commit.
   --custom-image-ref REF          custom-image branch, tag, or commit.
   --push-target-image             Push target OCI after local verification.
@@ -613,7 +647,7 @@ Checksum pin behavior:
 
 Source-reference strategy:
   custom-image Git checkout: main branch
-  live-iso Git checkout:     orchid branch
+  live-iso Git checkout:     Reunion WiP source; upstream branch identifier retained
   target OCI base:           ghcr.io/vanilla-os/desktop:dev
   live build container:      ghcr.io/vanilla-os/pico:dev
 
@@ -748,6 +782,7 @@ parse_args() {
       --iso-image-path) [[ $# -ge 2 ]] || die "--iso-image-path requires a value"; ISO_IMAGE_LAYOUT_PATH="$2"; shift 2 ;;
       --local-registry-port) [[ $# -ge 2 ]] || die "--local-registry-port requires a value"; LOCAL_REGISTRY_PORT="$2"; shift 2 ;;
       --local-registry-logical-host) [[ $# -ge 2 ]] || die "--local-registry-logical-host requires a value"; LOCAL_REGISTRY_LOGICAL_HOST="$2"; shift 2 ;;
+      --storage-guard-policy) [[ $# -ge 2 ]] || die "--storage-guard-policy requires repair, strict, or off"; INSTALLER_STORAGE_GUARD_POLICY="${2,,}"; shift 2 ;;
       --live-ref) [[ $# -ge 2 ]] || die "--live-ref requires a value"; LIVE_ISO_REF="$2"; shift 2 ;;
       --custom-image-ref) [[ $# -ge 2 ]] || die "--custom-image-ref requires a value"; CUSTOM_IMAGE_REF="$2"; shift 2 ;;
       --push-target-image) PUSH_TARGET_IMAGE=1; shift ;;
@@ -761,7 +796,7 @@ recompute_paths() {
   WORKDIR="$(canonicalize_workdir "$WORKDIR")"
   ARTIFACT_DIR="${ARTIFACT_DIR:-$WORKDIR/artifacts/$PROFILE}"
   KERNEL_DEB_DIR="${KERNEL_DEB_DIR:-$ARTIFACT_DIR/kernel-debs}"
-  TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-localhost/conception/vanilla-desktop-${PROFILE}}"
+  TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-localhost/vanillaos-snapdragonx/vanilla-desktop-${PROFILE}}"
   TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-${TARGET_IMAGE_REPOSITORY}:${BUILD_DATE}}"
   ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-/target-images/$PROFILE}"
   DELIVERY_MODE="${DELIVERY_MODE:-iso-oci}"
@@ -773,7 +808,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.4-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.4-r2-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -985,7 +1020,8 @@ synthesize_compatibility_profile() {
         default_delivery: $delivery,
         auto_start: true,
         ignore_cpu: true,
-        allow_custom_image_override: true
+        allow_custom_image_override: true,
+        storage_guard_policy: "repair"
       },
       validation: {
         installed_paths: [],
@@ -1121,6 +1157,11 @@ load_hardware_profile() {
   INSTALLER_IGNORE_CPU="$(json_bool_to_flag "$(jq -r '.installer.ignore_cpu // true' "$PROFILE_FILE_RESOLVED")")"
   INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="$(json_bool_to_flag "$(jq -r '.installer.allow_custom_image_override // true' "$PROFILE_FILE_RESOLVED")")"
 
+  if [[ -z "$ENV_INSTALLER_STORAGE_GUARD_POLICY_SET" ]]; then
+    value="$(jq -r '.installer.storage_guard_policy // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || INSTALLER_STORAGE_GUARD_POLICY="${value,,}"
+  fi
+
   if [[ -z "$ENV_MIN_FREE_GIB_SET" ]]; then
     value="$(jq -r '.validation.minimum_free_gib // empty' "$PROFILE_FILE_RESOLVED")"
     [[ -z "$value" ]] || MIN_FREE_GIB="$value"
@@ -1156,6 +1197,11 @@ load_hardware_profile() {
       [[ -n "$REGISTRY_IMAGE_REF" ]] || die "registry delivery requires REGISTRY_IMAGE_REF or target_image.registry_fallback"
       ;;
     *) die "Unsupported delivery mode: $DELIVERY_MODE" ;;
+  esac
+
+  case "$INSTALLER_STORAGE_GUARD_POLICY" in
+    repair|strict|off) : ;;
+    *) die "Unsupported installer storage-guard policy: $INSTALLER_STORAGE_GUARD_POLICY" ;;
   esac
 
   ok "Loaded hardware profile: $PROFILE_DISPLAY_NAME ($PROFILE)"
@@ -1195,6 +1241,7 @@ write_resolved_profile() {
     --arg abroot "$ABROOT_IMAGE_NAME" \
     --arg iso_path "$ISO_IMAGE_LAYOUT_PATH" \
     --arg delivery "$DELIVERY_MODE" \
+    --arg storage_guard_policy "$INSTALLER_STORAGE_GUARD_POLICY" \
     --arg registry "$REGISTRY_IMAGE_REF" \
     --argjson autostart "$INSTALLER_AUTOSTART" \
     --argjson ignore_cpu "$INSTALLER_IGNORE_CPU" \
@@ -1236,6 +1283,7 @@ write_resolved_profile() {
         abroot_image: $abroot,
         iso_layout_path: $iso_path,
         delivery_mode: $delivery,
+        installer_storage_guard_policy: $storage_guard_policy,
         registry_fallback: (if $registry == "" then null else $registry end),
         installer_autostart: $autostart,
         installer_ignore_cpu: $ignore_cpu,
@@ -1258,6 +1306,7 @@ write_resolved_profile() {
     printf 'qcom_soc_package_sha256\t%s\t%s\n' "$([[ -n "$FIRMWARE_QCOM_SOC_ACTUAL_SHA256" ]] && printf pass || printf pending)" "${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-not-yet-validated}"
     printf 'kernel_command_line\tresolved\t%s\n' "${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}"
     printf 'delivery_mode\tpass\t%s\n' "$DELIVERY_MODE"
+    printf 'installer_storage_guard_policy\tpass\t%s\n' "$INSTALLER_STORAGE_GUARD_POLICY"
     printf 'iso_layout_path\tpass\t%s\n' "$ISO_IMAGE_LAYOUT_PATH"
   } > "$PROFILE_VALIDATION_REPORT"
 }
@@ -1523,7 +1572,7 @@ choose_target_image() {
 print_builder_banner() {
   cat >&2 <<EOF
 
-${C_BOLD}Conception VanillaOS ARM64 Container-Model Builder${C_RESET}
+${C_BOLD}VanillaOS-SnapdragonX ARM64 Container-Model Builder${C_RESET}
 Version: $SCRIPT_VERSION
 
 Work directory:   $WORKDIR
@@ -3084,6 +3133,7 @@ Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
 Installer delivery:        $DELIVERY_MODE
+Installer storage guard:    $INSTALLER_STORAGE_GUARD_POLICY
 ISO OCI layout path:       $ISO_IMAGE_LAYOUT_PATH
 Logical registry host:      $LOCAL_REGISTRY_LOGICAL_HOST
 Physical registry endpoint: $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
@@ -3117,6 +3167,9 @@ Safety invariants:
   - Final filesystem.packages and filesystem.packages-remove are byte-identical
     to the accepted ARM64 baseline ISO.
   - Only boot-critical hardware payload is added to the live filesystem.
+  - The external storage guard validates one and only one /var target, keeps
+    automatic vos-var/var LVM topology unchanged, repairs only missing manual
+    GPT PARTLABEL metadata, and fails before destructive setup on ambiguity.
 
 Exact non-interactive execute command:
   sudo env WORKDIR=$(printf '%q' "$WORKDIR") PROFILE=$(printf '%q' "$PROFILE") \
@@ -3126,7 +3179,8 @@ Exact non-interactive execute command:
     FIRMWARE_QCOM_SOC_DEB=$(printf '%q' "$FIRMWARE_QCOM_SOC_DEB") \
     FIRMWARE_QCOM_SOC_SHA256=$(printf '%q' "$FIRMWARE_QCOM_SOC_SHA256") \
     FIRMWARE_QCOM_SOC_EXPECTED_VERSION=$(printf '%q' "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION") \
-    REPO_POLICY=$(printf '%q' "$REPO_POLICY") TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") \
+    REPO_POLICY=$(printf '%q' "$REPO_POLICY") INSTALLER_STORAGE_GUARD_POLICY=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY") \
+    TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") \
     ABROOT_IMAGE_NAME=$(printf '%q' "$ABROOT_IMAGE_NAME") \
     $(printf '%q' "$SCRIPT_PATH") --execute --non-interactive
 EOF
@@ -3449,7 +3503,7 @@ capture_vib_diagnostics() {
   for f in \
     "$CUSTOM_PROJECT/recipe.yml" \
     "$CUSTOM_PROJECT/Containerfile" \
-    "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" \
+    "$CUSTOM_PROJECT/VanillaOS-SnapdragonX-INPUTS.txt" \
     "$TMP_ROOT/target-installed-kernel-packages.actual.tsv" \
     "$TMP_ROOT/target-installed-package-expectations.tsv" \
     "$SOURCE_PROVENANCE_MANIFEST" \
@@ -3609,9 +3663,9 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
     "$CUSTOM_PROJECT/includes.container/root" \
     "$CUSTOM_PROJECT/includes.container/image-info" \
-    "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE" \
-    "$CUSTOM_PROJECT/includes.container/usr/share/conception/firmware-provenance" \
-    "$CUSTOM_PROJECT/includes.container/usr/lib/conception"
+    "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE" \
+    "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance" \
+    "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx"
 
   mkdir -p \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
@@ -3621,9 +3675,9 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/root" \
     "$CUSTOM_PROJECT/includes.container/image-info" \
     "$CUSTOM_PROJECT/includes.container/usr/local/sbin" \
-    "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE" \
-    "$CUSTOM_PROJECT/includes.container/usr/share/conception/firmware-provenance" \
-    "$CUSTOM_PROJECT/includes.container/usr/lib/conception" \
+    "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE" \
+    "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance" \
+    "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx" \
     "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants" \
     "$CUSTOM_PROJECT/modules"
 
@@ -3677,12 +3731,12 @@ prepare_custom_image_project() {
   fi
 
   generate_root_overlay_inventory
-  cp -a "$PROFILE_RESOLVED_JSON"     "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE/profile.resolved.json"
-  cp -a "$PROFILE_VALIDATION_REPORT"     "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE/profile-validation.tsv"
-  cp -a "$ROOT_OVERLAY_INVENTORY"     "$CUSTOM_PROJECT/includes.container/usr/lib/conception/root-overlay.sha256"
+  cp -a "$PROFILE_RESOLVED_JSON"     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json"
+  cp -a "$PROFILE_VALIDATION_REPORT"     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile-validation.tsv"
+  cp -a "$ROOT_OVERLAY_INVENTORY"     "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx/root-overlay.sha256"
   if [[ -d "$FIRMWARE_PROVENANCE_DIR" ]]; then
     rsync -aHAX "$FIRMWARE_PROVENANCE_DIR/" \
-      "$CUSTOM_PROJECT/includes.container/usr/share/conception/firmware-provenance/"
+      "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance/"
   fi
 
   # Preserve every supplied package without forcing optional build artifacts
@@ -3742,7 +3796,7 @@ apt-get install -y "${packages[@]}"
 # executables therefore cannot be assumed to exist in the finished image.
 # Verify the transaction now, while dpkg-query is available, and persist an
 # immutable receipt for post-build verification.
-receipt_dir=/usr/lib/conception
+receipt_dir=/usr/lib/vanillaos-snapdragonx
 receipt_tmp="$receipt_dir/target-installed-kernel-packages.tsv.tmp"
 receipt="$receipt_dir/target-installed-kernel-packages.tsv"
 receipt_checksum="$receipt.sha256"
@@ -3794,7 +3848,7 @@ INSTALL_DEBS_EOF
   installed_array="$(shell_array_literal "${PROFILE_INSTALLED_PATH_PROBES[@]}")"
   cmdline_array="$(shell_array_literal "${PROFILE_KERNEL_CMDLINE_APPEND[@]}")"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize" <<EOF_FINALIZE
+  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize" <<EOF_FINALIZE
 #!/usr/bin/env bash
 set -Eeuo pipefail
 release=$(printf '%q' "$KERNEL_RELEASE")
@@ -3813,10 +3867,10 @@ if [[ ! -e "/boot/initrd.img-\$release" ]]; then
 fi
 ln -sfn "boot/vmlinuz-\$release" /vmlinuz
 ln -sfn "boot/initrd.img-\$release" /initrd.img
-printf '%s\n' "\$release" > /usr/lib/conception-kernel-release
-printf '%s\n' "\$dtb" > /usr/lib/conception-dtb
-printf '%s\n' "\$profile" > /usr/lib/conception-profile
-printf '%s\n' "\${cmdline_append[@]}" > /usr/lib/conception-kernel-command-line
+printf '%s\n' "\$release" > /usr/lib/vanillaos-snapdragonx-kernel-release
+printf '%s\n' "\$dtb" > /usr/lib/vanillaos-snapdragonx-dtb
+printf '%s\n' "\$profile" > /usr/lib/vanillaos-snapdragonx-profile
+printf '%s\n' "\${cmdline_append[@]}" > /usr/lib/vanillaos-snapdragonx-kernel-command-line
 for probe in "\${firmware_probes[@]}"; do
   firmware_path="/usr/lib/firmware/\$probe"
   [[ -f "\$firmware_path" && ! -L "\$firmware_path" && -s "\$firmware_path" ]] || {
@@ -3825,11 +3879,11 @@ for probe in "\${firmware_probes[@]}"; do
   }
 done
 
-test -s /usr/share/conception/firmware-provenance/staged-firmware.sha256
+test -s /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
 EOF_FINALIZE
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot" <<EOF_INSTALLED_VERIFY
+  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot" <<EOF_INSTALLED_VERIFY
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -3844,7 +3898,7 @@ cmdline_append=$cmdline_array
 fail_verify() {
   local code="\$1"
   shift
-  printf 'CONCEPTION INSTALLED-BOOT VERIFY FAILED: %s\n' "\$*" >&2
+  printf 'VANILLAOS_SNAPDRAGONX INSTALLED-BOOT VERIFY FAILED: %s\n' "\$*" >&2
   exit "\$code"
 }
 
@@ -3867,9 +3921,9 @@ read_required_marker() {
   printf '%s' "\$value"
 }
 
-profile="\$(read_required_marker /usr/lib/conception-profile profile 101)"
-release="\$(read_required_marker /usr/lib/conception-kernel-release kernel 102)"
-dtb="\$(read_required_marker /usr/lib/conception-dtb DTB 103)"
+profile="\$(read_required_marker /usr/lib/vanillaos-snapdragonx-profile profile 101)"
+release="\$(read_required_marker /usr/lib/vanillaos-snapdragonx-kernel-release kernel 102)"
+dtb="\$(read_required_marker /usr/lib/vanillaos-snapdragonx-dtb DTB 103)"
 
 [[ "\$profile" == "\$expected_profile" ]] || \
   fail_verify 104 "Profile mismatch: expected=\$expected_profile installed=\$profile"
@@ -3878,7 +3932,7 @@ dtb="\$(read_required_marker /usr/lib/conception-dtb DTB 103)"
 [[ "\$dtb" == "\$expected_dtb" ]] || \
   fail_verify 106 "DTB mismatch: expected=\$expected_dtb installed=\$dtb"
 
-[[ -r /usr/lib/conception-kernel-command-line ]] || \
+[[ -r /usr/lib/vanillaos-snapdragonx-kernel-command-line ]] || \
   fail_verify 107 "Kernel command-line marker is unreadable"
 
 require_directory "/usr/lib/modules/\$release" "selected kernel module tree" 108
@@ -3936,11 +3990,11 @@ for probe in "\${firmware_probes[@]}"; do
 done
 
 require_nonempty_file \
-  /usr/share/conception/firmware-provenance/staged-firmware.sha256 \
+  /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256 \
   "staged firmware provenance" 132
-[[ -x /usr/local/sbin/conception-record-boot-evidence ]] || \
+[[ -x /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence ]] || \
   fail_verify 133 "Boot evidence recorder is absent or not executable"
-[[ -x /usr/local/sbin/conception-collect-hardware-diagnostics ]] || \
+[[ -x /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics ]] || \
   fail_verify 134 "Hardware diagnostics collector is absent or not executable"
 
 for path in "\${installed_paths[@]}"; do
@@ -3955,7 +4009,7 @@ case "\$root_link" in
 esac
 
 require_nonempty_file \
-  /usr/lib/conception/relocated-var-payload.status \
+  /usr/lib/vanillaos-snapdragonx/relocated-var-payload.status \
   "relocated payload status" 126
 require_nonempty_file \
   /root/custom-kernel-packages/PACKAGE-SELECTION.tsv \
@@ -3976,9 +4030,9 @@ if (( \${#initramfs_probes[@]} > 0 )); then
 fi
 
 root_overlay_status="not-configured"
-if [[ -s /usr/lib/conception/root-overlay.sha256 ]]; then
+if [[ -s /usr/lib/vanillaos-snapdragonx/root-overlay.sha256 ]]; then
   checksum_output="\$(mktemp)"
-  if ! sha256sum -c /usr/lib/conception/root-overlay.sha256 \
+  if ! sha256sum -c /usr/lib/vanillaos-snapdragonx/root-overlay.sha256 \
       > "\$checksum_output" 2>&1; then
     cat "\$checksum_output" >&2 || true
     rm -f "\$checksum_output"
@@ -3990,7 +4044,7 @@ if [[ -s /usr/lib/conception/root-overlay.sha256 ]]; then
   root_overlay_status="pass"
 fi
 
-mkdir -p /usr/lib/conception
+mkdir -p /usr/lib/vanillaos-snapdragonx
 {
   printf 'check\tstatus\tdetail\n'
   printf 'profile\tpass\t%s\n' "\$profile"
@@ -4000,29 +4054,29 @@ mkdir -p /usr/lib/conception
   printf 'initramfs\tpass\t%s\n' "\$state/initrd.img-\$release"
   printf 'root_relocation\tpass\t%s\n' "\$root_link"
   printf 'root_overlay\t%s\t%s\n' "\$root_overlay_status" \
-    /usr/lib/conception/root-overlay.sha256
+    /usr/lib/vanillaos-snapdragonx/root-overlay.sha256
   printf 'package_archive\tpass\t%s\n' \
     /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
   printf 'firmware_provenance\tpass\t%s\n' \
-    /usr/share/conception/firmware-provenance/staged-firmware.sha256
+    /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
   printf 'boot_evidence_collector\tpass\t%s\n' \
-    /usr/local/sbin/conception-record-boot-evidence
+    /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
   printf 'hardware_diagnostics\tpass\t%s\n' \
-    /usr/local/sbin/conception-collect-hardware-diagnostics
-} > /usr/lib/conception/installed-boot-validation.tsv
+    /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+} > /usr/lib/vanillaos-snapdragonx/installed-boot-validation.tsv
 
-printf 'Conception installed-boot verification passed for profile %s.\n' "\$profile"
+printf 'VanillaOS-SnapdragonX installed-boot verification passed for profile %s.\n' "\$profile"
 EOF_INSTALLED_VERIFY
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot"
 
   # Vanilla installations may not retain a conventional dmesg text file. This
   # oneshot records the boot's kernel journal, command line, Adreno messages,
   # firmware inventory, and DRM nodes into writable /var after each boot.
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-record-boot-evidence" <<'BOOT_EVIDENCE_EOF'
+  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence" <<'BOOT_EVIDENCE_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-out=/var/log/conception
+out=/var/log/vanillaos-snapdragonx
 mkdir -p "$out"
 boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || date -u +%Y%m%d-%H%M%S)"
 work="$out/.boot-$boot_id.tmp"
@@ -4059,26 +4113,26 @@ rm -rf "$final"
 mv "$work" "$final"
 ln -sfn "$(basename "$final")" "$out/current"
 BOOT_EVIDENCE_EOF
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-record-boot-evidence"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-collect-hardware-diagnostics" <<'HW_COLLECT_EOF'
+  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics" <<'HW_COLLECT_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
-name="conception-hardware-diagnostics-$stamp"
+name="vanillaos-snapdragonx-hardware-diagnostics-$stamp"
 work="${TMPDIR:-/tmp}/$name"
 archive="${1:-$PWD/$name.tar.gz}"
 mkdir -p "$work"
 
-/usr/local/sbin/conception-record-boot-evidence || true
-cp -a /var/log/conception "$work/" 2>/dev/null || true
-cp -a /usr/share/conception/firmware-provenance "$work/" 2>/dev/null || true
-cp -a /usr/share/conception/profiles "$work/" 2>/dev/null || true
-cp -a /usr/lib/conception-kernel-command-line "$work/" 2>/dev/null || true
-cp -a /usr/lib/conception-kernel-release "$work/" 2>/dev/null || true
-cp -a /usr/lib/conception-dtb "$work/" 2>/dev/null || true
-cp -a /usr/lib/conception-profile "$work/" 2>/dev/null || true
+/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence || true
+cp -a /var/log/vanillaos-snapdragonx "$work/" 2>/dev/null || true
+cp -a /usr/share/vanillaos-snapdragonx/firmware-provenance "$work/" 2>/dev/null || true
+cp -a /usr/share/vanillaos-snapdragonx/profiles "$work/" 2>/dev/null || true
+cp -a /usr/lib/vanillaos-snapdragonx-kernel-command-line "$work/" 2>/dev/null || true
+cp -a /usr/lib/vanillaos-snapdragonx-kernel-release "$work/" 2>/dev/null || true
+cp -a /usr/lib/vanillaos-snapdragonx-dtb "$work/" 2>/dev/null || true
+cp -a /usr/lib/vanillaos-snapdragonx-profile "$work/" 2>/dev/null || true
 
 find /sys/class/drm -maxdepth 3 -printf '%M\t%p\t%l\n' 2>/dev/null | LC_ALL=C sort \
   > "$work/sys-class-drm.tsv" || true
@@ -4090,30 +4144,30 @@ tar -C "$(dirname "$work")" -czf "$archive" "$(basename "$work")"
 sha256sum "$archive"
 printf 'Diagnostic archive: %s\n' "$archive"
 HW_COLLECT_EOF
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-collect-hardware-diagnostics"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics"
 
-  cat > "$CUSTOM_PROJECT/includes.container/etc/systemd/system/conception-boot-evidence.service" <<'BOOT_SERVICE_EOF'
+  cat > "$CUSTOM_PROJECT/includes.container/etc/systemd/system/vanillaos-snapdragonx-boot-evidence.service" <<'BOOT_SERVICE_EOF'
 [Unit]
-Description=Record Conception Snapdragon X boot and GPU evidence
+Description=Record VanillaOS-SnapdragonX Snapdragon X boot and GPU evidence
 After=systemd-journald.service local-fs.target
 Wants=systemd-journald.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/conception-record-boot-evidence
+ExecStart=/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 BOOT_SERVICE_EOF
-  ln -sfn ../conception-boot-evidence.service \
-    "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants/conception-boot-evidence.service"
+  ln -sfn ../vanillaos-snapdragonx-boot-evidence.service \
+    "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-boot-evidence.service"
 
   bash -n "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-record-boot-evidence"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-collect-hardware-diagnostics"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics"
 
   cat > "$CUSTOM_PROJECT/modules/50-install-hardware-debs.yml" <<'MODULE_DEBS_EOF'
 name: install-hardware-debs
@@ -4127,12 +4181,12 @@ MODULE_DEBS_EOF
 name: select-hardware-kernel
 type: shell
 commands:
-  - /usr/local/sbin/conception-hardware-finalize
+  - /usr/local/sbin/vanillaos-snapdragonx-hardware-finalize
 MODULE_HW_EOF
 
   cat > "$CUSTOM_PROJECT/recipe.yml" <<EOF_RECIPE
-name: Conception VanillaOS Desktop for $PROFILE
-id: conception-$PROFILE
+name: VanillaOS-SnapdragonX Desktop for $PROFILE
+id: vanillaos-snapdragonx-$PROFILE
 vibversion: 1.0.7
 
 stages:
@@ -4141,19 +4195,19 @@ stages:
     addincludes: true
     singlelayer: false
     labels:
-      maintainer: Conception
-      conception.profile: $PROFILE
-      conception.profile-schema: "$PROFILE_SCHEMA_VERSION"
-      conception.kernel: $KERNEL_RELEASE
-      conception.dtb: $DTB_NAME
-      conception.builder-version: "$SCRIPT_VERSION"
-      conception.qcom-soc-firmware-version: "${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-prestaged}"
-      conception.qcom-soc-firmware-sha256: "${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-not-recorded}"
+      maintainer: VanillaOS-SnapdragonX
+      vanillaos-snapdragonx.profile: $PROFILE
+      vanillaos-snapdragonx.profile-schema: "$PROFILE_SCHEMA_VERSION"
+      vanillaos-snapdragonx.kernel: $KERNEL_RELEASE
+      vanillaos-snapdragonx.dtb: $DTB_NAME
+      vanillaos-snapdragonx.builder-version: "$SCRIPT_VERSION"
+      vanillaos-snapdragonx.qcom-soc-firmware-version: "${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-prestaged}"
+      vanillaos-snapdragonx.qcom-soc-firmware-sha256: "${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-not-recorded}"
     args:
       DEBIAN_FRONTEND: noninteractive
     runs:
       commands:
-        - echo 'APT::Install-Recommends "1";' > /etc/apt/apt.conf.d/01conception-recommends
+        - echo 'APT::Install-Recommends "1";' > /etc/apt/apt.conf.d/01vanillaos-snapdragonx-recommends
     modules:
       - name: init-setup
         type: shell
@@ -4200,7 +4254,7 @@ stages:
           - rm -rf /var/tmp/*
 EOF_RECIPE
 
-  cat > "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" <<EOF_INPUTS
+  cat > "$CUSTOM_PROJECT/VanillaOS-SnapdragonX-INPUTS.txt" <<EOF_INPUTS
 Kernel packages discovered from:
   $ARTIFACT_DIR/kernel-debs/
   Compatibility fallback: $ARTIFACT_DIR/*.deb
@@ -4288,8 +4342,8 @@ expected_archive_count="$6"
 expected_package_file="$7"
 expected_profile="$8"
 
-receipt=/usr/lib/conception/target-installed-kernel-packages.tsv
-receipt_checksum=/usr/lib/conception/target-installed-kernel-packages.tsv.sha256
+receipt=/usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv
+receipt_checksum=/usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv.sha256
 
 test -s "/boot/vmlinuz-$release"
 test -d "/usr/lib/modules/$release" || test -d "/lib/modules/$release"
@@ -4297,17 +4351,29 @@ test -e "/boot/initrd.img-$release"
 test "$(readlink -f /vmlinuz)" = "/boot/vmlinuz-$release"
 test "$(readlink -f /initrd.img)" = "/boot/initrd.img-$release"
 test -s "/boot/dtbs/$dtb"
-grep -Fxq "$release" /usr/lib/conception-kernel-release
-grep -Fxq "$dtb" /usr/lib/conception-dtb
-grep -Fxq "$expected_profile" /usr/lib/conception-profile
-test -f /usr/lib/conception-kernel-command-line
+grep -Fxq "$release" /usr/lib/vanillaos-snapdragonx-kernel-release
+grep -Fxq "$dtb" /usr/lib/vanillaos-snapdragonx-dtb
+grep -Fxq "$expected_profile" /usr/lib/vanillaos-snapdragonx-profile
+test -f /usr/lib/vanillaos-snapdragonx-kernel-command-line
 grep -Fq "$abroot_name" /usr/share/abroot/abroot.json
 
-test -s /usr/share/conception/firmware-provenance/staged-firmware.sha256
-test -x /usr/local/sbin/conception-record-boot-evidence
-test -x /usr/local/sbin/conception-collect-hardware-diagnostics
-test -f /etc/systemd/system/conception-boot-evidence.service
-test -L /etc/systemd/system/multi-user.target.wants/conception-boot-evidence.service
+for storage_command in cryptsetup lsblk blkid; do
+  command -v "$storage_command" >/dev/null 2>&1 || {
+    echo "Target image lacks boot-storage command: $storage_command" >&2
+    exit 1
+  }
+done
+unlock_hook=/usr/share/init.d/090-abroot-unlock-var.sh
+test -s "$unlock_hook"
+grep -Fq '/dev/mapper/vos--var-var' "$unlock_hook"
+grep -Fq '/dev/disk/by-partlabel/vos-var' "$unlock_hook"
+grep -Fq '/dev/disk/by-label/vos-var' "$unlock_hook"
+
+test -s /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
+test -x /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
+test -x /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+test -f /etc/systemd/system/vanillaos-snapdragonx-boot-evidence.service
+test -L /etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-boot-evidence.service
 
 for core_firmware in \
   /usr/lib/firmware/qcom/gen71500_sqe.fw \
@@ -4424,7 +4490,7 @@ VERIFY_OCI_EOF
   "$OCI_RUNTIME" run --rm \
     --entrypoint /bin/cat \
     "$TARGET_IMAGE_REF" \
-    /usr/lib/conception/target-installed-kernel-packages.tsv \
+    /usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv \
     > "$actual_receipt"
   [[ -s "$actual_receipt" ]] || die "Unable to export the target installed-package receipt."
 
@@ -5008,7 +5074,7 @@ prepare_arm64_live_worktree() {
   prepare_arm64_package_list_projection "$conf"
   preflight_arm64_package_candidates "$conf"
 
-  # The official orchid build script still hard-codes the final AMD64 output
+  # The official Reunion build script still hard-codes the final AMD64 output
   # source path. This replacement happens after lb build and cannot alter the
   # package closure or live filesystem content.
   if grep -Fq 'tmp/amd64/live-image-amd64.hybrid.iso' "$build"; then
@@ -5240,7 +5306,7 @@ VERIFY_GRUB_BINDINGS_PY
 patch_live_grub_file() {
   # Patch one GRUB configuration in the extracted ISO tree.
   #
-  # The official orchid template uses:
+  # The official Reunion template uses:
   #   linux<TAB>KERNEL_LIVE APPEND_LIVE ---
   # A literal-space startswith() test therefore misses the command. Parse
   # complete menuentry blocks and accept all horizontal whitespace instead.
@@ -5284,7 +5350,7 @@ data = source.read_text(encoding="utf-8", errors="strict")
 target_kernel = f"/live/vmlinuz-{release}"
 target_initrd = f"/live/initrd.img-{release}"
 target_dtb = f"/boot/dtbs/{dtb}"
-marker = "CONCEPTION_ARM64_DTB_MANAGED"
+marker = "VANILLAOS_SNAPDRAGONX_ARM64_DTB_MANAGED"
 required_set = set(required_args)
 
 
@@ -5564,7 +5630,7 @@ def descriptor_for_reference(reference: str):
     return None
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ConceptionOCIRegistry/1.1"
+    server_version = "VanillaOS-SnapdragonXOCIRegistry/1.2"
 
     def log_message(self, fmt, *values):
         rendered = fmt % values
@@ -5667,6 +5733,961 @@ compile(Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
 PY_VALIDATE_REGISTRY_SERVER
 }
 
+write_installer_storage_guard() {
+  local root="$1"
+  local guard="$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard"
+  local validator="$root/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage"
+  local wrapper="$root/usr/local/sbin/albius"
+  local real_albius=""
+  local candidate
+
+  for candidate in /usr/bin/albius /usr/sbin/albius /bin/albius; do
+    if [[ -x "$root$candidate" ]]; then
+      real_albius="$candidate"
+      break
+    fi
+  done
+  [[ -n "$real_albius" ]] || \
+    die "The live filesystem does not contain the real Albius executable."
+
+  if [[ -e "$wrapper" ]] && ! grep -Fq \
+      "VANILLAOS_SNAPDRAGONX_ALBIUS_STORAGE_GUARD" "$wrapper" 2>/dev/null; then
+    die "Refusing to replace an unrelated executable at ${wrapper#"$root"}."
+  fi
+
+  mkdir -p "$(dirname "$guard")" "$(dirname "$wrapper")"
+
+  cat > "$guard" <<'PY_STORAGE_GUARD'
+#!/usr/bin/env python3
+"""Validate and, when permitted, normalize Vanilla Installer storage recipes.
+
+This program deliberately operates on the generated Albius recipe instead of
+patching Vanilla Installer or Albius storage source. It is idempotent with an
+upstream fix: a correct recipe is accepted without adding duplicate operations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import subprocess
+import tempfile
+from typing import Any
+
+MARKER = "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1"
+DEFAULT_EFFECTIVE_EVIDENCE = Path(
+    "/tmp/vanillaos-snapdragonx-albius-install-recipe.json"
+)
+DEFAULT_GENERATED_EVIDENCE = Path(
+    "/tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json"
+)
+DEFAULT_REPORT = Path("/tmp/vanillaos-snapdragonx-storage-guard.json")
+DEFAULT_VALIDATOR = "/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage"
+
+
+class GuardError(RuntimeError):
+    pass
+
+
+def operation(step: dict[str, Any]) -> str:
+    value = step.get("operation")
+    return value if isinstance(value, str) else ""
+
+
+def params(step: dict[str, Any]) -> list[Any]:
+    value = step.get("params")
+    return value if isinstance(value, list) else []
+
+
+def norm_partnum(value: Any) -> str:
+    if isinstance(value, bool):
+        raise GuardError("partition number must not be boolean")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise GuardError(f"non-integral partition number: {value!r}")
+        return str(int(value))
+    text = str(value).strip()
+    if not text.isdigit() or int(text) < 1:
+        raise GuardError(f"invalid partition number: {value!r}")
+    return str(int(text))
+
+
+def compose_partition(disk: str, partnum: Any) -> str:
+    number = norm_partnum(partnum)
+    suffix = "p" if disk and disk[-1].isdigit() else ""
+    return f"{disk}{suffix}{number}"
+
+
+def redact_recipe(document: dict[str, Any]) -> dict[str, Any]:
+    redacted = copy.deepcopy(document)
+    for step in redacted.get("setup", []):
+        if not isinstance(step, dict):
+            continue
+        if operation(step) not in {"luks-format", "lvm-luks-format"}:
+            continue
+        values = params(step)
+        if len(values) >= 3:
+            values[2] = "<redacted-luks-passphrase>"
+    return redacted
+
+
+def atomic_json(path: Path, document: dict[str, Any], mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def require_list(document: dict[str, Any], key: str) -> list[Any]:
+    value = document.get(key)
+    if not isinstance(value, list):
+        raise GuardError(f"recipe field {key!r} must be a list")
+    return value
+
+
+def command_output(command: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise GuardError(f"required storage utility is unavailable: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "unknown error").strip()
+        raise GuardError(
+            f"storage preflight command failed ({shlex.join(command)}): {detail}"
+        ) from exc
+    return completed.stdout.strip()
+
+
+def iter_lsblk_nodes(nodes: list[Any]):
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        yield node
+        children = node.get("children")
+        if isinstance(children, list):
+            yield from iter_lsblk_nodes(children)
+
+
+def conflicting_partlabels(document: dict[str, Any], target: str) -> list[str]:
+    target_real = os.path.realpath(target)
+    conflicts: list[str] = []
+    nodes = document.get("blockdevices")
+    if not isinstance(nodes, list):
+        raise GuardError("lsblk JSON lacks blockdevices array")
+    for node in iter_lsblk_nodes(nodes):
+        if node.get("type") != "part" or node.get("partlabel") != "vos-var":
+            continue
+        path = node.get("path")
+        if not isinstance(path, str) or not path.startswith("/dev/"):
+            raise GuardError("lsblk returned an unsafe device path for PARTLABEL vos-var")
+        if os.path.realpath(path) != target_real:
+            conflicts.append(path)
+    return sorted(set(conflicts))
+
+
+def preflight_manual_device(report: dict[str, Any]) -> dict[str, Any]:
+    target = report.get("var_device")
+    disk = report.get("var_disk")
+    part_number = report.get("var_partition_number")
+    if not isinstance(target, str) or not isinstance(disk, str):
+        raise GuardError("manual storage report lacks target device identity")
+    try:
+        target_stat = os.stat(target)
+    except OSError as exc:
+        raise GuardError(f"manual /var partition is unavailable: {target}: {exc}") from exc
+    if not stat.S_ISBLK(target_stat.st_mode):
+        raise GuardError(f"manual /var target is not a block device: {target}")
+
+    target_type = command_output(["lsblk", "-dn", "-o", "TYPE", target])
+    if target_type != "part":
+        raise GuardError(f"manual /var target is not a partition: {target} ({target_type})")
+
+    parent_name = command_output(["lsblk", "-dn", "-o", "PKNAME", target])
+    actual_disk = parent_name if parent_name.startswith("/dev/") else f"/dev/{parent_name}"
+    if os.path.realpath(actual_disk) != os.path.realpath(disk):
+        raise GuardError(
+            f"manual /var recipe disk mismatch: recipe={disk}, actual={actual_disk}"
+        )
+
+    actual_part_number = norm_partnum(
+        command_output(["lsblk", "-dn", "-o", "PARTN", target])
+    )
+    if actual_part_number != norm_partnum(part_number):
+        raise GuardError(
+            "manual /var partition-number mismatch: "
+            f"recipe={part_number}, actual={actual_part_number}"
+        )
+
+    table_type = command_output(["lsblk", "-dn", "-o", "PTTYPE", disk]).lower()
+    encrypted = report.get("encrypted") is True
+    conflicts: list[str] = []
+    if encrypted:
+        if table_type != "gpt":
+            raise GuardError(
+                f"manual encrypted /var requires a GPT partition table for PARTLABEL discovery; "
+                f"{disk} reports {table_type or 'unknown'}"
+            )
+        try:
+            lsblk_document = json.loads(
+                command_output(["lsblk", "--json", "-p", "-o", "PATH,TYPE,PARTLABEL"])
+            )
+        except json.JSONDecodeError as exc:
+            raise GuardError(f"unable to parse lsblk JSON: {exc}") from exc
+        conflicts = conflicting_partlabels(lsblk_document, target)
+        if conflicts:
+            raise GuardError(
+                "existing GPT PARTLABEL vos-var is assigned to another partition: "
+                + ", ".join(conflicts)
+            )
+
+    return {
+        "status": "pass",
+        "target": target,
+        "disk": disk,
+        "partition_number": actual_part_number,
+        "partition_table": table_type,
+        "existing_vos_var_conflicts": conflicts,
+    }
+
+
+def validate_root_lvm(setup: list[Any]) -> None:
+    def matching(op: str, predicate) -> list[dict[str, Any]]:
+        return [
+            raw
+            for raw in setup
+            if isinstance(raw, dict) and operation(raw) == op and predicate(params(raw))
+        ]
+
+    vg = matching("vgcreate", lambda value: len(value) >= 1 and value[0] == "vos-root")
+    init_lv = matching(
+        "lvcreate",
+        lambda value: len(value) >= 2 and value[0] == "init" and value[1] == "vos-root",
+    )
+    root_data = matching(
+        "lvcreate",
+        lambda value: len(value) >= 2 and value[0] == "root" and value[1] == "vos-root",
+    )
+    root_meta = matching(
+        "lvcreate",
+        lambda value: len(value) >= 2 and value[0] == "root-meta" and value[1] == "vos-root",
+    )
+    thin_pool = matching(
+        "make-thin-pool",
+        lambda value: len(value) >= 2
+        and value[0] == "vos-root/root"
+        and value[1] == "vos-root/root-meta",
+    )
+    root_a = matching(
+        "lvcreate-thin",
+        lambda value: len(value) >= 4
+        and value[0] == "root-a"
+        and value[1] == "vos-root"
+        and value[3] == "root",
+    )
+    root_b = matching(
+        "lvcreate-thin",
+        lambda value: len(value) >= 4
+        and value[0] == "root-b"
+        and value[1] == "vos-root"
+        and value[3] == "root",
+    )
+    checks = {
+        "vos-root VG": vg,
+        "vos-root/init LV": init_lv,
+        "vos-root/root data LV": root_data,
+        "vos-root/root-meta LV": root_meta,
+        "vos-root/root thin pool": thin_pool,
+        "vos-root/root-a thin LV": root_a,
+        "vos-root/root-b thin LV": root_b,
+    }
+    invalid = [name for name, values in checks.items() if len(values) != 1]
+    if invalid:
+        raise GuardError(
+            "ABRoot LVM topology is incomplete or ambiguous: " + ", ".join(invalid)
+        )
+
+
+def matching_partition_steps(
+    setup: list[Any], var_partition: str, accepted_operations: set[str]
+) -> list[tuple[int, dict[str, Any]]]:
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for index, raw in enumerate(setup):
+        if not isinstance(raw, dict) or operation(raw) not in accepted_operations:
+            continue
+        disk = raw.get("disk")
+        values = params(raw)
+        if not isinstance(disk, str) or not values:
+            continue
+        try:
+            target = compose_partition(disk, values[0])
+        except GuardError:
+            continue
+        if os.path.normpath(target) == os.path.normpath(var_partition):
+            matches.append((index, raw))
+    return matches
+
+
+def validate_luks_passphrase(step: dict[str, Any]) -> None:
+    values = params(step)
+    if len(values) < 3 or not isinstance(values[2], str) or not values[2]:
+        raise GuardError("encrypted /var operation lacks a nonempty LUKS passphrase")
+
+
+def ensure_inner_label(
+    step: dict[str, Any], label_index: int, policy: str, corrections: list[str]
+) -> None:
+    values = params(step)
+    if len(values) > label_index and values[label_index] == "vos-var":
+        return
+    if policy != "repair":
+        raise GuardError(
+            "encrypted /var operation does not assign inner filesystem label vos-var"
+        )
+    while len(values) <= label_index:
+        values.append("")
+    values[label_index] = "vos-var"
+    corrections.append("normalized encrypted /var inner filesystem label to vos-var")
+
+
+def add_post_validation(
+    document: dict[str, Any], validator: str, mode: str, var_device: str
+) -> bool:
+    post = require_list(document, "postInstallation")
+    command = (
+        f"{shlex.quote(validator)} --mode {shlex.quote(mode)} "
+        f"--var-device {shlex.quote(var_device)}"
+    )
+    for raw in post:
+        if not isinstance(raw, dict) or operation(raw) != "shell":
+            continue
+        for value in params(raw):
+            if isinstance(value, str) and MARKER in value:
+                return False
+    post.append(
+        {
+            "chroot": False,
+            "operation": "shell",
+            "params": [f"{command} # {MARKER}"],
+        }
+    )
+    return True
+
+
+def analyze_and_normalize(
+    document: dict[str, Any], policy: str, validator: str
+) -> dict[str, Any]:
+    setup = require_list(document, "setup")
+    mountpoints = require_list(document, "mountpoints")
+    require_list(document, "postInstallation")
+
+    var_mounts = [
+        item
+        for item in mountpoints
+        if isinstance(item, dict) and item.get("target") == "/var"
+    ]
+    if len(var_mounts) != 1:
+        raise GuardError(
+            f"expected exactly one /var mountpoint, found {len(var_mounts)}"
+        )
+    var_partition = var_mounts[0].get("partition")
+    if not isinstance(var_partition, str) or not var_partition.startswith("/dev/"):
+        raise GuardError(f"unsafe or missing /var device: {var_partition!r}")
+
+    root_targets = [
+        item.get("partition")
+        for item in mountpoints
+        if isinstance(item, dict) and item.get("target") == "/"
+    ]
+    if (
+        len(root_targets) != 2
+        or root_targets.count("/dev/vos-root/root-a") != 1
+        or root_targets.count("/dev/vos-root/root-b") != 1
+    ):
+        raise GuardError(
+            "recipe must expose exactly one ABRoot A mount and one ABRoot B mount"
+        )
+
+    validate_root_lvm(setup)
+
+    corrections: list[str] = []
+    topology: str
+    encrypted: bool
+    discovery_path: str
+    var_disk: str | None = None
+    var_partition_number: str | None = None
+
+    automatic_paths = {"/dev/vos-var/var", "/dev/mapper/vos--var-var"}
+    if os.path.normpath(var_partition) in automatic_paths:
+        topology = "automatic-lvm"
+        vg_steps = [
+            raw
+            for raw in setup
+            if isinstance(raw, dict)
+            and operation(raw) == "vgcreate"
+            and params(raw)
+            and params(raw)[0] == "vos-var"
+        ]
+        lv_steps = [
+            raw
+            for raw in setup
+            if isinstance(raw, dict)
+            and operation(raw) == "lvcreate"
+            and len(params(raw)) >= 2
+            and params(raw)[0] == "var"
+            and params(raw)[1] == "vos-var"
+        ]
+        format_steps = [
+            raw
+            for raw in setup
+            if isinstance(raw, dict)
+            and operation(raw) in {"lvm-luks-format", "lvm-format"}
+            and params(raw)
+            and params(raw)[0] == "vos-var/var"
+        ]
+        if len(vg_steps) != 1 or len(lv_steps) != 1 or len(format_steps) != 1:
+            raise GuardError(
+                "automatic /var topology requires exactly one vos-var VG, var LV, and format operation"
+            )
+        encrypted = operation(format_steps[0]) == "lvm-luks-format"
+        if encrypted:
+            validate_luks_passphrase(format_steps[0])
+            ensure_inner_label(format_steps[0], 3, policy, corrections)
+            mode = "automatic-lvm-luks"
+            discovery_path = "/dev/mapper/vos--var-var"
+        else:
+            values = params(format_steps[0])
+            if len(values) < 3 or values[2] != "vos-var":
+                raise GuardError("unencrypted automatic /var lacks filesystem label vos-var")
+            mode = "automatic-lvm-plain"
+            discovery_path = "/dev/disk/by-label/vos-var"
+    else:
+        topology = "manual-partition"
+        candidates = matching_partition_steps(
+            setup, var_partition, {"luks-format", "format", "setlabel"}
+        )
+        if len(candidates) != 1:
+            raise GuardError(
+                "manual /var must have exactly one matching luks-format, format, or setlabel operation"
+            )
+        format_index, format_step = candidates[0]
+        format_operation = operation(format_step)
+        disk = format_step.get("disk")
+        values = params(format_step)
+        if not isinstance(disk, str) or not values:
+            raise GuardError("manual /var format operation is structurally invalid")
+        part_number = norm_partnum(values[0])
+        var_disk = disk
+        var_partition_number = part_number
+        encrypted = format_operation == "luks-format"
+
+        if encrypted:
+            validate_luks_passphrase(format_step)
+            ensure_inner_label(format_step, 3, policy, corrections)
+            other_vos_var: list[str] = []
+            same_name_steps: list[tuple[int, dict[str, Any]]] = []
+            for index, raw in enumerate(setup):
+                if not isinstance(raw, dict) or operation(raw) != "namepart":
+                    continue
+                raw_values = params(raw)
+                raw_disk = raw.get("disk")
+                if len(raw_values) < 2 or not isinstance(raw_disk, str):
+                    raise GuardError("malformed namepart operation in storage recipe")
+                raw_number = norm_partnum(raw_values[0])
+                same_target = raw_disk == disk and raw_number == part_number
+                if raw_values[1] == "vos-var" and not same_target:
+                    other_vos_var.append(compose_partition(raw_disk, raw_number))
+                if same_target:
+                    same_name_steps.append((index, raw))
+            if other_vos_var:
+                raise GuardError(
+                    "PARTLABEL vos-var is assigned to another partition: "
+                    + ", ".join(other_vos_var)
+                )
+            if len(same_name_steps) > 1:
+                raise GuardError(
+                    "manual /var contains multiple namepart operations for the same partition"
+                )
+            if same_name_steps:
+                label_values = params(same_name_steps[0][1])
+                if label_values[1] != "vos-var":
+                    if policy != "repair":
+                        raise GuardError(
+                            "manual encrypted /var GPT partition name is not vos-var"
+                        )
+                    label_values[1] = "vos-var"
+                    corrections.append(
+                        "corrected manual encrypted /var GPT partition name to vos-var"
+                    )
+            else:
+                if policy != "repair":
+                    raise GuardError(
+                        "manual encrypted /var lacks required GPT PARTLABEL vos-var"
+                    )
+                setup.insert(
+                    format_index,
+                    {
+                        "disk": disk,
+                        "operation": "namepart",
+                        "params": [int(part_number), "vos-var"],
+                    },
+                )
+                corrections.append(
+                    "inserted idempotent namepart operation for manual encrypted /var"
+                )
+            mode = "manual-partition-luks"
+            discovery_path = "/dev/disk/by-partlabel/vos-var"
+        else:
+            if format_operation == "format":
+                if len(values) < 3 or values[2] != "vos-var":
+                    raise GuardError("unencrypted manual /var lacks filesystem label vos-var")
+            elif format_operation == "setlabel":
+                if len(values) < 2 or values[1] != "vos-var":
+                    raise GuardError("existing manual /var lacks filesystem label vos-var")
+            mode = "manual-partition-plain"
+            discovery_path = "/dev/disk/by-label/vos-var"
+
+    validation_added = add_post_validation(document, validator, mode, var_partition)
+    if validation_added:
+        corrections.append("appended target storage validation post-install step")
+
+    return {
+        "marker": MARKER,
+        "status": "pass",
+        "policy": policy,
+        "topology": topology,
+        "root_lvm_topology": "vos-root validated",
+        "encrypted": encrypted,
+        "var_device": var_partition,
+        "var_disk": var_disk,
+        "var_partition_number": var_partition_number,
+        "initramfs_discovery_path": discovery_path,
+        "corrections": corrections,
+        "effective_recipe_changed": bool(corrections),
+    }
+
+
+def process(args: argparse.Namespace) -> int:
+    recipe_path = Path(args.recipe)
+    try:
+        if recipe_path.is_symlink():
+            raise GuardError(f"refusing to replace symlinked Albius recipe: {recipe_path}")
+        original_stat = recipe_path.stat()
+        original_mode = stat.S_IMODE(original_stat.st_mode)
+        document = json.loads(recipe_path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise GuardError("Albius recipe root must be a JSON object")
+
+        atomic_json(Path(args.generated_evidence), redact_recipe(document))
+        if args.policy == "off":
+            report = {
+                "marker": MARKER,
+                "status": "disabled",
+                "policy": "off",
+                "warning": "storage recipe validation was explicitly disabled",
+            }
+        else:
+            report = analyze_and_normalize(document, args.policy, args.validator)
+            if report["topology"] == "manual-partition" and not args.skip_device_preflight:
+                report["device_preflight"] = preflight_manual_device(report)
+            else:
+                report["device_preflight"] = {
+                    "status": "not-required" if report["topology"] != "manual-partition" else "skipped"
+                }
+            atomic_json(recipe_path, document, mode=original_mode)
+            os.chown(recipe_path, original_stat.st_uid, original_stat.st_gid)
+        atomic_json(Path(args.effective_evidence), redact_recipe(document))
+        atomic_json(Path(args.report), report)
+        print(
+            "Storage guard: "
+            f"status={report['status']} policy={report['policy']} "
+            f"topology={report.get('topology', 'not-validated')} "
+            f"corrections={len(report.get('corrections', []))}"
+        )
+        return 0
+    except (OSError, json.JSONDecodeError, GuardError, TypeError, ValueError) as exc:
+        report = {
+            "marker": MARKER,
+            "status": "fail",
+            "policy": args.policy,
+            "error": str(exc),
+        }
+        try:
+            atomic_json(Path(args.report), report)
+        except OSError:
+            pass
+        print(f"Storage guard failure: {exc}", file=os.sys.stderr)
+        return 78
+
+
+def minimal_root_setup() -> list[dict[str, Any]]:
+    return [
+        {"disk": "/dev/nvme0n1", "operation": "vgcreate", "params": ["vos-root", ["/dev/nvme0n1p8"]]},
+        {"disk": "/dev/nvme0n1", "operation": "lvcreate", "params": ["init", "vos-root", "linear", 1024]},
+        {"disk": "/dev/nvme0n1", "operation": "lvcreate", "params": ["root-meta", "vos-root", "linear", 1024]},
+        {"disk": "/dev/nvme0n1", "operation": "lvcreate", "params": ["root", "vos-root", "linear", 19456]},
+        {"disk": "/dev/nvme0n1", "operation": "make-thin-pool", "params": ["vos-root/root", "vos-root/root-meta"]},
+        {"disk": "/dev/nvme0n1", "operation": "lvcreate-thin", "params": ["root-a", "vos-root", 19456, "root"]},
+        {"disk": "/dev/nvme0n1", "operation": "lvcreate-thin", "params": ["root-b", "vos-root", 19456, "root"]},
+    ]
+
+
+def minimal_recipe_manual(encrypted: bool, name: str | None = None) -> dict[str, Any]:
+    op = "luks-format" if encrypted else "format"
+    values: list[Any] = [9, "btrfs"]
+    if encrypted:
+        values.extend(["secret", "vos-var"])
+    else:
+        values.append("vos-var")
+    setup: list[dict[str, Any]] = minimal_root_setup() + [
+        {"disk": "/dev/nvme0n1", "operation": op, "params": values},
+    ]
+    if name is not None:
+        format_index = next(index for index, step in enumerate(setup) if operation(step) == op)
+        setup.insert(format_index, {"disk": "/dev/nvme0n1", "operation": "namepart", "params": [9, name]})
+    return {
+        "setup": setup,
+        "mountpoints": [
+            {"partition": "/dev/vos-root/root-a", "target": "/"},
+            {"partition": "/dev/vos-root/root-b", "target": "/"},
+            {"partition": "/dev/nvme0n1p9", "target": "/var"},
+        ],
+        "installation": {"method": "oci", "source": "example.invalid/image:tag"},
+        "postInstallation": [],
+    }
+
+
+def minimal_recipe_auto(encrypted: bool = True) -> dict[str, Any]:
+    op = "lvm-luks-format" if encrypted else "lvm-format"
+    values: list[Any] = ["vos-var/var", "btrfs"]
+    if encrypted:
+        values.extend(["secret", "vos-var"])
+    else:
+        values.append("vos-var")
+    return {
+        "setup": minimal_root_setup() + [
+            {"disk": "/dev/nvme0n1", "operation": "vgcreate", "params": ["vos-var", ["/dev/nvme0n1p4"]]},
+            {"disk": "/dev/nvme0n1", "operation": "lvcreate", "params": ["var", "vos-var", "linear", "100%FREE"]},
+            {"disk": "/dev/nvme0n1", "operation": op, "params": values},
+        ],
+        "mountpoints": [
+            {"partition": "/dev/vos-root/root-a", "target": "/"},
+            {"partition": "/dev/vos-root/root-b", "target": "/"},
+            {"partition": "/dev/vos-var/var", "target": "/var"},
+        ],
+        "installation": {"method": "oci", "source": "example.invalid/image:tag"},
+        "postInstallation": [],
+    }
+
+
+def expect_failure(document: dict[str, Any], policy: str, text: str) -> None:
+    try:
+        analyze_and_normalize(document, policy, DEFAULT_VALIDATOR)
+    except GuardError as exc:
+        if text not in str(exc):
+            raise AssertionError(f"expected {text!r} in {exc!r}") from exc
+    else:
+        raise AssertionError(f"expected failure containing {text!r}")
+
+
+def self_test() -> int:
+    repaired = minimal_recipe_manual(True)
+    result = analyze_and_normalize(repaired, "repair", DEFAULT_VALIDATOR)
+    assert result["topology"] == "manual-partition"
+    assert any(operation(step) == "namepart" for step in repaired["setup"])
+    assert "<redacted-luks-passphrase>" in json.dumps(redact_recipe(repaired))
+    assert "secret" not in json.dumps(redact_recipe(repaired))
+
+    already_fixed = minimal_recipe_manual(True, "vos-var")
+    result = analyze_and_normalize(already_fixed, "repair", DEFAULT_VALIDATOR)
+    assert not any("inserted idempotent namepart" in item for item in result["corrections"])
+    assert sum(operation(step) == "namepart" for step in already_fixed["setup"]) == 1
+
+    strict_missing = minimal_recipe_manual(True)
+    expect_failure(strict_missing, "strict", "lacks required GPT PARTLABEL")
+
+    conflict = minimal_recipe_manual(True)
+    conflict["setup"].insert(
+        0,
+        {"disk": "/dev/nvme0n1", "operation": "namepart", "params": [7, "vos-var"]},
+    )
+    expect_failure(conflict, "repair", "assigned to another partition")
+
+    duplicate_var = minimal_recipe_manual(True)
+    duplicate_var["mountpoints"].append(
+        {"partition": "/dev/nvme0n1p10", "target": "/var"}
+    )
+    expect_failure(duplicate_var, "repair", "exactly one /var")
+
+    automatic = minimal_recipe_auto(True)
+    result = analyze_and_normalize(automatic, "repair", DEFAULT_VALIDATOR)
+    assert result["topology"] == "automatic-lvm"
+    assert not any(operation(step) == "namepart" for step in automatic["setup"])
+
+    broken_auto = minimal_recipe_auto(True)
+    broken_auto["setup"] = [
+        step
+        for step in broken_auto["setup"]
+        if not (operation(step) == "vgcreate" and params(step)[0] == "vos-var")
+    ]
+    expect_failure(broken_auto, "repair", "requires exactly one vos-var VG")
+
+    auto_missing_label = minimal_recipe_auto(True)
+    auto_format = next(
+        step for step in auto_missing_label["setup"] if operation(step) == "lvm-luks-format"
+    )
+    params(auto_format).pop()
+    result = analyze_and_normalize(auto_missing_label, "repair", DEFAULT_VALIDATOR)
+    assert params(auto_format)[3] == "vos-var"
+    assert any("inner filesystem label" in item for item in result["corrections"])
+
+    missing_secret = minimal_recipe_manual(True)
+    manual_format = next(
+        step for step in missing_secret["setup"] if operation(step) == "luks-format"
+    )
+    params(manual_format)[2] = ""
+    expect_failure(missing_secret, "repair", "nonempty LUKS passphrase")
+
+    plain = minimal_recipe_manual(False)
+    result = analyze_and_normalize(plain, "repair", DEFAULT_VALIDATOR)
+    assert result["encrypted"] is False
+    assert result["initramfs_discovery_path"] == "/dev/disk/by-label/vos-var"
+
+    labels = {
+        "blockdevices": [
+            {
+                "path": "/dev/nvme0n1",
+                "type": "disk",
+                "children": [
+                    {"path": "/dev/nvme0n1p9", "type": "part", "partlabel": None},
+                    {"path": "/dev/nvme0n1p10", "type": "part", "partlabel": "vos-var"},
+                ],
+            }
+        ]
+    }
+    assert conflicting_partlabels(labels, "/dev/nvme0n1p9") == ["/dev/nvme0n1p10"]
+
+    print("Storage guard self-test: 11 scenarios passed")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--recipe")
+    parser.add_argument("--policy", choices=("repair", "strict", "off"), default="repair")
+    parser.add_argument("--report", default=str(DEFAULT_REPORT))
+    parser.add_argument("--effective-evidence", default=str(DEFAULT_EFFECTIVE_EVIDENCE))
+    parser.add_argument("--generated-evidence", default=str(DEFAULT_GENERATED_EVIDENCE))
+    parser.add_argument("--validator", default=DEFAULT_VALIDATOR)
+    parser.add_argument("--skip-device-preflight", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--self-test", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.recipe:
+        raise SystemExit("--recipe is required unless --self-test is used")
+    return process(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY_STORAGE_GUARD
+
+  cat > "$validator" <<'SH_STORAGE_VALIDATOR'
+#!/usr/bin/env bash
+# VANILLAOS_SNAPDRAGONX_INSTALLED_STORAGE_VALIDATOR
+set -Eeuo pipefail
+
+mode=""
+var_device=""
+while (($#)); do
+  case "$1" in
+    --mode) [[ $# -ge 2 ]] || exit 64; mode="$2"; shift 2 ;;
+    --var-device) [[ $# -ge 2 ]] || exit 64; var_device="$2"; shift 2 ;;
+    *) printf 'Unknown storage-validator argument: %s\n' "$1" >&2; exit 64 ;;
+  esac
+done
+
+[[ -n "$mode" && -n "$var_device" ]] || {
+  echo "Storage validator requires --mode and --var-device." >&2
+  exit 64
+}
+
+report=/tmp/vanillaos-snapdragonx-installed-storage-validation.txt
+exec > >(tee "$report") 2>&1
+
+fail_storage() {
+  printf 'FAIL installed-storage: %s\n' "$*" >&2
+  exit 79
+}
+
+real_device() {
+  readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+udevadm trigger --subsystem-match=block --action=change >/dev/null 2>&1 || true
+udevadm settle --timeout=20 || fail_storage "udev did not settle"
+
+printf 'Mode: %s\n' "$mode"
+printf 'Recipe /var device: %s\n' "$var_device"
+
+for required_command in lvs lsblk blkid udevadm; do
+  command -v "$required_command" >/dev/null 2>&1 || \
+    fail_storage "$required_command is unavailable"
+done
+for root_lv in init root root-a root-b; do
+  lvs --noheadings "vos-root/$root_lv" >/dev/null 2>&1 || \
+    fail_storage "required ABRoot LV is missing: vos-root/$root_lv"
+done
+
+case "$mode" in
+  manual-partition-luks)
+    command -v cryptsetup >/dev/null 2>&1 || fail_storage "cryptsetup is unavailable"
+    [[ -b "$var_device" ]] || fail_storage "manual /var device is absent: $var_device"
+    cryptsetup isLuks "$var_device" || fail_storage "$var_device is not a LUKS container"
+    [[ "$(lsblk -dn -o PARTLABEL "$var_device" | xargs)" == "vos-var" ]] || \
+      fail_storage "manual encrypted /var lacks GPT PARTLABEL vos-var"
+    [[ -L /dev/disk/by-partlabel/vos-var ]] || \
+      fail_storage "/dev/disk/by-partlabel/vos-var was not created"
+    [[ "$(real_device /dev/disk/by-partlabel/vos-var)" == "$(real_device "$var_device")" ]] || \
+      fail_storage "vos-var PARTLABEL resolves to the wrong partition"
+    luks_uuid="$(blkid -s UUID -o value "$var_device" 2>/dev/null || true)"
+    [[ -n "$luks_uuid" ]] || fail_storage "unable to read LUKS UUID for $var_device"
+    mapper="/dev/mapper/luks-$luks_uuid"
+    [[ -b "$mapper" ]] || fail_storage "installer did not leave encrypted /var open at $mapper"
+    [[ "$(blkid -s LABEL -o value "$mapper" 2>/dev/null || true)" == "vos-var" ]] || \
+      fail_storage "inner /var filesystem label is not vos-var"
+    ;;
+  automatic-lvm-luks)
+    command -v cryptsetup >/dev/null 2>&1 || fail_storage "cryptsetup is unavailable"
+    lvs --noheadings vos-var/var >/dev/null 2>&1 || \
+      fail_storage "automatic vos-var/var LV is missing"
+    [[ -b /dev/mapper/vos--var-var ]] || \
+      fail_storage "/dev/mapper/vos--var-var is missing"
+    cryptsetup isLuks /dev/mapper/vos--var-var || \
+      fail_storage "vos-var/var is not a LUKS container"
+    luks_uuid="$(blkid -s UUID -o value /dev/mapper/vos--var-var 2>/dev/null || true)"
+    [[ -n "$luks_uuid" ]] || fail_storage "unable to read LUKS UUID for vos-var/var"
+    mapper="/dev/mapper/luks-$luks_uuid"
+    [[ -b "$mapper" ]] || fail_storage "installer did not leave encrypted /var open at $mapper"
+    [[ "$(blkid -s LABEL -o value "$mapper" 2>/dev/null || true)" == "vos-var" ]] || \
+      fail_storage "inner automatic /var filesystem label is not vos-var"
+    ;;
+  manual-partition-plain)
+    [[ -b "$var_device" ]] || fail_storage "manual /var device is absent: $var_device"
+    [[ "$(blkid -s LABEL -o value "$var_device" 2>/dev/null || true)" == "vos-var" ]] || \
+      fail_storage "unencrypted manual /var lacks filesystem label vos-var"
+    [[ -L /dev/disk/by-label/vos-var ]] || \
+      fail_storage "/dev/disk/by-label/vos-var was not created"
+    [[ "$(real_device /dev/disk/by-label/vos-var)" == "$(real_device "$var_device")" ]] || \
+      fail_storage "vos-var filesystem label resolves to the wrong manual partition"
+    ;;
+  automatic-lvm-plain)
+    lvs --noheadings vos-var/var >/dev/null 2>&1 || \
+      fail_storage "automatic vos-var/var LV is missing"
+    [[ -L /dev/disk/by-label/vos-var ]] || \
+      fail_storage "/dev/disk/by-label/vos-var was not created"
+    [[ "$(real_device /dev/disk/by-label/vos-var)" == "$(real_device /dev/vos-var/var)" ]] || \
+      fail_storage "vos-var filesystem label resolves to the wrong logical volume"
+    ;;
+  *) fail_storage "unsupported validation mode: $mode" ;;
+esac
+
+printf 'PASS installed-storage: initramfs discovery metadata is valid for %s\n' "$mode"
+SH_STORAGE_VALIDATOR
+
+  cat > "$wrapper" <<EOF_ALBIUS_GUARD
+#!/usr/bin/env bash
+# VANILLAOS_SNAPDRAGONX_ALBIUS_STORAGE_GUARD
+set -Eeuo pipefail
+real_albius=$(printf '%q' "$real_albius")
+guard=/usr/local/libexec/vanillaos-snapdragonx-storage-guard
+validator=/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage
+policy=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY")
+
+[[ \$# -ge 1 ]] || {
+  echo "The guarded Albius launcher requires a recipe path." >&2
+  exit 64
+}
+recipe=\$1
+[[ -s "\$recipe" ]] || {
+  echo "The Albius recipe is absent or empty: \$recipe" >&2
+  exit 66
+}
+
+"\$guard" \
+  --recipe "\$recipe" \
+  --policy "\$policy" \
+  --validator "\$validator" \
+  --generated-evidence /tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json \
+  --effective-evidence /tmp/vanillaos-snapdragonx-albius-install-recipe.json \
+  --report /tmp/vanillaos-snapdragonx-storage-guard.json
+
+recipe_real=\$(readlink -m -- "\$recipe")
+cleanup_recipe=0
+case "\$recipe_real" in
+  /tmp/tmp*) cleanup_recipe=1 ;;
+esac
+
+set +e
+"\$real_albius" "\$@"
+rc=\$?
+set -e
+
+# Vanilla Installer uses NamedTemporaryFile under /tmp. Remove that raw recipe
+# after Albius exits because it may contain the LUKS passphrase. Redacted
+# generated/effective evidence and the guard report remain available.
+if (( cleanup_recipe == 1 )); then
+  rm -f -- "\$recipe_real"
+fi
+exit "\$rc"
+EOF_ALBIUS_GUARD
+
+  chmod 0755 "$guard" "$validator" "$wrapper"
+  python3 -m py_compile "$guard"
+  rm -rf "$(dirname "$guard")/__pycache__"
+  python3 "$guard" --self-test
+  bash -n "$validator" "$wrapper"
+
+  grep -Fq "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1" "$guard" || \
+    die "Generated storage guard lacks its version marker."
+  grep -Fq "manual-partition-luks" "$validator" || \
+    die "Generated storage validator lacks manual LUKS support."
+  grep -Fq "preflight_manual_device" "$guard" || \
+    die "Generated storage guard lacks physical manual-device preflight."
+  grep -Fq "existing GPT PARTLABEL vos-var" "$guard" || \
+    die "Generated storage guard lacks duplicate PARTLABEL rejection."
+  grep -Fq "$real_albius" "$wrapper" || \
+    die "Guarded Albius launcher does not reference the real executable."
+
+  ok "Installed external Albius storage guard with policy: $INSTALLER_STORAGE_GUARD_POLICY"
+}
+
 patch_vanilla_installer_processor() {
   local root="$1"
   local processor progress
@@ -5707,7 +6728,7 @@ processor_path = Path(sys.argv[1])
 progress_path = Path(sys.argv[2])
 
 data = processor_path.read_text(encoding="utf-8")
-marker = "CONCEPTION_V8_PROFILE_INSTALLER_PATCH"
+marker = "VANILLAOS_SNAPDRAGONX_V8_PROFILE_INSTALLER_PATCH"
 if marker in data:
     raise SystemExit("processor already contains the v8 patch marker")
 
@@ -5715,9 +6736,9 @@ installation_anchor = '''        # Installation
         recipe.set_installation("oci", oci_image)
 '''
 installation_replacement = '''        # Installation
-        # CONCEPTION_V8_PROFILE_INSTALLER_PATCH
-        abroot_image = sys_recipe.get("conception_abroot_image", oci_image)
-        expected_image_digest = sys_recipe.get("conception_embedded_digest", "")
+        # VANILLAOS_SNAPDRAGONX_V8_PROFILE_INSTALLER_PATCH
+        abroot_image = sys_recipe.get("vanillaos_snapdragonx_abroot_image", oci_image)
+        expected_image_digest = sys_recipe.get("vanillaos_snapdragonx_embedded_digest", "")
         recipe.set_installation("oci", oci_image)
 '''
 if installation_anchor not in data:
@@ -5749,8 +6770,8 @@ migration_step = r'''            # Preserve OCI payload before converting select
                         f"then cp -a /mnt/a/{path}/. /mnt/a/var/{path}/; fi"
                         for path in _REL_VAR_LINKS
                     ],
-                    "mkdir -p /mnt/a/usr/lib/conception",
-                    "printf '%s\\n' 'complete' > /mnt/a/usr/lib/conception/relocated-var-payload.status",
+                    "mkdir -p /mnt/a/usr/lib/vanillaos-snapdragonx",
+                    "printf '%s\\n' 'complete' > /mnt/a/usr/lib/vanillaos-snapdragonx/relocated-var-payload.status",
                 ],
             )
 
@@ -5763,7 +6784,7 @@ generic_kernel_anchor = (
     "KERNEL_VERSION=$(ls -1 /mnt/a/usr/lib/modules | sed '1p;d')"
 )
 generic_kernel_replacement = (
-    "KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release)"
+    "KERNEL_VERSION=$(cat /mnt/a/usr/lib/vanillaos-snapdragonx-kernel-release)"
 )
 if generic_kernel_anchor not in data:
     raise SystemExit("unable to locate generic ABRoot kernel selection")
@@ -5777,10 +6798,10 @@ profile_boot_step = r'''            # Replace the generic ABRoot entry with the 
                 "shell",
                 [
                     " ".join(
-                        f"""KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release) && \
-                        DTB_NAME=$(cat /mnt/a/usr/lib/conception-dtb) && \
-                        PROFILE_NAME=$(cat /mnt/a/usr/lib/conception-profile) && \
-                        KERNEL_CMDLINE=$(tr '\\n' ' ' < /mnt/a/usr/lib/conception-kernel-command-line) && \
+                        f"""KERNEL_VERSION=$(cat /mnt/a/usr/lib/vanillaos-snapdragonx-kernel-release) && \
+                        DTB_NAME=$(cat /mnt/a/usr/lib/vanillaos-snapdragonx-dtb) && \
+                        PROFILE_NAME=$(cat /mnt/a/usr/lib/vanillaos-snapdragonx-profile) && \
+                        KERNEL_CMDLINE=$(tr '\\n' ' ' < /mnt/a/usr/lib/vanillaos-snapdragonx-kernel-command-line) && \
                         ROOTA_UUID=$(lsblk -d -n -o UUID {root_a_part}) && \
                         test -n "$KERNEL_VERSION" && \
                         test -n "$DTB_NAME" && \
@@ -5827,7 +6848,7 @@ move_anchor = '''                "update-initramfs -c -k all",
 '''
 move_replacement = '''                "update-initramfs -c -k all",
                 "mv /boot/config* /boot/initrd.img* /boot/System.map* /boot/vmlinuz* /boot/init/vos-a",
-                "/usr/local/sbin/conception-verify-installed-boot",
+                "/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot",
 '''
 if move_anchor not in data:
     raise SystemExit("unable to locate installed-initramfs validation anchor")
@@ -5844,9 +6865,19 @@ recipe_anchor = '''        with tempfile.NamedTemporaryFile(mode="w", delete=Fal
             return f.name
 '''
 recipe_replacement = '''        serialized_recipe = json.dumps(recipe, default=vars)
-        persistent_recipe = "/tmp/conception-albius-install-recipe.json"
+
+        # Keep deterministic recipe evidence without persisting the LUKS
+        # passphrase. The effective redacted recipe is written by the external
+        # storage guard immediately before Albius executes.
+        evidence_recipe = json.loads(serialized_recipe)
+        for setup_step in evidence_recipe.get("setup", []):
+            if setup_step.get("operation") in ("luks-format", "lvm-luks-format"):
+                setup_params = setup_step.get("params", [])
+                if len(setup_params) >= 3:
+                    setup_params[2] = "<redacted-luks-passphrase>"
+        persistent_recipe = "/tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json"
         with open(persistent_recipe, "w", encoding="utf-8") as evidence:
-            evidence.write(serialized_recipe)
+            evidence.write(json.dumps(evidence_recipe, indent=2, sort_keys=True))
             evidence.write("\\n")
             evidence.flush()
         os.chmod(persistent_recipe, 0o600)
@@ -5856,8 +6887,10 @@ recipe_replacement = '''        serialized_recipe = json.dumps(recipe, default=v
             f.flush()
             f.close()
 
-            # setting the file executable
-            os.chmod(f.name, 0o755)
+            # The generated recipe can contain a LUKS passphrase. It only
+            # needs to be readable by its owner and by the root-run Albius
+            # launcher; it must never be world-readable or executable.
+            os.chmod(f.name, 0o600)
 
             return f.name
 '''
@@ -5868,7 +6901,7 @@ data = data.replace(recipe_anchor, recipe_replacement, 1)
 processor_path.write_text(data, encoding="utf-8")
 
 progress = progress_path.read_text(encoding="utf-8")
-progress_marker = "CONCEPTION_V8_ALBIUS_LOG_CAPTURE"
+progress_marker = "VANILLAOS_SNAPDRAGONX_V8_ALBIUS_LOG_CAPTURE"
 if progress_marker in progress:
     raise SystemExit("progress view already contains log capture patch")
 
@@ -5885,7 +6918,7 @@ spawn_anchor = '''        self.__terminal.spawn_async(
             None,
         )
 '''
-spawn_replacement = '''        # CONCEPTION_V8_ALBIUS_LOG_CAPTURE
+spawn_replacement = '''        # VANILLAOS_SNAPDRAGONX_V8_ALBIUS_LOG_CAPTURE
         log_path = self.__window.recipe.get(
             "log_file", "/tmp/vanilla_installer.log"
         )
@@ -5894,7 +6927,7 @@ spawn_replacement = '''        # CONCEPTION_V8_ALBIUS_LOG_CAPTURE
             'install -d -m 0755 "$(dirname "$log_path")"; '
             'printf "%s\\\\n" "# Vanilla Installer Log" '
             '"Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$log_path"; '
-            'albius "$1" 2>&1 | tee -a "$log_path"'
+            '/usr/local/sbin/albius "$1" 2>&1 | tee -a "$log_path"'
         )
         self.__terminal.spawn_async(
             Vte.PtyFlags.DEFAULT,
@@ -5906,7 +6939,7 @@ spawn_replacement = '''        # CONCEPTION_V8_ALBIUS_LOG_CAPTURE
                 "pipefail",
                 "-c",
                 command,
-                "conception-albius",
+                "vanillaos-snapdragonx-albius",
                 recipe,
                 log_path,
             ],
@@ -5950,10 +6983,12 @@ PATCH_INSTALLER_COMPONENTS
 
   grep -Fq "relocated-var-payload.status" "$processor" || \
     die "Patched installer processor lacks payload-relocation evidence."
-  grep -Fq "conception-albius-install-recipe.json" "$processor" || \
-    die "Patched installer processor lacks persistent recipe evidence."
-  grep -Fq "CONCEPTION_V8_ALBIUS_LOG_CAPTURE" "$progress" || \
+  grep -Fq "vanillaos-snapdragonx-albius-install-recipe.generated.json" "$processor" || \
+    die "Patched installer processor lacks redacted generated-recipe evidence."
+  grep -Fq "VANILLAOS_SNAPDRAGONX_V8_ALBIUS_LOG_CAPTURE" "$progress" || \
     die "Patched installer progress view lacks Albius log capture."
+  grep -Fq "/usr/local/sbin/albius" "$progress" || \
+    die "Patched installer progress view bypasses the external storage guard."
 
   ok "Patched Vanilla Installer processor and VTE logging for profile installation."
 }
@@ -5962,11 +6997,11 @@ install_profile_aware_installer_overlay() {
   local recipe_source="$root/etc/vanilla-installer/recipe.json"
   local profile_dir="$root/etc/vanilla-installer/profiles/$PROFILE"
   local recipe_target="$profile_dir/recipe.json"
-  local wrapper="$root/usr/local/libexec/conception-installer-$PROFILE"
-  local registry_server="$root/usr/local/libexec/conception-oci-registry.py"
-  local collector="$root/usr/local/sbin/conception-collect-installer-diagnostics"
-  local desktop="$root/etc/xdg/autostart/conception-installer-$PROFILE.desktop"
-  local app="$root/usr/share/applications/conception-installer-$PROFILE.desktop"
+  local wrapper="$root/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE"
+  local registry_server="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry.py"
+  local collector="$root/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics"
+  local desktop="$root/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
+  local app="$root/usr/share/applications/vanillaos-snapdragonx-installer-$PROFILE.desktop"
 
   [[ -s "$recipe_source" ]] || \
     die "Live filesystem lacks Vanilla Installer recipe.json."
@@ -5975,7 +7010,7 @@ install_profile_aware_installer_overlay() {
     "$root/usr/local/sbin" \
     "$root/etc/xdg/autostart" "$root/usr/share/applications" \
     "$root/etc/containers/registries.conf.d" \
-    "$root/usr/share/conception/profiles/$PROFILE"
+    "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE"
 
   jq \
     --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
@@ -5983,22 +7018,24 @@ install_profile_aware_installer_overlay() {
     --arg abroot "$ABROOT_IMAGE_NAME" \
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg delivery "$DELIVERY_MODE" \
+    --arg storage_guard_policy "$INSTALLER_STORAGE_GUARD_POLICY" \
     --arg allow_custom "$INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE" \
     '.images.default = $image
      | .images.nvidia = $image
      | .images.vm = $image
-     | .conception_profile = $profile
-     | .conception_abroot_image = $abroot
-     | .conception_embedded_digest = $digest
-     | .conception_delivery_mode = $delivery
+     | .vanillaos_snapdragonx_profile = $profile
+     | .vanillaos_snapdragonx_abroot_image = $abroot
+     | .vanillaos_snapdragonx_embedded_digest = $digest
+     | .vanillaos_snapdragonx_delivery_mode = $delivery
+     | .vanillaos_snapdragonx_storage_guard_policy = $storage_guard_policy
      | if $delivery == "iso-oci" then del(.steps["conn-check"]) else . end
      | if $allow_custom == "1" then . else del(.steps["image"]) end' \
     "$recipe_source" > "$recipe_target"
 
   cp -a "$PROFILE_RESOLVED_JSON" \
-    "$root/usr/share/conception/profiles/$PROFILE/profile.resolved.json"
+    "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json"
   cp -a "$TMP_ROOT/embedded-target-image.json" \
-    "$root/usr/share/conception/profiles/$PROFILE/embedded-target-image.json"
+    "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/embedded-target-image.json"
 
   write_local_oci_registry_server "$registry_server"
 
@@ -6015,17 +7052,19 @@ expected_digest=$(printf '%q' "$TARGET_IMAGE_MANIFEST_DIGEST")
 host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
 port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
 recipe=$(printf '%q' "/etc/vanilla-installer/profiles/$PROFILE/recipe.json")
+storage_guard_policy=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY")
 server_pid=""
-wrapper_log=/tmp/conception-installer-wrapper.log
+wrapper_log=/tmp/vanillaos-snapdragonx-installer-wrapper.log
 EOF_INSTALLER_WRAPPER_HEADER
 
   cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_RUNTIME'
 
 exec > >(tee -a "$wrapper_log") 2>&1
-printf '\n=== Conception profile installer started: %s ===\n' \
+printf '\n=== VanillaOS-SnapdragonX profile installer started: %s ===\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'Profile: %s\n' "$profile"
 printf 'Delivery: %s\n' "$delivery"
+printf 'Storage guard policy: %s\n' "$storage_guard_policy"
 
 cleanup_registry() {
   if [[ -n "$server_pid" ]]; then
@@ -6051,10 +7090,10 @@ if [[ "$delivery" == "iso-oci" ]]; then
   }
 
   layout="$medium/${layout_path#/}"
-  python3 /usr/local/libexec/conception-oci-registry.py \
+  python3 /usr/local/libexec/vanillaos-snapdragonx-oci-registry.py \
     --layout "$layout" --tag "$tag" --repository "$repository" \
     --host "$host" --port "$port" \
-    > /tmp/conception-local-registry.log 2>&1 &
+    > /tmp/vanillaos-snapdragonx-local-registry.log 2>&1 &
   server_pid=$!
 
   python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
@@ -6163,7 +7202,7 @@ summary = {
     "blobs_verified": len(seen_blobs),
 }
 with open(
-    "/tmp/conception-local-registry-selftest.json", "w", encoding="utf-8"
+    "/tmp/vanillaos-snapdragonx-local-registry-selftest.json", "w", encoding="utf-8"
 ) as handle:
     json.dump(summary, handle, indent=2)
     handle.write("\n")
@@ -6202,7 +7241,7 @@ EOF_INSTALLER_WRAPPER_END
 set -Eeuo pipefail
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
-name="conception-installer-diagnostics-$stamp"
+name="vanillaos-snapdragonx-installer-diagnostics-$stamp"
 work="/tmp/$name"
 archive="/tmp/$name.tar.gz"
 mkdir -p "$work"
@@ -6218,12 +7257,15 @@ copy_if_present() {
 }
 
 copy_if_present /etc/vanilla/installer.log
-copy_if_present /tmp/conception-installer-wrapper.log
-copy_if_present /tmp/conception-local-registry.log
-copy_if_present /tmp/conception-local-registry-selftest.json
-copy_if_present /tmp/conception-albius-install-recipe.json
-copy_if_present /etc/containers/registries.conf.d/90-conception-local.conf
-copy_if_present /usr/share/conception profiles
+copy_if_present /tmp/vanillaos-snapdragonx-installer-wrapper.log
+copy_if_present /tmp/vanillaos-snapdragonx-local-registry.log
+copy_if_present /tmp/vanillaos-snapdragonx-local-registry-selftest.json
+copy_if_present /tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json
+copy_if_present /tmp/vanillaos-snapdragonx-albius-install-recipe.json
+copy_if_present /tmp/vanillaos-snapdragonx-storage-guard.json
+copy_if_present /tmp/vanillaos-snapdragonx-installed-storage-validation.txt
+copy_if_present /etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf
+copy_if_present /usr/share/vanillaos-snapdragonx profiles
 
 find /etc/vanilla-installer/profiles -maxdepth 3 -type f \
   -print -exec cp --parents -a '{}' "$work" ';' 2>/dev/null || true
@@ -6238,12 +7280,12 @@ find /etc/vanilla-installer/profiles -maxdepth 3 -type f \
   echo "=== Profile markers ==="
   for path in \
     /mnt/a/.oci_digest \
-    /mnt/a/usr/lib/conception-profile \
-    /mnt/a/usr/lib/conception-kernel-release \
-    /mnt/a/usr/lib/conception-dtb \
-    /mnt/a/usr/lib/conception-kernel-command-line \
-    /mnt/a/usr/lib/conception/relocated-var-payload.status \
-    /mnt/a/usr/lib/conception/installed-boot-validation.tsv
+    /mnt/a/usr/lib/vanillaos-snapdragonx-profile \
+    /mnt/a/usr/lib/vanillaos-snapdragonx-kernel-release \
+    /mnt/a/usr/lib/vanillaos-snapdragonx-dtb \
+    /mnt/a/usr/lib/vanillaos-snapdragonx-kernel-command-line \
+    /mnt/a/usr/lib/vanillaos-snapdragonx/relocated-var-payload.status \
+    /mnt/a/usr/lib/vanillaos-snapdragonx/installed-boot-validation.tsv
   do
     echo
     echo "--- $path"
@@ -6252,6 +7294,16 @@ find /etc/vanilla-installer/profiles -maxdepth 3 -type f \
       cat "$path" 2>&1 || true
     fi
   done
+
+  echo
+  echo "=== Target storage topology ==="
+  lsblk -e7 -o NAME,PATH,TYPE,FSTYPE,LABEL,PARTLABEL,UUID,PARTUUID,SIZE,MOUNTPOINTS 2>&1 || true
+  pvs -a -o pv_name,pv_uuid,vg_name,pv_attr,pv_size,pv_free 2>&1 || true
+  vgs -a -o vg_name,vg_uuid,vg_attr,vg_size,vg_free,lv_count,pv_count 2>&1 || true
+  lvs -a -o vg_name,lv_name,lv_path,lv_attr,lv_active,segtype,devices 2>&1 || true
+  find /dev/disk/by-partlabel /dev/disk/by-label -maxdepth 1 -type l \
+    -printf '%p -> %l\n' 2>/dev/null | sort || true
+  ls -la /dev/mapper 2>&1 || true
 
   echo
   echo "=== Relocated root payload ==="
@@ -6273,7 +7325,7 @@ sha256sum "$archive"
 EOF_INSTALLER_COLLECTOR
   chmod 0755 "$collector"
 
-  cat > "$root/etc/containers/registries.conf.d/90-conception-local.conf" <<EOF_REGISTRY_CONF
+  cat > "$root/etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf" <<EOF_REGISTRY_CONF
 # Keep the image name given to Albius port-free. containers/image remaps this
 # exact logical repository to the loopback-only physical bridge.
 [[registry]]
@@ -6288,7 +7340,7 @@ EOF_REGISTRY_CONF
 Type=Application
 Name=Install $PROFILE_DISPLAY_NAME
 Comment=Install the profile-specific offline VanillaOS target image
-Exec=/usr/local/libexec/conception-installer-$PROFILE
+Exec=/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE
 Icon=org.vanillaos.Installer
 Terminal=false
 Categories=System;
@@ -6305,21 +7357,34 @@ EOF_INSTALLER_DESKTOP
   bash -n "$collector"
 
   grep -Fqx "prefix = \"$(local_registry_logical_prefix)\"" \
-    "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
+    "$root/etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf" || \
     die "Generated registry remapping lacks its logical prefix."
   grep -Fqx "location = \"$(local_registry_physical_prefix)\"" \
-    "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
+    "$root/etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf" || \
     die "Generated registry remapping lacks its physical endpoint."
   validate_prometheus_storage_reference_compatibility \
     "$INSTALLER_DEFAULT_IMAGE_REF"
 
   jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg profile "$PROFILE" \
-    '.images.default == $image and .conception_profile == $profile' \
+    '.images.default == $image and .vanillaos_snapdragonx_profile == $profile' \
     "$recipe_target" >/dev/null || \
     die "Generated profile-specific Vanilla Installer recipe failed validation."
 
+  write_installer_storage_guard "$root"
   patch_vanilla_installer_processor "$root"
+
+  {
+    printf 'external-storage-guard\t%s\tnot-applicable\t%s\tgenerated\n' \
+      "/usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
+      "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard" | awk '{print $1}')"
+    printf 'external-storage-validator\t%s\tnot-applicable\t%s\tgenerated\n' \
+      "/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" \
+      "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" | awk '{print $1}')"
+    printf 'guarded-albius-launcher\t%s\tnot-applicable\t%s\tgenerated\n' \
+      "/usr/local/sbin/albius" \
+      "$(sha256sum "$root/usr/local/sbin/albius" | awk '{print $1}')"
+  } >> "$INSTALLER_PATCH_MANIFEST"
 
   jq -n \
     --arg profile "$PROFILE" \
@@ -6328,21 +7393,26 @@ EOF_INSTALLER_DESKTOP
     --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg cfg "/boot/init/vos-a/abroot.cfg" \
+    --arg storage_guard_policy "$INSTALLER_STORAGE_GUARD_POLICY" \
     --argjson cmdline "$(cat "$LIVE_KERNEL_CMDLINE_JSON")" \
     '{profile:$profile,kernel_release:$release,dtb:$dtb,
       installer_image:$image,manifest_digest:$digest,
       abroot_a_config:$cfg,
       kernel_command_line_append:$cmdline,
       installer_log:"/etc/vanilla/installer.log",
-      persistent_recipe:"/tmp/conception-albius-install-recipe.json",
-      diagnostics_collector:"/usr/local/sbin/conception-collect-installer-diagnostics",
-      installed_hardware_collector:"/usr/local/sbin/conception-collect-hardware-diagnostics",
-      installed_boot_evidence:"/var/log/conception/current",
+      generated_recipe:"/tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json",
+      persistent_recipe:"/tmp/vanillaos-snapdragonx-albius-install-recipe.json",
+      storage_guard_report:"/tmp/vanillaos-snapdragonx-storage-guard.json",
+      storage_validation_report:"/tmp/vanillaos-snapdragonx-installed-storage-validation.txt",
+      storage_guard_policy:$storage_guard_policy,
+      diagnostics_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics",
+      installed_hardware_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics",
+      installed_boot_evidence:"/var/log/vanillaos-snapdragonx/current",
       required_markers:[
-        "/usr/lib/conception-profile",
-        "/usr/lib/conception-kernel-release",
-        "/usr/lib/conception-dtb",
-        "/usr/lib/conception/relocated-var-payload.status"
+        "/usr/lib/vanillaos-snapdragonx-profile",
+        "/usr/lib/vanillaos-snapdragonx-kernel-release",
+        "/usr/lib/vanillaos-snapdragonx-dtb",
+        "/usr/lib/vanillaos-snapdragonx/relocated-var-payload.status"
       ]}' > "$INSTALLED_BOOT_EXPECTED_JSON"
 
   ok "Installed profile-aware Vanilla Installer overlay for $PROFILE."
@@ -6415,7 +7485,7 @@ remaster_boot_hardware_only() {
   rm -rf "$embedded_dest"
   mkdir -p "$embedded_dest"
   rsync -aHAX "$EMBEDDED_OCI_LAYOUT/" "$embedded_dest/"
-  cp -a "$TMP_ROOT/embedded-target-image.json" "$embedded_dest/CONCEPTION-IMAGE.json"
+  cp -a "$TMP_ROOT/embedded-target-image.json" "$embedded_dest/VANILLAOS_SNAPDRAGONX-IMAGE.json"
   cp -a "$PROFILE_RESOLVED_JSON" "$embedded_dest/profile.resolved.json"
 
   # Preserve both official package manifests byte-for-byte. The custom live
@@ -6544,6 +7614,16 @@ verify_final_release() {
       die "Final squashfs lacks required firmware probe: $firmware_probe"
   done
 
+  unsquashfs -cat "$final_squash" \
+    "usr/share/init.d/090-abroot-unlock-var.sh" \
+    > "$verify_dir/090-abroot-unlock-var.sh"
+  grep -Fq '/dev/mapper/vos--var-var' "$verify_dir/090-abroot-unlock-var.sh" || \
+    die "Final target hook lacks automatic LVM encrypted /var discovery."
+  grep -Fq '/dev/disk/by-partlabel/vos-var' "$verify_dir/090-abroot-unlock-var.sh" || \
+    die "Final target hook lacks manual encrypted /var PARTLABEL discovery."
+  grep -Fq '/dev/disk/by-label/vos-var' "$verify_dir/090-abroot-unlock-var.sh" || \
+    die "Final target hook lacks unencrypted /var filesystem-label discovery."
+
   # Verify the embedded OCI layout and exact manifest digest.
   local embedded_verify="$verify_dir/embedded-oci"
   mkdir -p "$embedded_verify"
@@ -6576,12 +7656,35 @@ verify_final_release() {
     '.images.default == $image' "$verify_dir/installer-recipe.json" >/dev/null || \
     die "Final ISO installer recipe does not default to the resolved profile image."
   unsquashfs -cat "$final_squash" \
-    "usr/local/libexec/conception-installer-$PROFILE" \
+    "usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" \
     > "$verify_dir/installer-wrapper"
+  unsquashfs -cat "$final_squash" \
+    "usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
+    > "$verify_dir/storage-guard"
+  unsquashfs -cat "$final_squash" \
+    "usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" \
+    > "$verify_dir/storage-validator"
+  unsquashfs -cat "$final_squash" \
+    "usr/local/sbin/albius" \
+    > "$verify_dir/albius-wrapper"
   grep -Fq "VANILLA_CUSTOM_RECIPE" "$verify_dir/installer-wrapper" || \
     die "Final ISO lacks the profile installer wrapper."
+  grep -Fq "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1" "$verify_dir/storage-guard" || \
+    die "Final ISO lacks the external storage guard."
+  grep -Fq "manual-partition-luks" "$verify_dir/storage-validator" || \
+    die "Final ISO storage validator lacks manual LUKS support."
+  grep -Fq "preflight_manual_device" "$verify_dir/storage-guard" || \
+    die "Final ISO storage guard lacks physical manual-device preflight."
+  grep -Fq "existing GPT PARTLABEL vos-var" "$verify_dir/storage-guard" || \
+    die "Final ISO storage guard lacks duplicate PARTLABEL rejection."
+  grep -Fq "VANILLAOS_SNAPDRAGONX_ALBIUS_STORAGE_GUARD" "$verify_dir/albius-wrapper" || \
+    die "Final ISO Albius launcher does not enforce the storage guard."
+  python3 "$verify_dir/storage-guard" --self-test >/dev/null || \
+    die "Final ISO storage guard failed its synthetic regression suite."
+  bash -n "$verify_dir/installer-wrapper" "$verify_dir/storage-validator" \
+    "$verify_dir/albius-wrapper"
   unsquashfs -cat "$final_squash" \
-    "usr/share/conception/profiles/$PROFILE/profile.resolved.json" \
+    "usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json" \
     > "$verify_dir/profile.resolved.json"
   jq -e --arg profile "$PROFILE" '.profile == $profile' \
     "$verify_dir/profile.resolved.json" >/dev/null || \
@@ -6651,13 +7754,18 @@ Kernel command additions: ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
 Qualcomm FW package:      ${FIRMWARE_QCOM_SOC_DEB:-none}
 Qualcomm FW version:      ${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-none}
 Qualcomm FW SHA-256:      ${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-none}
-Hardware diagnostics:    /usr/local/sbin/conception-collect-hardware-diagnostics
-Boot evidence:           /var/log/conception/current
+Hardware diagnostics:    /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+Boot evidence:           /var/log/vanillaos-snapdragonx/current
 Installer delivery:       $DELIVERY_MODE
+Storage guard policy:     $INSTALLER_STORAGE_GUARD_POLICY
+Manual encrypted /var:    /dev/disk/by-partlabel/vos-var
+Automatic encrypted /var: /dev/mapper/vos--var-var
+Storage guard report:     /tmp/vanillaos-snapdragonx-storage-guard.json
+Storage validation report: /tmp/vanillaos-snapdragonx-installed-storage-validation.txt
 Installer image source:   $INSTALLER_DEFAULT_IMAGE_REF
 Physical bridge endpoint: http://$(local_registry_physical_prefix)
 Installer transcript:     /etc/vanilla/installer.log
-Persistent Albius recipe: /tmp/conception-albius-install-recipe.json
+Persistent Albius recipe: /tmp/vanillaos-snapdragonx-albius-install-recipe.json
 Root payload migration:   OCI /home,/mnt,/root,/srv -> installed /var paths
 ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
 Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
@@ -6668,7 +7776,7 @@ serving the embedded OCI image layout. No external image registry is required.
 EOF_TARGET
 
   cat > "$RELEASE_DIR/BUILD-MANIFEST.txt" <<EOF_MANIFEST
-Conception VanillaOS ARM64 build
+VanillaOS-SnapdragonX ARM64 build
 Version:                     $SCRIPT_VERSION
 Release ID:                  $RELEASE_ID
 Profile:                     $PROFILE
@@ -6681,7 +7789,7 @@ Supplied kernel .debs:       ${#KERNEL_DEBS[@]}
 Target-installed .debs:      ${#TARGET_KERNEL_DEBS[@]}
 Target-excluded .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
 Target archive location:     /root/custom-kernel-packages
-Installed package receipt:   /usr/lib/conception/target-installed-kernel-packages.tsv
+Installed package receipt:   /usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv
 Runtime dpkg-query required: no
 Live boot .debs:             ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
@@ -6697,6 +7805,9 @@ Target OCI:                  $TARGET_IMAGE_REF
 Target OCI manifest digest:  $TARGET_IMAGE_MANIFEST_DIGEST
 ABRoot image name:           $ABROOT_IMAGE_NAME
 Installer delivery mode:     $DELIVERY_MODE
+Installer storage guard:     $INSTALLER_STORAGE_GUARD_POLICY
+Manual LUKS discovery path:  /dev/disk/by-partlabel/vos-var
+Automatic LUKS discovery:    /dev/mapper/vos--var-var
 Installer default image:     $INSTALLER_DEFAULT_IMAGE_REF
 Embedded OCI layout path:    $ISO_IMAGE_LAYOUT_PATH
 Embedded OCI tag:            $EMBEDDED_IMAGE_TAG
@@ -6795,7 +7906,7 @@ main() {
 
   RELEASE_ID="$(reserve_release_id)"
   RELEASE_DIR="$RELEASES_DIR/${BUILD_DATE}-${RELEASE_ID}-${PROFILE}"
-  FINAL_ISO="$RELEASE_DIR/Conception-VanillaOS-Orchid-arm64-${BUILD_DATE}-${RELEASE_ID}-${PROFILE}.iso"
+  FINAL_ISO="$RELEASE_DIR/VanillaOS-SnapdragonX-Reunion-arm64-${BUILD_DATE}-${RELEASE_ID}-${PROFILE}.iso"
   mkdir -p "$RELEASE_DIR"
 
   stage "5/13 Staging Qualcomm firmware without modifying the build host"
