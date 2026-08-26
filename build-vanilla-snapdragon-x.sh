@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.4
+# Version 7.0.5
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,24 +11,28 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.4 corrections after the v7.0.3 Vib plugin field test:
-#   - Mirrors the official vib-gh-action plugin setup instead of assuming the
-#     core Vib plugin archive contains the external FsGuard plugin.
-#   - Extracts the core archive from its documented build/plugins directory.
-#   - Downloads the architecture-specific vib-fsguard release asset separately
-#     and renames fsguard-<arch>.so to the exact loader name fsguard.so.
-#   - Pins the default Vib toolchain to the versions used by the official
-#     custom-image workflow: Vib 1.1.0 and vib-fsguard 1.5.3.
-#   - Validates plugin presence, ELF type, architecture, nonzero size, and
-#     checksums before recipe generation.
-#   - Preserves normalized root Vib execution, source validation, interactive
-#     firmware alternatives, host safeguards, custom-image architecture, and
-#     live graphical package-closure protections.
+# v7.0.5 corrections after the v7.0.4 field test:
+#   - Restores the canonical source checkout name sources/live-iso. The v7-only
+#     name sources/live-iso-v7 was unnecessary and diverged from the established
+#     source tree used by earlier builder generations.
+#   - Safely migrates an existing clean sources/live-iso-v7 checkout to
+#     sources/live-iso when the canonical path is absent and its origin matches
+#     the configured official repository.
+#   - Preserves pre-existing core-image, desktop-image, live-iso, and
+#     qcom-firmware-updater checkouts. core-image and desktop-image are retained
+#     as historical/optional sources but are not rebuilt by the v7 architecture.
+#   - Resolves the external FsGuard plugin from GitHub release metadata by exact
+#     architecture-specific asset name instead of constructing an unverified
+#     release URL. The default version is auto: the newest non-draft release
+#     containing fsguard-<arch>.so is selected and recorded.
+#   - Preserves normalized root Vib execution, repository validation,
+#     interactive firmware alternatives, host safeguards, custom-image
+#     architecture, and live graphical package-closure protections.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.4"
+SCRIPT_VERSION="7.0.5"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -65,8 +69,11 @@ VIB_VERSION="${VIB_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
 VIB_DETECTED_VERSION=""
 FSGUARD_PLUGIN_REPO="${FSGUARD_PLUGIN_REPO:-Vanilla-OS/vib-fsguard}"
-FSGUARD_PLUGIN_VERSION="${FSGUARD_PLUGIN_VERSION:-1.5.3}"
+FSGUARD_PLUGIN_VERSION="${FSGUARD_PLUGIN_VERSION:-auto}"
 FSGUARD_PLUGIN_FILE=""
+FSGUARD_PLUGIN_RESOLVED_TAG=""
+FSGUARD_PLUGIN_RELEASE_METADATA=""
+FSGUARD_PLUGIN_ASSET_URL=""
 
 REPO_POLICY="${REPO_POLICY:-ask-once}"
 FIRMWARE_MODE="${FIRMWARE_MODE:-ask}"
@@ -103,6 +110,9 @@ RELEASE_DIR=""
 CUSTOM_IMAGE_SOURCE=""
 CUSTOM_PROJECT=""
 LIVE_ISO_SOURCE=""
+LEGACY_LIVE_ISO_SOURCE=""
+CORE_IMAGE_SOURCE=""
+DESKTOP_IMAGE_SOURCE=""
 LIVE_BUILD_DIR=""
 QCOM_UPDATER_DIR=""
 STAGED_FIRMWARE_DIR=""
@@ -344,7 +354,9 @@ Options:
 Vib toolchain defaults:
   VIB_VERSION=1.1.0
   FSGUARD_PLUGIN_REPO=Vanilla-OS/vib-fsguard
-  FSGUARD_PLUGIN_VERSION=1.5.3
+  FSGUARD_PLUGIN_VERSION=auto     Select newest release containing the exact
+                                  fsguard-<host-arch>.so asset.
+  GITHUB_TOKEN=<optional>         Raise GitHub API rate limits.
 
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
@@ -404,11 +416,14 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.4-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.5-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
-  LIVE_ISO_SOURCE="$SOURCES_DIR/live-iso-v7"
+  LIVE_ISO_SOURCE="$SOURCES_DIR/live-iso"
+  LEGACY_LIVE_ISO_SOURCE="$SOURCES_DIR/live-iso-v7"
+  CORE_IMAGE_SOURCE="$SOURCES_DIR/core-image"
+  DESKTOP_IMAGE_SOURCE="$SOURCES_DIR/desktop-image"
   LIVE_BUILD_DIR="$TMP_ROOT/live-iso-worktree"
   QCOM_UPDATER_DIR="$SOURCES_DIR/qcom-firmware-updater"
   STAGED_FIRMWARE_DIR="$WORKDIR/staged-firmware/$PROFILE"
@@ -1050,11 +1065,87 @@ verify_required_source_checkouts() {
 report_repository_plan_state() {
   info "Plan mode is non-mutating: repositories will not be cloned, fetched, reset, or refreshed."
   info "Selected execute-time repository policy: $REPO_POLICY"
-  info "custom-image current state: $(repo_state "$CUSTOM_IMAGE_SOURCE")"
-  info "live-iso current state:     $(repo_state "$LIVE_ISO_SOURCE")"
+  info "custom-image current state: $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"
+  info "live-iso current state:     $(source_checkout_summary "$LIVE_ISO_SOURCE")"
+  info "core-image retained state:  $(source_checkout_summary "$CORE_IMAGE_SOURCE")"
+  info "desktop-image retained:     $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
+  info "qcom updater state:         $(source_checkout_summary "$QCOM_UPDATER_DIR")"
+  [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]] &&     warn "Legacy live-iso-v7 path is present and will be normalized in execute mode when safe."
   if [[ ! -d "$CUSTOM_IMAGE_SOURCE/.git" || ! -d "$LIVE_ISO_SOURCE/.git" ]]; then
     warn "One or both required source checkouts are absent. Execute mode will create them using policy '$REPO_POLICY'."
   fi
+}
+
+source_checkout_summary() {
+  local path="$1"
+  if [[ -d "$path/.git" ]]; then
+    repo_state "$path"
+  elif [[ -e "$path" ]]; then
+    printf 'present but not a Git checkout'
+  else
+    printf 'absent'
+  fi
+}
+
+normalize_live_iso_source_path() {
+  # v7.0.2-v7.0.4 used sources/live-iso-v7. The repository itself is still the
+  # official VanillaOS live-iso checkout, so the version suffix adds no useful
+  # distinction. Migrate only when the canonical destination is absent and the
+  # legacy directory is a clean checkout with the expected origin.
+  [[ "$LIVE_ISO_SOURCE" == "$SOURCES_DIR/live-iso" ]] || \
+    die "Internal source-layout guard: canonical live ISO path is not sources/live-iso."
+
+  if [[ -d "$LIVE_ISO_SOURCE/.git" ]]; then
+    if [[ -d "$LEGACY_LIVE_ISO_SOURCE/.git" ]]; then
+      warn "Both canonical and legacy live-iso checkouts exist."
+      warn "Using:    $LIVE_ISO_SOURCE"
+      warn "Leaving:  $LEGACY_LIVE_ISO_SOURCE"
+    fi
+    return 0
+  fi
+
+  [[ -e "$LIVE_ISO_SOURCE" ]] && \
+    die "Canonical live-iso path exists but is not a Git checkout: $LIVE_ISO_SOURCE"
+
+  if [[ -d "$LEGACY_LIVE_ISO_SOURCE/.git" ]]; then
+    local legacy_origin expected_origin
+    legacy_origin="$(
+      normalize_git_url "$(git -C "$LEGACY_LIVE_ISO_SOURCE" remote get-url origin)"
+    )"
+    expected_origin="$(normalize_git_url "$LIVE_ISO_REPO_URL")"
+
+    [[ "$legacy_origin" == "$expected_origin" ]] || {
+      warn "Legacy live-iso-v7 checkout has an unexpected origin: $legacy_origin"
+      warn "It will be preserved; a canonical live-iso checkout will be cloned."
+      return 0
+    }
+
+    [[ -z "$(git -C "$LEGACY_LIVE_ISO_SOURCE" status --porcelain)" ]] || {
+      warn "Legacy live-iso-v7 checkout is dirty and will not be moved."
+      warn "It will be preserved; resolve it manually or allow a fresh canonical clone."
+      return 0
+    }
+
+    info "Migrating legacy source checkout to canonical path:"
+    info "  from: $LEGACY_LIVE_ISO_SOURCE"
+    info "  to:   $LIVE_ISO_SOURCE"
+    mv "$LEGACY_LIVE_ISO_SOURCE" "$LIVE_ISO_SOURCE"
+    ok "Canonical live-iso source path restored."
+  elif [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
+    warn "Legacy path exists but is not a Git checkout and will be preserved: $LEGACY_LIVE_ISO_SOURCE"
+  fi
+}
+
+report_preserved_source_layout() {
+  info "Source checkout layout:"
+  info "  custom-image:          $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"
+  info "  live-iso:              $(source_checkout_summary "$LIVE_ISO_SOURCE")"
+  info "  core-image:            $(source_checkout_summary "$CORE_IMAGE_SOURCE")"
+  info "  desktop-image:         $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
+  info "  qcom-firmware-updater: $(source_checkout_summary "$QCOM_UPDATER_DIR")"
+
+  [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]] && \
+    warn "Legacy source path remains present: $LEGACY_LIVE_ISO_SOURCE"
 }
 
 sync_repo() {
@@ -1151,6 +1242,8 @@ sync_repo() {
 
 sync_required_repositories() {
   info "Beginning required official source synchronization."
+  normalize_live_iso_source_path
+  report_preserved_source_layout
   sync_repo "VanillaOS custom-image" "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" "$CUSTOM_IMAGE_SOURCE"
   sync_repo "VanillaOS live-iso" "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" "$LIVE_ISO_SOURCE"
   CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"
@@ -1393,14 +1486,17 @@ Sources synchronized:       $SOURCES_SYNCHRONIZED
 custom-image source:        $CUSTOM_IMAGE_REPO_URL @ $CUSTOM_IMAGE_REF
 custom-image checkout:      $(repo_state "$CUSTOM_IMAGE_SOURCE")
 live-iso source:            $LIVE_ISO_REPO_URL @ $LIVE_ISO_REF
-live-iso checkout:          $(repo_state "$LIVE_ISO_SOURCE")
+live-iso checkout:          $(source_checkout_summary "$LIVE_ISO_SOURCE")
+core-image retained:        $(source_checkout_summary "$CORE_IMAGE_SOURCE")
+desktop-image retained:     $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")
+qcom updater checkout:      $(source_checkout_summary "$QCOM_UPDATER_DIR")
 Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
 Push target OCI:            $PUSH_TARGET_IMAGE
 Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
 Requested Vib version:      $VIB_VERSION
-FsGuard plugin:             $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")
+FsGuard plugin request:     $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_VERSION
 Expected release ID:        $preview_id
 Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 
@@ -1460,6 +1556,98 @@ download_atomic() {
     "$url" -o "$partial"
   [[ -s "$partial" ]] || die "Downloaded file is empty: $url"
   mv -f "$partial" "$destination"
+}
+
+github_api_curl() {
+  local -a args=(
+    -fsSL
+    --retry 3
+    --retry-delay 2
+    --connect-timeout 30
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28"
+  )
+  [[ -n "${GITHUB_TOKEN:-}" ]] && \
+    args+=( -H "Authorization: Bearer $GITHUB_TOKEN" )
+  curl "${args[@]}" "$@"
+}
+
+resolve_fsguard_release_asset() {
+  local arch="$1"
+  local asset_name="fsguard-$arch.so"
+  local metadata selection available
+  local requested="${FSGUARD_PLUGIN_VERSION}"
+
+  if [[ "${requested,,}" == "auto" || "${requested,,}" == "latest-compatible" ]]; then
+    metadata="$TMP_ROOT/vib-fsguard-releases.json"
+    info "Querying $FSGUARD_PLUGIN_REPO releases for newest asset: $asset_name"
+    github_api_curl \
+      "https://api.github.com/repos/$FSGUARD_PLUGIN_REPO/releases?per_page=100" \
+      -o "$metadata" || die "Unable to query FsGuard release metadata."
+
+    selection="$(
+      jq -r --arg asset "$asset_name" '
+        [
+          .[]
+          | select(.draft == false)
+          | select(.prerelease == false)
+          | . as $release
+          | $release.assets[]?
+          | select(.name == $asset)
+          | [$release.tag_name, .browser_download_url]
+        ][0] // empty
+        | @tsv
+      ' "$metadata"
+    )"
+  else
+    local tag
+    tag="$(normalize_version_tag "$requested")"
+    metadata="$TMP_ROOT/vib-fsguard-release-${tag}.json"
+    info "Querying $FSGUARD_PLUGIN_REPO release $tag for asset: $asset_name"
+    github_api_curl \
+      "https://api.github.com/repos/$FSGUARD_PLUGIN_REPO/releases/tags/$tag" \
+      -o "$metadata" || die "Unable to query FsGuard release metadata for $tag."
+
+    selection="$(
+      jq -r --arg asset "$asset_name" '
+        . as $release
+        | [
+            $release.assets[]?
+            | select(.name == $asset)
+            | [$release.tag_name, .browser_download_url]
+          ][0] // empty
+        | @tsv
+      ' "$metadata"
+    )"
+  fi
+
+  if [[ -z "$selection" ]]; then
+    available="$(
+      jq -r '
+        if type == "array" then
+          .[] | .tag_name as $tag | .assets[]? | "\($tag):\(.name)"
+        else
+          .tag_name as $tag | .assets[]? | "\($tag):\(.name)"
+        end
+      ' "$metadata" | sed -n '1,80p'
+    )"
+    fail "No exact FsGuard release asset was found for architecture $arch: $asset_name"
+    fail "Requested selector: $requested"
+    if [[ -n "$available" ]]; then
+      fail "Available release assets examined:"
+      printf '%s\n' "$available" >&2
+    fi
+    return 1
+  fi
+
+  FSGUARD_PLUGIN_RESOLVED_TAG="${selection%%$'\t'*}"
+  FSGUARD_PLUGIN_ASSET_URL="${selection#*$'\t'}"
+  FSGUARD_PLUGIN_RELEASE_METADATA="$metadata"
+
+  [[ -n "$FSGUARD_PLUGIN_RESOLVED_TAG" ]] || return 1
+  [[ -n "$FSGUARD_PLUGIN_ASSET_URL" ]] || return 1
+
+  ok "Resolved FsGuard plugin: $FSGUARD_PLUGIN_REPO $FSGUARD_PLUGIN_RESOLVED_TAG / $asset_name"
 }
 
 vib_exec() {
@@ -1579,21 +1767,24 @@ install_core_vib_plugins() {
 }
 
 install_fsguard_vib_plugin() {
-  # FsGuard is an external plugin declared separately by the official
-  # custom-image workflow. Its release asset is fsguard-<arch>.so, while Vib's
-  # loader searches for the module type as plugins/fsguard.so.
-  local arch="$1" tag asset_name cached_asset plugin_dir final_plugin
-  tag="$(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")"
+  # FsGuard is external to the core Vib plugin archive. Resolve an exact
+  # architecture-specific release asset from GitHub metadata and install it
+  # under the module loader name plugins/fsguard.so.
+  local arch="$1"
+  local asset_name cached_asset plugin_dir final_plugin cache_tag
+
+  resolve_fsguard_release_asset "$arch" || \
+    die "Unable to resolve a compatible FsGuard Vib plugin."
+
   asset_name="fsguard-$arch.so"
-  cached_asset="$CACHE_DIR/vib-fsguard-$tag-$arch.so"
+  cache_tag="${FSGUARD_PLUGIN_RESOLVED_TAG//\//-}"
+  cached_asset="$CACHE_DIR/vib-fsguard-$cache_tag-$arch.so"
   plugin_dir="$CUSTOM_PROJECT/plugins"
   final_plugin="$plugin_dir/fsguard.so"
 
   if [[ ! -s "$cached_asset" ]]; then
-    info "Downloading external FsGuard plugin $FSGUARD_PLUGIN_REPO $tag for $arch."
-    download_atomic \
-      "https://github.com/$FSGUARD_PLUGIN_REPO/releases/download/$tag/$asset_name" \
-      "$cached_asset"
+    info "Downloading external FsGuard plugin $FSGUARD_PLUGIN_RESOLVED_TAG for $arch."
+    download_atomic "$FSGUARD_PLUGIN_ASSET_URL" "$cached_asset"
   else
     info "Using cached external FsGuard plugin: $cached_asset"
   fi
@@ -1605,6 +1796,7 @@ install_fsguard_vib_plugin() {
   FSGUARD_PLUGIN_FILE="$final_plugin"
   ok "Installed FsGuard plugin with exact Vib loader name: $final_plugin"
 }
+
 
 verify_vib_plugin_set() {
   local arch="$1" plugin_dir="$CUSTOM_PROJECT/plugins"
@@ -1647,7 +1839,8 @@ capture_vib_diagnostics() {
     "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" \
     "$TMP_ROOT/vib-core-plugin-archive.inventory" \
     "$TMP_ROOT/vib-plugin-inventory.txt" \
-    "$TMP_ROOT/vib-plugin-checksums.sha256"
+    "$TMP_ROOT/vib-plugin-checksums.sha256" \
+    "$FSGUARD_PLUGIN_RELEASE_METADATA"
   do
     [[ -f "$f" ]] && cp -a "$f" "$diag/"
   done
@@ -1674,6 +1867,8 @@ capture_vib_diagnostics() {
     printf 'VIB_DETECTED_VERSION=%q\n' "$VIB_DETECTED_VERSION"
     printf 'FSGUARD_PLUGIN_REPO=%q\n' "$FSGUARD_PLUGIN_REPO"
     printf 'FSGUARD_PLUGIN_VERSION=%q\n' "$FSGUARD_PLUGIN_VERSION"
+    printf 'FSGUARD_PLUGIN_RESOLVED_TAG=%q\n' "$FSGUARD_PLUGIN_RESOLVED_TAG"
+    printf 'FSGUARD_PLUGIN_ASSET_URL=%q\n' "$FSGUARD_PLUGIN_ASSET_URL"
     printf 'FSGUARD_PLUGIN_FILE=%q\n' "$FSGUARD_PLUGIN_FILE"
   ) > "$diag/execution-context.txt"
 
@@ -1758,7 +1953,7 @@ install_vib_and_plugins() {
   ok "Vib detected version: $VIB_DETECTED_VERSION"
   ok "Vib execution identity: uid=0 gid=0 user=root through normalized SUDO_* context"
   ok "Project-local Vib plugins: $CUSTOM_PROJECT/plugins"
-  ok "FsGuard plugin: $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")"
+  ok "FsGuard plugin: $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG"
 }
 
 # ------------------------ custom target OCI ------------------------------
@@ -2298,6 +2493,8 @@ verify_final_release() {
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-checksums.sha256" ]] && cp -a "$TMP_ROOT/vib-plugin-checksums.sha256" "$RELEASE_DIR/"
+  [[ -n "$FSGUARD_PLUGIN_RELEASE_METADATA" && -f "$FSGUARD_PLUGIN_RELEASE_METADATA" ]] && \
+    cp -a "$FSGUARD_PLUGIN_RELEASE_METADATA" "$RELEASE_DIR/"
   printf '%s\n' "$CUSTOM_SOURCE_COMMIT" > "$RELEASE_DIR/custom-image-source.commit"
   printf '%s\n' "$LIVE_SOURCE_COMMIT" > "$RELEASE_DIR/live-iso-source.commit"
 
@@ -2333,7 +2530,7 @@ Target OCI:                  $TARGET_IMAGE_REF
 ABRoot image name:           $ABROOT_IMAGE_NAME
 Target OCI base:             $CUSTOM_IMAGE_BASE
 Vib version:                 $VIB_DETECTED_VERSION
-FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")
+FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG
 custom-image source commit:  $CUSTOM_SOURCE_COMMIT
 live-iso source commit:      $LIVE_SOURCE_COMMIT
 Pristine ISO:                $UPSTREAM_ISO
