@@ -1,18 +1,108 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.0.4-r4.1
+# Version 8.5-r1
+#
+# v8.5-r1 installation-path regression correction
+# -------------------------------------------------
+# Field testing of the first 8.5 ISO proved that the current Reunion live
+# environment itself is healthy on Snapdragon X, including the GDM timed-login
+# correction, but exposed two release-harness defects:
+#   - Replacing the read-only squashfs extracted from the upstream ISO with a
+#     plain `mv` can trigger GNU mv's terminal overwrite prompt. The remaster
+#     now removes the immutable extracted destination explicitly before the
+#     new squashfs is moved into place, so Stage 12 is non-interactive.
+#   - The 8.5 live overlay generated and verified a profile-specific Installer
+#     recipe, but still left the stock /etc/vanilla-installer/recipe.json and
+#     stock /usr/bin/vanilla-installer launch path viable. Current Vanilla
+#     Installer is a single-instance Gio application and its stock recipe now
+#     defaults to ghcr.io/vanilla-os/gnome:latest. Any launch that did not
+#     inherit VANILLA_CUSTOM_RECIPE could therefore bypass the ISO-local OCI
+#     reference even though the embedded OCI layout and profile recipe were
+#     both correct. r1 makes the profile recipe the canonical live recipe and
+#     routes the stock installer executable through the profile wrapper, while
+#     retaining the original installer executable as a private real entrypoint.
+#     This guarantees that both automatic and manual launches start the local
+#     OCI bridge before the Installer and consume the same embedded image
+#     contract. Final verification now checks both recipe paths and the launcher
+#     dispatch chain.
+#
+# v8.5 Reunion convergence release
+# ---------------------------------
+# Canonical parent: v8.0.4-r4.1, SHA-256
+#   adc38fab5ae4ecdc3e0eadd611e323274b157147b3c8b44bf26383a1e17932cc
+#
+# This is a significant convergence release rather than an r4.x point fix.
+# Generic ARM64 enablement is now owned by the maturing upstream Reunion stack;
+# Snapdragon X hardware enablement and the offline/reproducible installation
+# architecture remain project-owned and are deliberately preserved.
+#
+# Reunion source/taxonomy reconciliation:
+#   - The installed target is a Vib custom OCI layered on the canonical Reunion
+#     development desktop image ghcr.io/vanilla-os/gnome:dev. The historical
+#     ghcr.io/vanilla-os/desktop:dev spelling is no longer the default.
+#   - Vanilla-OS/custom-image:main remains a scaffold/module source only. Its
+#     sample recipe taxonomy is not authoritative for the Reunion target base.
+#   - Vanilla-OS/live-iso:orchid remains the upstream branch identifier, but the
+#     current branch content identifies itself as Vanilla OS 3 / Reunion and
+#     now supports native ARM64 live builds.
+#   - LIVE_ARM64_PACKAGE_POLICY=upstream-native is the default. Current upstream
+#     architecture conditionals select ARM64 GRUB/shim and suppress AMD64-only
+#     microcode/VirtualBox content. The proven r4.1 explicit projection engine
+#     is retained intact as legacy-projection compatibility for historical refs.
+#   - The live build container default follows the current official workflow:
+#     ghcr.io/vanilla-os/pico:latest. The workflow-equivalent debootstrap
+#     prerequisite is installed inside that disposable build container before
+#     build.sh runs. Overrides remain supported.
+#   - Generated target recipes declare Vib recipe version 1.1.0 and the builder
+#     requires a Vib implementation compatible with that recipe generation.
+#
+# Reunion userland coherence gate:
+#   - The completed target must contain /usr/bin/distrobox, the current VSO
+#     native stack, both host hook placeholders, and a working `vso native`
+#     command surface. This specifically guards against the mixed-generation
+#     VSO/APX/Distrobox state diagnosed on the late-July/August test image.
+#   - The temporary recovery techniques used on that historical installation
+#     (OverlayFS path shims, Distrobox CLI translation, manual APX labels, and
+#     hook omission) are NOT incorporated into the built target.
+#
+# Live-session stability:
+#   - Integrates the tested live-only GDM timing correction: Debian live-config's
+#     gdm3 component is suppressed and GDM owns a short timed login for user
+#     `vanilla` (default 5 seconds, configurable 1..60). This policy is applied
+#     only to the live squashfs and is verified semantically in the final ISO.
+#
+# Identity/provenance contract:
+#   - Upstream base, local target build reference, ISO-embedded OCI manifest,
+#     installer logical reference, loopback physical transport, ABRoot logical
+#     identity, ABRoot future registry locator, and installation provenance are
+#     distinct layers. The release evidence records them separately.
+#   - ISO-local OCI installation remains first-class: the verified target OCI
+#     layout is embedded under /target-images/<profile>/ and served through the
+#     loopback OCI Distribution v2 bridge so installation requires no external
+#     target-image registry.
+#
+# Preserved project-owned implementation:
+#   - profile-driven, package-name-independent kernel selection and dependency
+#     closure; exact DTB selection; generic firmware package resolution and
+#     board-data policy; Snapdragon kernel arguments and evidence;
+#   - the r2 encrypted custom-layout storage guard and regression suite;
+#   - the r3 root-payload migration and installer transcript behavior;
+#   - the r4 profile/firmware schema and the r4.1 target-hook/embedded-digest
+#     verification boundary;
+#   - registry and ISO-local delivery modes, optional target publication,
+#     interactive/plan execution, hardware profiles, diagnostics, and all
+#     existing harness overrides unless explicitly superseded above.
 #
 # Architecture:
-#   - The installed system is a Vib custom OCI image layered on
-#     ghcr.io/vanilla-os/desktop:dev.
+#   - The installed system is a Vib custom OCI image layered on the current
+#     Reunion GNOME development image.
 #   - The graphical installer ISO is built from a clean official live-iso
-#     checkout using the proven Pico workflow.
-#   - Upstream package-list source files remain byte-identical. A derived ARM64
-#     projection removes only explicitly approved snapshot-incompatible x86
-#     support packages; GNOME and installer package closure is preserved.
-#   - The live filesystem remaster includes boot-critical hardware content plus
-#     the profile-aware offline installer delivery overlay. Upstream package
-#     manifests remain byte-identical to the accepted ARM64 baseline.
+#     checkout using the upstream native ARM64 path whenever available.
+#   - Upstream package-list source files remain byte-identical. In the default
+#     policy the upstream ARCHITECTURES conditionals select the ARM64 closure;
+#     the historical explicit projection remains available only as a fallback.
+#   - The live filesystem remaster adds only profile/hardware requirements plus
+#     offline installer delivery and the live-session timing policy.
 #
 # v8.0.4-r4.1 final-artifact verification correction:
 #   - Corrects a stage-12 category error that attempted to read the installed
@@ -202,7 +292,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4-r4.1"
+SCRIPT_VERSION="8.5-r1"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -316,19 +406,25 @@ KERNEL_RELEASE_POLICY="${KERNEL_RELEASE_POLICY:-prefer}"
 
 CUSTOM_IMAGE_REPO_URL="${CUSTOM_IMAGE_REPO_URL:-https://github.com/Vanilla-OS/custom-image.git}"
 CUSTOM_IMAGE_REF="${CUSTOM_IMAGE_REF:-main}"
-CUSTOM_IMAGE_BASE="${CUSTOM_IMAGE_BASE:-ghcr.io/vanilla-os/desktop:dev}"
+CUSTOM_IMAGE_BASE="${CUSTOM_IMAGE_BASE:-ghcr.io/vanilla-os/gnome:dev}"
 
 LIVE_ISO_REPO_URL="${LIVE_ISO_REPO_URL:-https://github.com/Vanilla-OS/live-iso.git}"
 LIVE_ISO_REF="${LIVE_ISO_REF:-orchid}"
 SOURCE_STALE_WARN_DAYS="${SOURCE_STALE_WARN_DAYS:-180}"
-LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
+LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:latest}"
 LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 
-# The current Reunion installer list is shared with AMD64. These exact x86,
-# AMD64 EFI, and unavailable VirtualBox entries are incompatible with the
-# configured ARM64 snapshot. The value is intentionally
-# explicit and environment-overridable; broad "remove every unavailable
-# package" behavior is prohibited.
+# Current upstream Reunion owns generic ARM64 package selection through
+# live-build ARCHITECTURES conditionals. Keep the r4.1 projection engine as an
+# explicit compatibility path for historical refs, but never apply it silently
+# to a current upstream tree.
+LIVE_ARM64_PACKAGE_POLICY="${LIVE_ARM64_PACKAGE_POLICY:-upstream-native}"
+
+# Legacy projection compatibility contract. These are the exact exclusions
+# accepted by r4.1 for older live-iso snapshots that lacked upstream
+# ARCHITECTURES conditionals. They are intentionally preserved, explicit, and
+# environment-overridable; broad "remove every unavailable package" behavior
+# remains prohibited.
 LIVE_ARM64_PACKAGE_LIST_SUFFIX="${LIVE_ARM64_PACKAGE_LIST_SUFFIX:-vanilla-installer-arm64}"
 LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-grub-efi-amd64,grub-efi-amd64-bin,grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11}"
 
@@ -359,7 +455,14 @@ INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="${INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE:-1}"
 INSTALLER_STORAGE_GUARD_POLICY="${INSTALLER_STORAGE_GUARD_POLICY:-repair}"
 
+# Live-only session policy. These settings never enter the target OCI.
+LIVE_GDM_TIMED_LOGIN_DELAY="${LIVE_GDM_TIMED_LOGIN_DELAY:-5}"
+LIVE_GDM_TIMED_LOGIN_USER="vanilla"
+LIVE_GDM_LIVE_CONFIG_REL="etc/live/config.conf.d/vanillaos-snapdragonx.conf"
+LIVE_GDM_DAEMON_CONFIG_REL="etc/gdm3/daemon.conf"
+
 VIB_VERSION="${VIB_VERSION:-1.1.0}"
+VIB_RECIPE_VERSION="${VIB_RECIPE_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
 VIB_DETECTED_VERSION=""
 FSGUARD_PLUGIN_REPO="${FSGUARD_PLUGIN_REPO:-Vanilla-OS/vib-fsguard}"
@@ -434,6 +537,10 @@ LIVE_KERNEL_CMDLINE_EVIDENCE=""
 TARGET_STORAGE_HOOK_FILE=""
 TARGET_STORAGE_HOOK_SHA256_FILE=""
 TARGET_STORAGE_HOOK_EVIDENCE_JSON=""
+TARGET_ABROOT_CONFIG_EVIDENCE=""
+TARGET_BASE_INSPECT_JSON=""
+TARGET_USERLAND_COHERENCE_REPORT=""
+REUNION_CONVERGENCE_MANIFEST=""
 
 # Discovered inputs.
 declare -a KERNEL_DEBS=()
@@ -733,21 +840,28 @@ Checksum pin behavior:
                                   an upstream-correct namepart operation and
                                   inserts it only when manual encrypted /var
                                   lacks GPT PARTLABEL vos-var.
+  --live-package-policy POLICY   upstream-native or legacy-projection.
+                                  Default: upstream-native. The legacy mode
+                                  preserves the accepted r4.1 explicit package
+                                  projection for historical live-iso refs.
+  --live-gdm-delay SECONDS       Timed login delay for live user vanilla.
+                                  Default: 5; valid range: 1..60.
   --live-ref REF                  live-iso branch, tag, or commit.
   --custom-image-ref REF          custom-image branch, tag, or commit.
   --push-target-image             Push target OCI after local verification.
   -h, --help                      Show this help.
 
 Source-reference strategy:
-  custom-image Git checkout: main branch
-  live-iso Git checkout:     Reunion WiP source; upstream branch identifier retained
-  target OCI base:           ghcr.io/vanilla-os/desktop:dev
-  live build container:      ghcr.io/vanilla-os/pico:dev
+  custom-image Git checkout: main branch (scaffold/modules only)
+  live-iso Git checkout:     orchid (current content: Vanilla OS 3 / Reunion)
+  target OCI base:           ghcr.io/vanilla-os/gnome:dev
+  live build container:      ghcr.io/vanilla-os/pico:latest
+  live package policy:       upstream-native
 
-  These repositories do not share one universal dev branch. Git branches are
-  refreshed and exact commit SHAs are recorded. Vib and plugins use release
-  tags. core-image and desktop-image source trees are not build inputs in this
-  v7 container-base architecture.
+  Branch names, image names, and tags are separate taxonomies. Exact Git commit
+  SHAs and resolved OCI evidence are recorded. custom-image's sample
+  desktop:main base is intentionally ignored when this harness generates its
+  target recipe. The current desktop development image is gnome:dev.
 
 Vib toolchain defaults:
   VIB_VERSION=1.1.0
@@ -755,17 +869,24 @@ Vib toolchain defaults:
   FSGUARD_PLUGIN_VERSION=auto     Select newest release containing the exact
                                   fsguard-<host-arch>.so asset.
   GITHUB_TOKEN=<optional>         Raise GitHub API rate limits.
+  LIVE_GDM_TIMED_LOGIN_DELAY=5   Live-only GDM timed login (1..60 seconds).
 
-ARM64 live-ISO package projection:
-  LIVE_ARM64_PACKAGE_LIST_SUFFIX=vanilla-installer-arm64
-  LIVE_ARM64_EXCLUDE_PACKAGES=grub-efi-amd64,grub-efi-amd64-bin,
-      grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,
-      amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11
+ARM64 live-ISO package policy:
+  LIVE_ARM64_PACKAGE_POLICY=upstream-native
 
-  The canonical upstream package-lists.vanilla-installer tree is never edited.
-  Only exact package lines named above are omitted from the derived ARM64 tree.
-  Every remaining direct package name is candidate-checked against the selected
-  ARM64 snapshot before the expensive live-build starts.
+  Current Reunion live-iso carries architecture-aware package-list conditionals
+  and an architecture-aware build.sh. In upstream-native mode those canonical
+  files are used byte-for-byte and validated before/after the build.
+
+  Historical compatibility remains available with:
+    LIVE_ARM64_PACKAGE_POLICY=legacy-projection
+    LIVE_ARM64_PACKAGE_LIST_SUFFIX=vanilla-installer-arm64
+    LIVE_ARM64_EXCLUDE_PACKAGES=grub-efi-amd64,grub-efi-amd64-bin,
+        grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,
+        amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11
+
+  Legacy projection uses the unchanged r4.1 explicit allowlist and candidate
+  preflight. It is not invoked for a current upstream Reunion tree.
 
 Hardware profile lookup order:
   --profile-file PATH
@@ -882,6 +1003,8 @@ parse_args() {
       --local-registry-port) [[ $# -ge 2 ]] || die "--local-registry-port requires a value"; LOCAL_REGISTRY_PORT="$2"; shift 2 ;;
       --local-registry-logical-host) [[ $# -ge 2 ]] || die "--local-registry-logical-host requires a value"; LOCAL_REGISTRY_LOGICAL_HOST="$2"; shift 2 ;;
       --storage-guard-policy) [[ $# -ge 2 ]] || die "--storage-guard-policy requires repair, strict, or off"; INSTALLER_STORAGE_GUARD_POLICY="${2,,}"; shift 2 ;;
+      --live-package-policy) [[ $# -ge 2 ]] || die "--live-package-policy requires upstream-native or legacy-projection"; LIVE_ARM64_PACKAGE_POLICY="${2,,}"; shift 2 ;;
+      --live-gdm-delay) [[ $# -ge 2 ]] || die "--live-gdm-delay requires a value"; LIVE_GDM_TIMED_LOGIN_DELAY="$2"; shift 2 ;;
       --live-ref) [[ $# -ge 2 ]] || die "--live-ref requires a value"; LIVE_ISO_REF="$2"; shift 2 ;;
       --custom-image-ref) [[ $# -ge 2 ]] || die "--custom-image-ref requires a value"; CUSTOM_IMAGE_REF="$2"; shift 2 ;;
       --push-target-image) PUSH_TARGET_IMAGE=1; shift ;;
@@ -908,7 +1031,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.4-r4.1-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v${SCRIPT_VERSION}-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -940,6 +1063,10 @@ recompute_paths() {
   TARGET_STORAGE_HOOK_FILE="$TMP_ROOT/target-090-abroot-unlock-var.sh"
   TARGET_STORAGE_HOOK_SHA256_FILE="$TMP_ROOT/target-090-abroot-unlock-var.sh.sha256"
   TARGET_STORAGE_HOOK_EVIDENCE_JSON="$TMP_ROOT/target-storage-hook-evidence.json"
+  TARGET_ABROOT_CONFIG_EVIDENCE="$TMP_ROOT/target-abroot.json"
+  TARGET_BASE_INSPECT_JSON="$TMP_ROOT/target-base-inspect.json"
+  TARGET_USERLAND_COHERENCE_REPORT="$TMP_ROOT/target-userland-coherence.txt"
+  REUNION_CONVERGENCE_MANIFEST="$TMP_ROOT/reunion-convergence.tsv"
   KERNEL_PACKAGE_CLOSURE_JSON="$TMP_ROOT/kernel-package-closure.json"
 }
 
@@ -1345,7 +1472,7 @@ load_hardware_profile() {
   PROFILE_DISPLAY_NAME="$(jq -r '.display_name // .profile' "$PROFILE_FILE_RESOLVED")"
   PROFILE_ARCHITECTURE="$(jq -r '.architecture // "arm64"' "$PROFILE_FILE_RESOLVED")"
   [[ "$PROFILE_ARCHITECTURE" == "arm64" ]] || \
-    die "v8.0.4 supports ARM64 profiles only; profile requested $PROFILE_ARCHITECTURE"
+    die "v$SCRIPT_VERSION supports ARM64 profiles only; profile requested $PROFILE_ARCHITECTURE"
 
   if [[ -z "$ENV_ARTIFACT_DIR_SET" ]]; then
     value="$(jq -r '.artifacts.directory // empty' "$PROFILE_FILE_RESOLVED")"
@@ -1390,6 +1517,10 @@ load_hardware_profile() {
 
   if [[ -z "$ENV_CUSTOM_IMAGE_BASE_SET" ]]; then
     value="$(jq -r '.target_image.base // empty' "$PROFILE_FILE_RESOLVED")"
+    if [[ "$value" == "ghcr.io/vanilla-os/desktop:dev" ]]; then
+      warn "Profile uses retired Reunion development taxonomy desktop:dev; resolving to canonical gnome:dev for v$SCRIPT_VERSION."
+      value="ghcr.io/vanilla-os/gnome:dev"
+    fi
     [[ -z "$value" ]] || CUSTOM_IMAGE_BASE="$value"
   fi
   if [[ -z "$ENV_TARGET_REPOSITORY_SET" ]]; then
@@ -2936,6 +3067,35 @@ write_source_provenance_manifest() {
   } > "$SOURCE_PROVENANCE_MANIFEST"
 }
 
+write_reunion_convergence_manifest() {
+  local live_conf="$LIVE_ISO_SOURCE/etc/terraform.conf"
+  local live_build="$LIVE_ISO_SOURCE/build.sh"
+  local live_codename="unknown" live_version="unknown" live_suffix="unknown"
+  [[ -f "$live_conf" ]] && {
+    live_codename="$(read_terraform_value "$live_conf" CODENAME)"
+    live_version="$(read_terraform_value "$live_conf" VERSION)"
+    live_suffix="$(read_terraform_value "$live_conf" PACKAGE_LISTS_SUFFIX)"
+  }
+
+  {
+    printf 'component\tselection\tbasis\n'
+    printf 'live-iso-ref\t%s@%s\tupstream branch identifier; content codename=%s version=%s\n' \
+      "$LIVE_ISO_REF" "$LIVE_SOURCE_COMMIT" "$live_codename" "$live_version"
+    printf 'live-package-lists\t%s\tupstream PACKAGE_LISTS_SUFFIX\n' "$live_suffix"
+    printf 'live-package-policy\t%s\tupstream-native is canonical; r4.1 projection retained only for compatibility\n' "$LIVE_ARM64_PACKAGE_POLICY"
+    printf 'live-builder\t%s\tcurrent official live-iso ARM64 workflow default\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf 'custom-image\t%s@%s\tscaffold/modules only; sample base taxonomy is non-authoritative\n' \
+      "$CUSTOM_IMAGE_REF" "$CUSTOM_SOURCE_COMMIT"
+    printf 'target-base\t%s\tcanonical Reunion development desktop taxonomy\n' "$CUSTOM_IMAGE_BASE"
+    printf 'vib-binary\t%s\tbuilder tool request\n' "$VIB_VERSION"
+    printf 'vib-recipe\t%s\tgenerated recipe declaration\n' "$VIB_RECIPE_VERSION"
+    printf 'system-operator-contract\tvso-native\ttarget verifier requires VSO native stack and canonical Distrobox path/interface\n'
+    printf 'installation-transport\t%s\tISO-local OCI bridge remains first-class when iso-oci is selected\n' "$DELIVERY_MODE"
+  } > "$REUNION_CONVERGENCE_MANIFEST"
+
+  [[ -f "$live_build" ]] || warn "Current live-iso build.sh is unavailable while writing convergence evidence."
+}
+
 report_source_provenance() {
   local custom_age live_age
   custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"
@@ -3209,6 +3369,7 @@ sync_required_repositories() {
   LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"
   verify_required_source_checkouts
   write_source_provenance_manifest
+  write_reunion_convergence_manifest
   report_source_provenance
   return 0
 }
@@ -3899,7 +4060,7 @@ live-iso source:            $LIVE_ISO_REPO_URL @ $LIVE_ISO_REF
 live-iso checkout:          $(source_checkout_summary "$LIVE_ISO_SOURCE")
 live-iso commit date:       $(repo_commit_iso_date "$LIVE_ISO_SOURCE")
 core-image source role:     not cloned; consumed through published OCI lineage
-desktop-image source role:  not cloned; target uses $CUSTOM_IMAGE_BASE
+desktop-image source role:  not cloned; canonical target base is $CUSTOM_IMAGE_BASE
 qcom updater checkout:      $(source_checkout_summary "$QCOM_UPDATER_DIR")
 Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
@@ -3914,10 +4075,14 @@ Profile source:            $PROFILE_FILE_SOURCE
 Profile normalized:        $PROFILE_FILE_RESOLVED
 Kernel package directory:  $KERNEL_DEB_DIR
 Push target OCI:            $PUSH_TARGET_IMAGE
-Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
-ARM64 package-list suffix:  $LIVE_ARM64_PACKAGE_LIST_SUFFIX
-ARM64 package exclusions:   $LIVE_ARM64_EXCLUDE_PACKAGES
+Live build image:           $LIVE_ISO_CONTAINER_IMAGE
+Live ARM64 package policy:  $LIVE_ARM64_PACKAGE_POLICY
+Upstream package-list suffix:${LIVE_PACKAGE_LIST_SOURCE_SUFFIX:-pending source validation}
+Legacy package-list suffix: $LIVE_ARM64_PACKAGE_LIST_SUFFIX
+Legacy package exclusions:  $LIVE_ARM64_EXCLUDE_PACKAGES
+Live GDM timed-login delay: ${LIVE_GDM_TIMED_LOGIN_DELAY}s
 Requested Vib version:      $VIB_VERSION
+Vib recipe version:         $VIB_RECIPE_VERSION
 FsGuard plugin request:     $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_VERSION
 Expected release ID:        $preview_id
 Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
@@ -3937,11 +4102,15 @@ Safety invariants:
   - /lib/modules/<release>/build and source symlinks never qualify as modules.
   - Optional tools, headers, development, and metadata .debs are reference-only.
   - Official live package-list source files remain byte-identical.
-  - The derived ARM64 list may omit only explicitly approved x86 support
-    packages; no GNOME, installer, shim-signed, or efibootmgr package may be removed.
-  - Every remaining direct package name is candidate-checked against the exact
-    ARM64 snapshot before the expensive live-build begins.
+  - upstream-native requires Reunion 3 architecture conditionals and the
+    architecture-aware upstream build.sh; no package projection is performed.
+  - legacy-projection retains the r4.1 explicit exclusion allowlist and direct
+    package candidate preflight for historical source refs only.
   - The upstream-derived ARM64 graphical manifest is accepted before remastering.
+  - The finished target must expose current Reunion VSO native semantics through
+    canonical /usr/bin/distrobox without post-install compatibility shims.
+  - Live GDM timing policy is confined to the installer squashfs and verified
+    semantically in the final ISO; the target OCI is not modified by it.
   - Final filesystem.packages and filesystem.packages-remove are byte-identical
     to the accepted ARM64 baseline ISO.
   - Only boot-critical hardware payload is added to the live filesystem.
@@ -3959,6 +4128,8 @@ Exact non-interactive execute command:
     FIRMWARE_MODE=$(printf '%q' "$FIRMWARE_MODE") FIRMWARE_PRESTAGED=$(printf '%q' "$FIRMWARE_PRESTAGED") \
     FIRMWARE_PACKAGE_OVERRIDES_JSON=$(printf '%q' "$FIRMWARE_PACKAGE_OVERRIDES_JSON") \
     REPO_POLICY=$(printf '%q' "$REPO_POLICY") INSTALLER_STORAGE_GUARD_POLICY=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY") \
+    CUSTOM_IMAGE_BASE=$(printf '%q' "$CUSTOM_IMAGE_BASE") LIVE_ISO_CONTAINER_IMAGE=$(printf '%q' "$LIVE_ISO_CONTAINER_IMAGE") \
+    LIVE_ARM64_PACKAGE_POLICY=$(printf '%q' "$LIVE_ARM64_PACKAGE_POLICY") LIVE_GDM_TIMED_LOGIN_DELAY=$(printf '%q' "$LIVE_GDM_TIMED_LOGIN_DELAY") \
     TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") \
     ABROOT_IMAGE_NAME=$(printf '%q' "$ABROOT_IMAGE_NAME") \
     $(printf '%q' "$SCRIPT_PATH") --execute --non-interactive
@@ -4132,8 +4303,8 @@ probe_vib_binary() {
     return 1
   }
 
-  version_ge "$detected" "1.0.7" || {
-    warn "Selected Vib version $detected is older than recipe requirement 1.0.7."
+  version_ge "$detected" "$VIB_RECIPE_VERSION" || {
+    warn "Selected Vib version $detected is older than recipe requirement $VIB_RECIPE_VERSION."
     return 1
   }
 
@@ -4954,7 +5125,7 @@ MODULE_HW_EOF
   cat > "$CUSTOM_PROJECT/recipe.yml" <<EOF_RECIPE
 name: VanillaOS-SnapdragonX Desktop for $PROFILE
 id: vanillaos-snapdragonx-$PROFILE
-vibversion: 1.0.7
+vibversion: $VIB_RECIPE_VERSION
 
 stages:
   - id: build
@@ -5061,7 +5232,32 @@ EOF_INPUTS
   ok "Prepared official custom-image-derived Vib project: $CUSTOM_PROJECT"
 }
 
+validate_target_base_arm64() {
+  # Resolve the selected upstream base for ARM64 before Vib emits a derived
+  # Containerfile. This is a taxonomy/existence check, not installation
+  # provenance: the resulting custom target is still built locally and, in
+  # iso-oci mode, installed from the ISO-embedded OCI layout.
+  case "$CUSTOM_IMAGE_BASE" in
+    ghcr.io/*|docker.io/*|quay.io/*)
+      info "Resolving ARM64 target-base descriptor: $CUSTOM_IMAGE_BASE"
+      skopeo --override-arch arm64 inspect "docker://$CUSTOM_IMAGE_BASE" \
+        > "$TARGET_BASE_INSPECT_JSON" || \
+        die "Unable to resolve an ARM64 descriptor for target base: $CUSTOM_IMAGE_BASE"
+      jq -e '.Architecture == "arm64" or .Architecture == "aarch64"' \
+        "$TARGET_BASE_INSPECT_JSON" >/dev/null || \
+        die "Resolved target base is not ARM64: $CUSTOM_IMAGE_BASE"
+      ok "Target base ARM64 descriptor resolved: $(jq -r '.Digest // "digest-unreported"' "$TARGET_BASE_INSPECT_JSON")"
+      ;;
+    *)
+      warn "Target base is not a recognized remote registry reference; skipping remote ARM64 descriptor preflight: $CUSTOM_IMAGE_BASE"
+      printf '{"reference":%s,"remote_inspect":"skipped"}\n' \
+        "$(jq -Rn --arg v "$CUSTOM_IMAGE_BASE" '$v')" > "$TARGET_BASE_INSPECT_JSON"
+      ;;
+  esac
+}
+
 build_target_oci() {
+  validate_target_base_arm64
   pushd "$CUSTOM_PROJECT" >/dev/null
   if ! run_logged_vib "vib-generate-containerfile" build recipe.yml; then
     die "Vib failed to generate Containerfile. Review the retained diagnostic bundle."
@@ -5083,7 +5279,7 @@ build_target_oci() {
   if [[ "$PUSH_TARGET_IMAGE" == "1" ]]; then
     run_logged "push-target-oci" "$OCI_RUNTIME" push "$TARGET_IMAGE_REF"
   elif [[ "$TARGET_IMAGE_REF" == localhost/* ]]; then
-    info "The target OCI reference is local-only; v8 will embed and serve it from the ISO in iso-oci mode."
+    info "The target OCI reference is local-only; v$SCRIPT_VERSION will embed and serve it from the ISO in iso-oci mode."
   fi
 }
 
@@ -5179,6 +5375,84 @@ else
   exit 1
 fi
 
+# Reunion userland coherence gate. A working Distrobox container by itself is
+# not sufficient evidence: the installed target must contain the host-side
+# VSO/APX/Distrobox generation expected by current Reunion.
+test -x /usr/bin/vso || {
+  echo "Reunion target lacks /usr/bin/vso" >&2
+  exit 1
+}
+test -x /usr/bin/distrobox || {
+  echo "Reunion target lacks canonical /usr/bin/distrobox" >&2
+  exit 1
+}
+test -x /usr/bin/setup-vso-terminal || {
+  echo "Reunion target lacks setup-vso-terminal" >&2
+  exit 1
+}
+
+distrobox_version="$(/usr/bin/distrobox --version)" || {
+  echo "Distrobox --version failed; APX 3.1.1+ requires this interface" >&2
+  exit 1
+}
+case "$distrobox_version" in
+  'distrobox version '*) : ;;
+  *)
+    echo "Unexpected Distrobox version interface: $distrobox_version" >&2
+    exit 1
+    ;;
+esac
+distrobox_release="${distrobox_version##* }"
+distrobox_major="${distrobox_release%%.*}"
+[[ "$distrobox_major" =~ ^[0-9]+$ ]] || {
+  echo "Unable to parse Distrobox major version: $distrobox_release" >&2
+  exit 1
+}
+(( distrobox_major >= 2 )) || {
+  echo "Distrobox is older than the Reunion-compatible 2.x generation: $distrobox_release" >&2
+  exit 1
+}
+if [[ "$distrobox_release" == 2.0.0-rc.* ]]; then
+  distrobox_rc="${distrobox_release#2.0.0-rc.}"
+  [[ "$distrobox_rc" =~ ^[0-9]+$ ]] && (( distrobox_rc >= 4 )) || {
+    echo "Distrobox release candidate predates the required additional-flags fix: $distrobox_release" >&2
+    exit 1
+  }
+fi
+
+# Current Reunion exposes the managed System Operator subsystem as `native`,
+# not the transitional Pico-generation command surface.
+/usr/bin/vso native --help >/dev/null 2>&1 || {
+  echo "VSO does not expose the current Reunion native subsystem" >&2
+  exit 1
+}
+
+vso_stack=/usr/share/vso/apx/stacks/vso-native.yaml
+test -f "$vso_stack" && test ! -L "$vso_stack" || {
+  echo "Reunion VSO native stack is absent or not a regular file" >&2
+  exit 1
+}
+grep -Eq '^name:[[:space:]]*vso-native[[:space:]]*$' "$vso_stack"
+grep -Eq '^base:[[:space:]]*ghcr\.io/vanilla-os/vso:latest[[:space:]]*$' "$vso_stack"
+grep -Eq '^pkgmanager:[[:space:]]*apt[[:space:]]*$' "$vso_stack"
+grep -Eq '^builtin:[[:space:]]*true[[:space:]]*$' "$vso_stack"
+
+test ! -e /usr/share/vso/apx/stacks/vso-pico.yaml || {
+  echo "Transitional vso-pico stack unexpectedly remains in the Reunion target" >&2
+  exit 1
+}
+for hook in pre-init-hook init-hook; do
+  test -f "/usr/share/vso/scripts/$hook" && test ! -L "/usr/share/vso/scripts/$hook" || {
+    echo "Reunion VSO host hook placeholder is absent: $hook" >&2
+    exit 1
+  }
+done
+
+printf 'REUNION-COHERENCE: distrobox=%s\n' "$distrobox_version"
+printf 'REUNION-COHERENCE: vso-native=present\n'
+printf 'REUNION-COHERENCE: vso-hooks=pre-init-hook,init-hook\n'
+printf 'REUNION-COHERENCE: distrobox-path=/usr/bin/distrobox\n'
+
 # Validate the receipt written during the unlocked package-install stage.
 test -s "$receipt"
 test -s "$receipt_checksum"
@@ -5269,6 +5543,19 @@ VERIFY_OCI_EOF
 
   cp -a "$actual_receipt" "$RELEASE_DIR/target-installed-kernel-packages.tsv"
   cp -a "$expected_packages" "$RELEASE_DIR/target-installed-package-expectations.tsv"
+
+  # Preserve the target's actual ABRoot configuration as evidence. Its
+  # registry/name/tag fields describe future update lookup and must never be
+  # confused with the ISO-local installation transport.
+  "$OCI_RUNTIME" run --rm --entrypoint /bin/cat "$TARGET_IMAGE_REF"     /usr/share/abroot/abroot.json > "$TARGET_ABROOT_CONFIG_EVIDENCE"
+  jq -e . "$TARGET_ABROOT_CONFIG_EVIDENCE" >/dev/null ||     die "Unable to export valid target ABRoot configuration evidence."
+  cp -a "$TARGET_ABROOT_CONFIG_EVIDENCE" "$RELEASE_DIR/target-abroot.json"
+
+  local verify_target_log="$LOG_DIR/${SESSION_ID}-verify-target-oci.log"
+  grep '^REUNION-COHERENCE:' "$verify_target_log" > "$TARGET_USERLAND_COHERENCE_REPORT" ||     die "Target verification did not emit Reunion userland coherence evidence."
+  [[ "$(wc -l < "$TARGET_USERLAND_COHERENCE_REPORT")" -ge 4 ]] ||     die "Target userland coherence report is incomplete."
+  cp -a "$TARGET_USERLAND_COHERENCE_REPORT" "$RELEASE_DIR/target-userland-coherence.txt"
+  [[ -s "$TARGET_BASE_INSPECT_JSON" ]] && cp -a "$TARGET_BASE_INSPECT_JSON" "$RELEASE_DIR/target-base-inspect.json"
 
   ok "Target OCI verification passed without requiring runtime package-manager tools."
 }
@@ -5421,22 +5708,41 @@ export_target_oci_for_installer() {
     INSTALLER_DEFAULT_IMAGE_REF="$REGISTRY_IMAGE_REF"
   fi
 
+  local abroot_registry abroot_config_name abroot_tag
+  abroot_registry="$(jq -r '.registry // empty' "$TARGET_ABROOT_CONFIG_EVIDENCE")"
+  abroot_config_name="$(jq -r '.name // empty' "$TARGET_ABROOT_CONFIG_EVIDENCE")"
+  abroot_tag="$(jq -r '.tag // empty' "$TARGET_ABROOT_CONFIG_EVIDENCE")"
+
   jq -n \
     --arg profile "$PROFILE" \
+    --arg upstream_base "$CUSTOM_IMAGE_BASE" \
+    --arg local_target "$TARGET_IMAGE_REF" \
     --arg tag "$EMBEDDED_IMAGE_TAG" \
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg layout "$ISO_IMAGE_LAYOUT_PATH" \
-    --arg local_ref "$LOCAL_INSTALL_IMAGE_REF" \
+    --arg logical_ref "$LOCAL_INSTALL_IMAGE_REF" \
     --arg physical_ref "$(local_registry_physical_prefix):$EMBEDDED_IMAGE_TAG" \
     --arg installer_ref "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg delivery "$DELIVERY_MODE" \
+    --arg abroot_identity "$ABROOT_IMAGE_NAME" \
+    --arg abroot_registry "$abroot_registry" \
+    --arg abroot_name "$abroot_config_name" \
+    --arg abroot_tag "$abroot_tag" \
     --arg kernel "$KERNEL_RELEASE" \
     --arg dtb "$DTB_NAME" \
-    '{profile:$profile, tag:$tag, manifest_digest:$digest, iso_layout_path:$layout,
-      local_registry_reference:$local_ref,
-      physical_registry_reference:$physical_ref,
-      installer_reference:$installer_ref,
-      delivery_mode:$delivery, kernel_release:$kernel, dtb:$dtb}' \
+    '{schema:2, profile:$profile,
+      upstream_base:$upstream_base,
+      local_target_build_reference:$local_target,
+      embedded_oci:{tag:$tag,manifest_digest:$digest,iso_layout_path:$layout},
+      installer:{delivery_mode:$delivery,logical_reference:$logical_ref,
+                 physical_loopback_reference:$physical_ref,
+                 selected_reference:$installer_ref},
+      abroot:{logical_identity:$abroot_identity,
+              future_update_locator:{registry:$abroot_registry,name:$abroot_name,tag:$abroot_tag}},
+      installation_provenance:(if $delivery == "iso-oci" then
+        "verified ISO-embedded OCI layout served through loopback registry bridge"
+        else "external registry delivery selected explicitly" end),
+      kernel_release:$kernel, dtb:$dtb}' \
     > "$TMP_ROOT/embedded-target-image.json"
 
   [[ -s "$TARGET_STORAGE_HOOK_FILE" && -s "$TARGET_STORAGE_HOOK_SHA256_FILE" ]] ||
@@ -5905,6 +6211,98 @@ verify_arm64_package_list_projection_after_build() {
   ok "Active live-build package-list target: $active_target"
 }
 
+normalize_live_arm64_package_policy() {
+  case "${LIVE_ARM64_PACKAGE_POLICY,,}" in
+    upstream|upstream-native|native) LIVE_ARM64_PACKAGE_POLICY="upstream-native" ;;
+    legacy|legacy-projection|projection) LIVE_ARM64_PACKAGE_POLICY="legacy-projection" ;;
+    *) die "Unsupported live ARM64 package policy: $LIVE_ARM64_PACKAGE_POLICY" ;;
+  esac
+}
+
+validate_upstream_reunion_arm64_live_source() {
+  local conf="$1" build="$2"
+  local codename version source_suffix source_dir desktop_list pool_list
+  codename="$(read_terraform_value "$conf" CODENAME)"
+  version="$(read_terraform_value "$conf" VERSION)"
+  source_suffix="$(read_terraform_value "$conf" PACKAGE_LISTS_SUFFIX)"
+
+  [[ "$codename" == "reunion" ]] || \
+    die "upstream-native policy requires current Reunion live source; CODENAME=$codename"
+  [[ "$version" == "3" ]] || \
+    die "upstream-native policy requires Vanilla OS 3 live source; VERSION=$version"
+  [[ -n "$source_suffix" ]] || die "Unable to read upstream package-list suffix."
+
+  source_dir="$LIVE_BUILD_DIR/etc/config/package-lists.$source_suffix"
+  desktop_list="$source_dir/desktop.list.chroot_live"
+  pool_list="$source_dir/pool.list.binary"
+  [[ -f "$desktop_list" && -f "$pool_list" ]] || \
+    die "Current Reunion package-list files are incomplete beneath $source_dir"
+
+  # Prove that generic architecture ownership has actually moved upstream
+  # before disabling the r4.1 projection. These predicates intentionally check
+  # both the ARM64 selections and the guarded AMD64 alternatives.
+  grep -Fq '#if ARCHITECTURES arm64' "$desktop_list" || \
+    die "Upstream desktop list lacks ARM64 architecture conditionals."
+  grep -Fq 'shim-helpers-arm64-signed' "$desktop_list" || \
+    die "Upstream desktop list lacks ARM64 shim helpers."
+  grep -Fq '#if ARCHITECTURES amd64' "$desktop_list" || \
+    die "Upstream desktop list lacks guarded AMD64 conditionals."
+  grep -Fq 'virtualbox-guest-utils' "$desktop_list" || \
+    die "Expected guarded VirtualBox package is absent; source taxonomy changed and requires review."
+
+  grep -Fq '#if ARCHITECTURES arm64' "$pool_list" || \
+    die "Upstream binary pool lacks ARM64 architecture conditionals."
+  for package in grub-efi-arm64 grub-efi-arm64-bin grub-efi-arm64-signed shim-helpers-arm64-signed; do
+    grep -Fxq "$package" "$pool_list" || \
+      die "Upstream ARM64 binary pool lacks expected package: $package"
+  done
+  grep -Fq '#if ARCHITECTURES amd64' "$pool_list" || \
+    die "Upstream binary pool lacks guarded AMD64 conditionals."
+  grep -Fxq 'grub-efi-amd64' "$pool_list" || \
+    die "Expected guarded AMD64 GRUB package is absent; source taxonomy changed and requires review."
+
+  # Current build.sh is architecture-aware. Refuse to patch it in canonical
+  # mode; if upstream changes this contract, stop for review instead of
+  # silently reintroducing an old workaround.
+  grep -Fq 'live-image-$BUILD_ARCH.hybrid.iso' "$build" || \
+    die "Current live-iso build.sh is not architecture-aware at the output path."
+  grep -Fq 'build "$ARCH"' "$build" || \
+    die "Current live-iso build.sh no longer exposes the expected ARCH selection path."
+
+  LIVE_PACKAGE_LIST_SOURCE_SUFFIX="$source_suffix"
+  LIVE_PACKAGE_LIST_SOURCE_DIR="$source_dir"
+  LIVE_PACKAGE_LIST_DERIVED_DIR=""
+  LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST=""
+  LIVE_PACKAGE_LIST_PACKAGE_INVENTORY=""
+  LIVE_PACKAGE_CANDIDATE_REPORT=""
+
+  hash_directory_tree "$source_dir" > "$TMP_ROOT/upstream-package-lists.original.before.sha256"
+  ok "Current Reunion native ARM64 live-source contract validated."
+  info "Upstream package-list suffix: $source_suffix"
+}
+
+verify_upstream_reunion_package_lists_after_build() {
+  [[ -d "$LIVE_PACKAGE_LIST_SOURCE_DIR" ]] || \
+    die "Canonical upstream package-list tree disappeared during live-build."
+  hash_directory_tree "$LIVE_PACKAGE_LIST_SOURCE_DIR" \
+    > "$TMP_ROOT/upstream-package-lists.original.after.sha256"
+  cmp -s \
+    "$TMP_ROOT/upstream-package-lists.original.before.sha256" \
+    "$TMP_ROOT/upstream-package-lists.original.after.sha256" || \
+    die "Canonical upstream live package-list source files changed during build."
+
+  local active_link="$LIVE_BUILD_DIR/tmp/arm64/config/package-lists"
+  [[ -L "$active_link" ]] || \
+    die "Live-build did not create the expected active package-list symlink: $active_link"
+  local active_target
+  active_target="$(readlink "$active_link")"
+  [[ "$active_target" == "package-lists.$LIVE_PACKAGE_LIST_SOURCE_SUFFIX" ]] || \
+    die "Live-build selected unexpected package-list target: $active_target"
+
+  ok "Canonical upstream architecture-aware package lists remained byte-identical during live-build."
+  ok "Active live-build package-list target: $active_target"
+}
+
 prepare_arm64_live_worktree() {
   rm -rf "$LIVE_BUILD_DIR"
   git -C "$LIVE_ISO_SOURCE" worktree add --detach "$LIVE_BUILD_DIR" "$LIVE_SOURCE_COMMIT"
@@ -5916,36 +6314,49 @@ prepare_arm64_live_worktree() {
   sed -i -E 's/^ARCH=.*/ARCH="arm64"/' "$conf"
   grep -q '^ARCH="arm64"$' "$conf" || die "Unable to select ARM64 in terraform.conf."
 
-  prepare_arm64_package_list_projection "$conf"
-  preflight_arm64_package_candidates "$conf"
+  normalize_live_arm64_package_policy
+  case "$LIVE_ARM64_PACKAGE_POLICY" in
+    upstream-native)
+      validate_upstream_reunion_arm64_live_source "$conf" "$build"
+      ;;
+    legacy-projection)
+      warn "Using legacy r4.1 ARM64 package projection by explicit policy."
+      prepare_arm64_package_list_projection "$conf"
+      preflight_arm64_package_candidates "$conf"
 
-  # The official Reunion build script still hard-codes the final AMD64 output
-  # source path. This replacement happens after lb build and cannot alter the
-  # package closure or live filesystem content.
-  if grep -Fq 'tmp/amd64/live-image-amd64.hybrid.iso' "$build"; then
-    sed -i \
-      's#tmp/amd64/live-image-amd64\.hybrid\.iso#tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso#' \
-      "$build"
-  fi
+      # Historical compatibility only. Current Reunion build.sh is already
+      # architecture-aware and therefore does not take this branch.
+      if grep -Fq 'tmp/amd64/live-image-amd64.hybrid.iso' "$build"; then
+        sed -i \
+          's#tmp/amd64/live-image-amd64\.hybrid\.iso#tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso#' \
+          "$build"
+      fi
+      ;;
+  esac
 
-  local changed unexpected untracked unexpected_untracked
+  local changed unexpected untracked unexpected_untracked allowed_tracked
   changed="$(git -C "$LIVE_BUILD_DIR" diff --name-only)"
-  unexpected="$(
-    printf '%s\n' "$changed" |
-      grep -Ev '^(build\.sh|etc/terraform\.conf)$' || true
-  )"
+  if [[ "$LIVE_ARM64_PACKAGE_POLICY" == "upstream-native" ]]; then
+    allowed_tracked='^etc/terraform\.conf$'
+  else
+    allowed_tracked='^(build\.sh|etc/terraform\.conf)$'
+  fi
+  unexpected="$(printf '%s\n' "$changed" | grep -Ev "$allowed_tracked" || true)"
   [[ -z "$unexpected" ]] || \
-    die "Refusing tracked live-iso source modifications outside build.sh and terraform.conf: $unexpected"
+    die "Refusing tracked live-iso source modifications outside the selected policy boundary: $unexpected"
 
   untracked="$(git -C "$LIVE_BUILD_DIR" ls-files --others --exclude-standard)"
-  unexpected_untracked="$(
-    printf '%s\n' "$untracked" |
-      grep -Ev "^etc/config/package-lists\\.${LIVE_ARM64_PACKAGE_LIST_SUFFIX}/" || true
-  )"
-  [[ -z "$unexpected_untracked" ]] || \
-    die "Refusing unexpected untracked live-iso build files: $unexpected_untracked"
+  if [[ "$LIVE_ARM64_PACKAGE_POLICY" == "upstream-native" ]]; then
+    [[ -z "$untracked" ]] || \
+      die "Canonical upstream-native live build unexpectedly created pre-build untracked files: $untracked"
+  else
+    unexpected_untracked="$(printf '%s\n' "$untracked" | grep -Ev "^etc/config/package-lists\\.${LIVE_ARM64_PACKAGE_LIST_SUFFIX}/" || true)"
+    [[ -z "$unexpected_untracked" ]] || \
+      die "Refusing unexpected untracked live-iso build files: $unexpected_untracked"
+  fi
 
-  ok "Upstream-derived ARM64 live-iso worktree prepared at commit $LIVE_SOURCE_COMMIT."
+  write_reunion_convergence_manifest
+  ok "Upstream-derived ARM64 live-iso worktree prepared at commit $LIVE_SOURCE_COMMIT using policy=$LIVE_ARM64_PACKAGE_POLICY."
 }
 
 build_arm64_live_iso() {
@@ -5958,7 +6369,7 @@ build_arm64_live_iso() {
     -v "$LIVE_BUILD_DIR:/working_dir" \
     -w /working_dir \
     "$LIVE_ISO_CONTAINER_IMAGE" \
-    /bin/bash -s etc/terraform.conf < build.sh \
+    /bin/bash -c 'apt-get update && apt-get install -y debootstrap && /bin/bash -s etc/terraform.conf' < build.sh \
     2>&1 | tee "$CURRENT_LOG"
   popd >/dev/null
 
@@ -5971,7 +6382,11 @@ build_arm64_live_iso() {
   [[ -n "$UPSTREAM_ISO" && -s "$UPSTREAM_ISO" ]] || \
     die "The upstream-derived ARM64 graphical ISO was not produced."
 
-  verify_arm64_package_list_projection_after_build
+  case "$LIVE_ARM64_PACKAGE_POLICY" in
+    upstream-native) verify_upstream_reunion_package_lists_after_build ;;
+    legacy-projection) verify_arm64_package_list_projection_after_build ;;
+    *) die "Internal live package policy drift after build: $LIVE_ARM64_PACKAGE_POLICY" ;;
+  esac
   verify_arm64_graphical_iso
 }
 
@@ -5999,6 +6414,206 @@ extract_required_squashfs_file() {
   [[ -s "$destination" ]] ||
     die "Required live-squashfs ${description} is empty at /${member}"
   rm -f "$stderr_file"
+}
+
+validate_live_gdm_timed_login_settings() {
+  case "$LIVE_GDM_TIMED_LOGIN_DELAY" in
+    ''|*[!0-9]*)
+      die "LIVE_GDM_TIMED_LOGIN_DELAY must be an integer from 1 through 60; got '$LIVE_GDM_TIMED_LOGIN_DELAY'"
+      ;;
+  esac
+  (( 10#$LIVE_GDM_TIMED_LOGIN_DELAY >= 1 && 10#$LIVE_GDM_TIMED_LOGIN_DELAY <= 60 )) || \
+    die "LIVE_GDM_TIMED_LOGIN_DELAY must be from 1 through 60 seconds; got '$LIVE_GDM_TIMED_LOGIN_DELAY'"
+  [[ "$LIVE_GDM_TIMED_LOGIN_USER" == "vanilla" ]] || \
+    die "Internal guard: live timed-login user unexpectedly changed from vanilla"
+}
+
+configure_live_gdm_timed_login() {
+  # Live-squashfs only. Never apply this disposable live-user session policy to
+  # the installed target OCI.
+  local root="$1"
+  local live_config="$root/$LIVE_GDM_LIVE_CONFIG_REL"
+  local gdm_config="$root/$LIVE_GDM_DAEMON_CONFIG_REL"
+
+  validate_live_gdm_timed_login_settings
+  [[ -d "$root" ]] || die "Live squashfs root does not exist: $root"
+  [[ -f "$gdm_config" && ! -L "$gdm_config" ]] || \
+    die "Live filesystem lacks a regular Debian GDM configuration file: /$LIVE_GDM_DAEMON_CONFIG_REL"
+
+  mkdir -p "$(dirname "$live_config")"
+  cat > "$live_config" <<'LIVE_CONFIG_EOF'
+# Managed by VanillaOS-SnapdragonX v8.5-r1.
+# Keep Debian live-config responsible for the live user, but prevent its gdm3
+# component from racing the explicit GDM timed-login policy below.
+LIVE_CONFIG_NOCOMPONENTS="gdm3"
+LIVE_CONFIG_EOF
+  chmod 0644 "$live_config"
+
+  python3 - "$gdm_config" "$LIVE_GDM_TIMED_LOGIN_USER" "$LIVE_GDM_TIMED_LOGIN_DELAY" <<'PY_GDM_TIMED_LOGIN'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+user = sys.argv[2]
+delay = int(sys.argv[3], 10)
+if delay < 1 or delay > 60:
+    raise SystemExit(f"invalid timed-login delay: {delay}")
+
+raw = path.read_text(encoding="utf-8")
+lines = raw.splitlines(keepends=True)
+section_re = re.compile(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$")
+managed_keys = {
+    "automaticloginenable", "automaticlogin", "timedloginenable",
+    "timedlogin", "timedlogindelay",
+}
+sections: list[tuple[int, str]] = []
+for idx, line in enumerate(lines):
+    match = section_re.match(line.rstrip("\r\n"))
+    if match:
+        sections.append((idx, match.group(1).strip()))
+daemon_sections = [idx for idx, name in sections if name.casefold() == "daemon"]
+if len(daemon_sections) > 1:
+    raise SystemExit("refusing GDM update: multiple [daemon] sections found")
+
+newline = "\r\n" if "\r\n" in raw else "\n"
+managed_block = [
+    f"AutomaticLoginEnable=false{newline}",
+    f"TimedLoginEnable=true{newline}",
+    f"TimedLogin={user}{newline}",
+    f"TimedLoginDelay={delay}{newline}",
+]
+if not daemon_sections:
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] = lines[-1] + newline
+    if lines and lines[-1].strip():
+        lines.append(newline)
+    lines.extend([f"[daemon]{newline}", *managed_block])
+else:
+    start = daemon_sections[0]
+    end = len(lines)
+    for idx, _name in sections:
+        if idx > start:
+            end = idx
+            break
+    kept: list[str] = []
+    assignment_re = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=")
+    for line in lines[start + 1 : end]:
+        match = assignment_re.match(line)
+        if match and match.group(1).casefold() in managed_keys:
+            continue
+        kept.append(line)
+    while kept and kept[-1].strip() == "":
+        kept.pop()
+    if kept:
+        kept.append(newline)
+    lines = lines[: start + 1] + kept + managed_block + lines[end:]
+
+result = "".join(lines)
+st = path.stat()
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r1-", dir=str(path.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        handle.write(result)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, stat.S_IMODE(st.st_mode))
+    try:
+        os.chown(tmp_name, st.st_uid, st.st_gid)
+    except PermissionError:
+        pass
+    os.replace(tmp_name, path)
+finally:
+    try:
+        os.unlink(tmp_name)
+    except FileNotFoundError:
+        pass
+PY_GDM_TIMED_LOGIN
+
+  grep -Fqx 'LIVE_CONFIG_NOCOMPONENTS="gdm3"' "$live_config" || \
+    die "Live-config GDM exclusion was not written correctly"
+  grep -Fqx 'AutomaticLoginEnable=false' "$gdm_config" || \
+    die "GDM immediate autologin was not explicitly disabled"
+  grep -Fqx 'TimedLoginEnable=true' "$gdm_config" || \
+    die "GDM timed login was not enabled"
+  grep -Fqx "TimedLogin=$LIVE_GDM_TIMED_LOGIN_USER" "$gdm_config" || \
+    die "GDM timed-login user does not match $LIVE_GDM_TIMED_LOGIN_USER"
+  grep -Fqx "TimedLoginDelay=$LIVE_GDM_TIMED_LOGIN_DELAY" "$gdm_config" || \
+    die "GDM timed-login delay does not match $LIVE_GDM_TIMED_LOGIN_DELAY"
+  ok "Configured live-only GDM timed login for $LIVE_GDM_TIMED_LOGIN_USER after ${LIVE_GDM_TIMED_LOGIN_DELAY}s."
+}
+
+verify_live_gdm_timed_login_files() {
+  local live_config="$1" gdm_config="$2"
+  grep -Fqx 'LIVE_CONFIG_NOCOMPONENTS="gdm3"' "$live_config" || \
+    die "Final live-config policy does not suppress the gdm3 component"
+
+  python3 - "$gdm_config" "$LIVE_GDM_TIMED_LOGIN_USER" "$LIVE_GDM_TIMED_LOGIN_DELAY" <<'PY_VERIFY_GDM_TIMED_LOGIN'
+from __future__ import annotations
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+expected_user = sys.argv[2]
+expected_delay = sys.argv[3]
+text = path.read_text(encoding="utf-8")
+section_re = re.compile(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$")
+assignment_re = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*?)\s*$")
+current = None
+daemon_count = 0
+values: dict[str, list[str]] = {}
+for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith(("#", ";")):
+        continue
+    section = section_re.match(raw_line)
+    if section:
+        current = section.group(1).strip().casefold()
+        if current == "daemon":
+            daemon_count += 1
+        continue
+    if current != "daemon":
+        continue
+    assignment = assignment_re.match(raw_line)
+    if assignment:
+        key = assignment.group(1).casefold()
+        values.setdefault(key, []).append(assignment.group(2).strip())
+if daemon_count != 1:
+    raise SystemExit(f"expected exactly one [daemon] section, found {daemon_count}")
+expected = {
+    "automaticloginenable": "false",
+    "timedloginenable": "true",
+    "timedlogin": expected_user,
+    "timedlogindelay": expected_delay,
+}
+for key, wanted in expected.items():
+    actual = values.get(key, [])
+    if actual != [wanted]:
+        raise SystemExit(f"unexpected {key}: expected {[wanted]!r}, got {actual!r}")
+if values.get("automaticlogin"):
+    raise SystemExit(f"stale AutomaticLogin assignment remains: {values['automaticlogin']!r}")
+PY_VERIFY_GDM_TIMED_LOGIN
+}
+
+verify_final_live_gdm_timed_login() {
+  local verify_dir="$TMP_ROOT/final-gdm-timed-login-verify"
+  local final_squash="$verify_dir/filesystem.squashfs"
+  local live_config="$verify_dir/vanillaos-snapdragonx.conf"
+  local gdm_config="$verify_dir/daemon.conf"
+  rm -rf "$verify_dir"
+  mkdir -p "$verify_dir"
+  extract_iso_file "$FINAL_ISO" /live/filesystem.squashfs "$final_squash"
+  [[ -s "$final_squash" ]] || die "Final ISO live filesystem.squashfs is missing for GDM verification"
+  extract_required_squashfs_file "$final_squash" "$LIVE_GDM_LIVE_CONFIG_REL" "$live_config" "live-config GDM component exclusion"
+  extract_required_squashfs_file "$final_squash" "$LIVE_GDM_DAEMON_CONFIG_REL" "$gdm_config" "GDM timed-login policy"
+  verify_live_gdm_timed_login_files "$live_config" "$gdm_config"
+  ok "Final ISO verified: live-config gdm3 autologin is suppressed and GDM timed login is ${LIVE_GDM_TIMED_LOGIN_DELAY}s."
 }
 
 verify_arm64_graphical_iso() {
@@ -7862,6 +8477,8 @@ install_profile_aware_installer_overlay() {
   local profile_dir="$root/etc/vanilla-installer/profiles/$PROFILE"
   local recipe_target="$profile_dir/recipe.json"
   local wrapper="$root/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE"
+  local installer_dispatch="$root/usr/bin/vanilla-installer"
+  local installer_real="$root/usr/libexec/vanilla-installer.real"
   local registry_server="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry.py"
   local collector="$root/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics"
   local desktop="$root/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
@@ -7895,6 +8512,27 @@ install_profile_aware_installer_overlay() {
      | if $delivery == "iso-oci" then del(.steps["conn-check"]) else . end
      | if $allow_custom == "1" then . else del(.steps["image"]) end' \
     "$recipe_source" > "$recipe_target"
+
+  # r1 canonical installer binding:
+  # Preserve the exact upstream recipe for evidence, then make the generated
+  # profile recipe canonical at /etc/vanilla-installer/recipe.json. The
+  # Installer still honors VANILLA_CUSTOM_RECIPE, but current Gio single-instance
+  # semantics make an environment-only selector insufficient: whichever launch
+  # owns org.vanillaos.Installer first controls the process environment. Both
+  # paths must therefore describe the same ISO-local target.
+  cp -a "$recipe_source" "$profile_dir/recipe.upstream.json"
+  cp -a "$recipe_target" "$recipe_source"
+  cmp -s "$recipe_source" "$recipe_target" || \
+    die "Canonical Vanilla Installer recipe diverges from the profile recipe."
+
+  # Preserve the package-provided executable behind a private real entrypoint.
+  # /usr/bin/vanilla-installer is replaced below with a dispatch shim so stock
+  # desktop launchers, the installer session, and manual CLI use all traverse
+  # the profile wrapper that starts/verifies the embedded OCI bridge.
+  [[ -s "$installer_dispatch" ]] || \
+    die "Live filesystem lacks /usr/bin/vanilla-installer before profile dispatch installation."
+  cp -L --preserve=mode,ownership,timestamps "$installer_dispatch" "$installer_real"
+  chmod 0755 "$installer_real"
 
   cp -a "$PROFILE_RESOLVED_JSON" \
     "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json"
@@ -8092,13 +8730,23 @@ EOF_INSTALLER_WRAPPER_RUNTIME
   cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_END'
 
 set +e
-vanilla-installer "$@"
+/usr/libexec/vanilla-installer.real "$@"
 rc=$?
 set -e
 printf 'Vanilla Installer exited with status %s\n' "$rc"
 exit "$rc"
 EOF_INSTALLER_WRAPPER_END
   chmod 0755 "$wrapper"
+
+  cat > "$installer_dispatch" <<EOF_INSTALLER_DISPATCH
+#!/bin/sh
+# VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1
+# All live installer entrypoints must traverse the profile wrapper so the
+# embedded OCI registry bridge is active before Vanilla Installer resolves its
+# canonical ISO-local recipe.
+exec /usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE "\$@"
+EOF_INSTALLER_DISPATCH
+  chmod 0755 "$installer_dispatch"
 
   cat > "$collector" <<'EOF_INSTALLER_COLLECTOR'
 #!/usr/bin/env bash
@@ -8126,6 +8774,11 @@ copy_if_present /tmp/vanillaos-snapdragonx-local-registry.log
 copy_if_present /tmp/vanillaos-snapdragonx-local-registry-selftest.json
 copy_if_present /tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json
 copy_if_present /tmp/vanillaos-snapdragonx-albius-install-recipe.json
+copy_if_present /etc/vanilla-installer/recipe.json installer-recipe-canonical.json
+copy_if_present /etc/vanilla-installer/profiles/$profile/recipe.json installer-recipe-profile.json
+copy_if_present /etc/vanilla-installer/profiles/$profile/recipe.upstream.json installer-recipe-upstream.json
+copy_if_present /usr/bin/vanilla-installer installer-dispatch
+copy_if_present /usr/local/libexec/vanillaos-snapdragonx-installer-$profile installer-wrapper
 copy_if_present /tmp/vanillaos-snapdragonx-storage-guard.json
 copy_if_present /tmp/vanillaos-snapdragonx-installed-storage-validation.txt
 copy_if_present /etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf
@@ -8234,11 +8887,34 @@ EOF_INSTALLER_DESKTOP
     '.images.default == $image and .vanillaos_snapdragonx_profile == $profile' \
     "$recipe_target" >/dev/null || \
     die "Generated profile-specific Vanilla Installer recipe failed validation."
+  jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg profile "$PROFILE" \
+    '.images.default == $image and .vanillaos_snapdragonx_profile == $profile' \
+    "$recipe_source" >/dev/null || \
+    die "Canonical Vanilla Installer recipe is not bound to the profile image."
+  cmp -s "$recipe_source" "$recipe_target" || \
+    die "Canonical and profile Vanilla Installer recipes differ after binding."
+  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1' "$installer_dispatch" || \
+    die "Stock Vanilla Installer executable was not routed through the profile wrapper."
+  [[ -x "$installer_real" && -s "$installer_real" ]] || \
+    die "Private real Vanilla Installer executable is absent or non-executable."
 
   write_installer_storage_guard "$root"
   patch_vanilla_installer_processor "$root"
 
   {
+    printf 'canonical-installer-recipe\t%s\tnot-applicable\t%s\tgenerated-profile-binding\n' \
+      "/etc/vanilla-installer/recipe.json" \
+      "$(sha256sum "$recipe_source" | awk '{print $1}')"
+    printf 'profile-installer-recipe\t%s\tnot-applicable\t%s\tgenerated-profile-binding\n' \
+      "/etc/vanilla-installer/profiles/$PROFILE/recipe.json" \
+      "$(sha256sum "$recipe_target" | awk '{print $1}')"
+    printf 'installer-dispatch\t%s\tnot-applicable\t%s\tgenerated-profile-binding\n' \
+      "/usr/bin/vanilla-installer" \
+      "$(sha256sum "$installer_dispatch" | awk '{print $1}')"
+    printf 'installer-real-entrypoint\t%s\tnot-applicable\t%s\tupstream-preserved\n' \
+      "/usr/libexec/vanilla-installer.real" \
+      "$(sha256sum "$installer_real" | awk '{print $1}')"
     printf 'external-storage-guard\t%s\tnot-applicable\t%s\tgenerated\n' \
       "/usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
       "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard" | awk '{print $1}')"
@@ -8314,6 +8990,7 @@ remaster_boot_hardware_only() {
   # Embed installer-side profile metadata and patch the installer before the
   # live squashfs is rebuilt. This does not alter package manifests.
   install_profile_aware_installer_overlay "$squash_root"
+  configure_live_gdm_timed_login "$squash_root"
 
   [[ -s "$squash_root/boot/vmlinuz-$KERNEL_RELEASE" ]] || \
     die "Live squashfs lacks /boot/vmlinuz-$KERNEL_RELEASE after package extraction."
@@ -8401,7 +9078,13 @@ remaster_boot_hardware_only() {
 
   rm -f "$new_squash"
   mksquashfs "$squash_root" "$new_squash" -noappend -comp "$compression" >/dev/null
-  mv "$new_squash" "$iso_tree/live/filesystem.squashfs"
+
+  # xorriso extraction preserves the upstream squashfs mode (normally 0444).
+  # A plain mv to that path can invoke GNU mv's terminal overwrite prompt even
+  # under an otherwise non-interactive build. Remove the extracted destination
+  # first so replacement is deterministic and Stage 12 never waits for input.
+  rm -f -- "$iso_tree/live/filesystem.squashfs"
+  mv -- "$new_squash" "$iso_tree/live/filesystem.squashfs"
 
   if [[ -f "$iso_tree/live/filesystem.size" ]]; then
     du -sx --block-size=1 "$squash_root" | awk '{print $1}' > "$iso_tree/live/filesystem.size"
@@ -8534,6 +9217,35 @@ verify_final_release() {
     '.images.default == $image' "$verify_dir/installer-recipe.json" >/dev/null || \
     die "Final ISO installer recipe does not default to the resolved profile image."
   extract_required_squashfs_file "$final_squash" \
+    "etc/vanilla-installer/recipe.json" \
+    "$verify_dir/installer-recipe-canonical.json" \
+    "canonical installer recipe"
+  jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg profile "$PROFILE" \
+    '.images.default == $image and .vanillaos_snapdragonx_profile == $profile' \
+    "$verify_dir/installer-recipe-canonical.json" >/dev/null || \
+    die "Final ISO canonical installer recipe is not bound to the embedded/profile image."
+  cmp -s "$verify_dir/installer-recipe.json" "$verify_dir/installer-recipe-canonical.json" || \
+    die "Final ISO canonical and profile installer recipes differ."
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    ! grep -Fq 'ghcr.io/vanilla-os/gnome:latest' "$verify_dir/installer-recipe-canonical.json" || \
+      die "Final ISO canonical recipe still exposes the stock gnome:latest default in iso-oci mode."
+  fi
+  extract_required_squashfs_file "$final_squash" \
+    "usr/bin/vanilla-installer" \
+    "$verify_dir/installer-dispatch" \
+    "canonical Vanilla Installer dispatch"
+  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1' "$verify_dir/installer-dispatch" || \
+    die "Final ISO /usr/bin/vanilla-installer does not dispatch through the profile wrapper."
+  grep -Fq "/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" "$verify_dir/installer-dispatch" || \
+    die "Final ISO installer dispatch targets the wrong profile wrapper."
+  extract_required_squashfs_file "$final_squash" \
+    "usr/libexec/vanilla-installer.real" \
+    "$verify_dir/installer-real" \
+    "private real Vanilla Installer entrypoint"
+  [[ -s "$verify_dir/installer-real" ]] || \
+    die "Final ISO private real Vanilla Installer entrypoint is empty."
+  extract_required_squashfs_file "$final_squash" \
     "usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" \
     "$verify_dir/installer-wrapper" \
     "profile installer wrapper"
@@ -8551,6 +9263,8 @@ verify_final_release() {
     "Albius guard launcher"
   grep -Fq "VANILLA_CUSTOM_RECIPE" "$verify_dir/installer-wrapper" || \
     die "Final ISO lacks the profile installer wrapper."
+  grep -Fq "/usr/libexec/vanilla-installer.real" "$verify_dir/installer-wrapper" || \
+    die "Final ISO profile wrapper does not invoke the private real Installer entrypoint."
   grep -Fq "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1" "$verify_dir/storage-guard" || \
     die "Final ISO lacks the external storage guard."
   grep -Fq "manual-partition-luks" "$verify_dir/storage-validator" || \
@@ -8563,8 +9277,8 @@ verify_final_release() {
     die "Final ISO Albius launcher does not enforce the storage guard."
   python3 "$verify_dir/storage-guard" --self-test >/dev/null || \
     die "Final ISO storage guard failed its synthetic regression suite."
-  bash -n "$verify_dir/installer-wrapper" "$verify_dir/storage-validator" \
-    "$verify_dir/albius-wrapper"
+  bash -n "$verify_dir/installer-dispatch" "$verify_dir/installer-wrapper" \
+    "$verify_dir/storage-validator" "$verify_dir/albius-wrapper"
   extract_required_squashfs_file "$final_squash" \
     "usr/share/vanillaos-snapdragonx/profiles/$PROFILE/profile.resolved.json" \
     "$verify_dir/profile.resolved.json" \
@@ -8577,16 +9291,21 @@ verify_final_release() {
   xorriso -indev "$FINAL_ISO" -report_el_torito as_mkisofs > "$el_torito" 2>&1
   grep -Fq -- "-e '/boot/grub/efi.img'" "$el_torito" || die "Final ISO lacks the expected ARM64 El Torito EFI image."
 
+  verify_final_live_gdm_timed_login
+
   sha256sum "$FINAL_ISO" > "$FINAL_ISO.sha256"
   cp -a "$TMP_ROOT/upstream-package-lists.original.before.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-package-lists.original.after.sha256" "$RELEASE_DIR/"
-  cp -a "$TMP_ROOT/arm64-package-lists.derived.before.sha256" "$RELEASE_DIR/"
-  cp -a "$TMP_ROOT/arm64-package-lists.derived.after.sha256" "$RELEASE_DIR/"
-  cp -a "$TMP_ROOT/arm64-package-list-exclusions.tsv" "$RELEASE_DIR/"
-  cp -a "$TMP_ROOT/arm64-package-list-projection.expected.tsv" "$RELEASE_DIR/"
-  cp -a "$TMP_ROOT/arm64-package-list-packages.tsv" "$RELEASE_DIR/"
-  [[ -n "$LIVE_PACKAGE_CANDIDATE_REPORT" && -f "$LIVE_PACKAGE_CANDIDATE_REPORT" ]] &&     cp -a "$LIVE_PACKAGE_CANDIDATE_REPORT" "$RELEASE_DIR/"
+  if [[ "$LIVE_ARM64_PACKAGE_POLICY" == "legacy-projection" ]]; then
+    cp -a "$TMP_ROOT/arm64-package-lists.derived.before.sha256" "$RELEASE_DIR/"
+    cp -a "$TMP_ROOT/arm64-package-lists.derived.after.sha256" "$RELEASE_DIR/"
+    cp -a "$TMP_ROOT/arm64-package-list-exclusions.tsv" "$RELEASE_DIR/"
+    cp -a "$TMP_ROOT/arm64-package-list-projection.expected.tsv" "$RELEASE_DIR/"
+    cp -a "$TMP_ROOT/arm64-package-list-packages.tsv" "$RELEASE_DIR/"
+    [[ -n "$LIVE_PACKAGE_CANDIDATE_REPORT" && -f "$LIVE_PACKAGE_CANDIDATE_REPORT" ]] &&       cp -a "$LIVE_PACKAGE_CANDIDATE_REPORT" "$RELEASE_DIR/"
+  fi
   [[ -n "$SOURCE_PROVENANCE_MANIFEST" && -f "$SOURCE_PROVENANCE_MANIFEST" ]] &&     cp -a "$SOURCE_PROVENANCE_MANIFEST" "$RELEASE_DIR/"
+  [[ -n "$REUNION_CONVERGENCE_MANIFEST" && -f "$REUNION_CONVERGENCE_MANIFEST" ]] &&     cp -a "$REUNION_CONVERGENCE_MANIFEST" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
@@ -8633,7 +9352,11 @@ Build reference:          $TARGET_IMAGE_REF
 Manifest digest:          $TARGET_IMAGE_MANIFEST_DIGEST
 Storage hook evidence:    target-storage-hook-evidence.json
 ABRoot image name:        $ABROOT_IMAGE_NAME
-Base image:               $CUSTOM_IMAGE_BASE
+Upstream base image:      $CUSTOM_IMAGE_BASE
+Local target build ref:   $TARGET_IMAGE_REF
+ABRoot logical identity:  $ABROOT_IMAGE_NAME
+ABRoot future locator:    $(jq -r '[(.registry // ""),(.name // ""),(.tag // "")] | join(" / ")' "$TARGET_ABROOT_CONFIG_EVIDENCE")
+Installation provenance:  $(jq -r '.installation_provenance' "$TMP_ROOT/embedded-target-image.json")
 Profile:                  $PROFILE
 Profile display name:     $PROFILE_DISPLAY_NAME
 Kernel:                   $KERNEL_RELEASE
@@ -8722,10 +9445,16 @@ live-iso source ref:         $LIVE_ISO_REF
 live-iso source commit:      $LIVE_SOURCE_COMMIT
 live-iso commit date:        $(repo_commit_iso_date "$LIVE_ISO_SOURCE")
 Source provenance record:    source-provenance.tsv
+Reunion convergence record:  reunion-convergence.tsv
 Upstream package-list suffix:$LIVE_PACKAGE_LIST_SOURCE_SUFFIX
-ARM64 package-list suffix:   $LIVE_ARM64_PACKAGE_LIST_SUFFIX
-ARM64 exclusions:            $LIVE_ARM64_EXCLUDE_PACKAGES
-ARM64 candidate report:      package-candidates.tsv
+Live ARM64 package policy:   $LIVE_ARM64_PACKAGE_POLICY
+Legacy package-list suffix:  $LIVE_ARM64_PACKAGE_LIST_SUFFIX
+Legacy exclusions:           $LIVE_ARM64_EXCLUDE_PACKAGES
+ARM64 candidate report:      $([[ "$LIVE_ARM64_PACKAGE_POLICY" == "legacy-projection" ]] && printf package-candidates.tsv || printf not-applicable-upstream-native)
+Live GDM timed-login delay:  ${LIVE_GDM_TIMED_LOGIN_DELAY}s
+Target userland coherence:   target-userland-coherence.txt
+Target ABRoot evidence:      target-abroot.json
+Target base inspect:         target-base-inspect.json
 ARM64 baseline ISO:          $UPSTREAM_ISO
 Final ISO:                   $FINAL_ISO
 Live package manifests:      byte-identical to accepted ARM64 baseline
@@ -8762,6 +9491,8 @@ main() {
   parse_args "$@"
   recompute_paths
   setup_directories
+  normalize_live_arm64_package_policy
+  validate_live_gdm_timed_login_settings
   write_resolved_profile
 
   [[ "$INTERACTIVE_MODE" != "auto" ]] || {
@@ -8817,7 +9548,7 @@ main() {
   stage "7/13 Preparing the official custom-image-derived hardware recipe"
   prepare_custom_image_project
 
-  stage "8/13 Building and verifying the desktop:dev-derived target OCI"
+  stage "8/13 Building and verifying the Reunion gnome-derived target OCI"
   build_target_oci
 
   stage "9/13 Exporting the verified target OCI for installer delivery"
