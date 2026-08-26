@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v5.0.1.sh
+# build-vanilla-arm64-release-v6.0.0.sh
 #
-# Conception Vanilla ARM64 Installer ISO Builder
-# Version: 4.0.0
+# Conception VanillaOS ARM64 OCI-First Dev Release Builder
+# Version: 6.0.0
 #
 # Purpose:
-#   Deterministically build the upstream VanillaOS installer-only ARM64 UEFI ISO
-#   from the proven vanilla-arm/live-iso ARM64 fork, local board-specific artifacts, and optional
-#   staged Qualcomm firmware, while preserving release provenance.
+#   Build a paired hardware-specific VanillaOS ARM64 desktop OCI image and
+#   installer ISO from official Vanilla-OS development sources. The supplied
+#   kernel packages, DTB, and Qualcomm firmware are injected into both the
+#   immutable target image and the live installer boot environment.
 #
 # Primary build host:
 #   Debian 13 VM on Apple Silicon / M3 Macintosh
@@ -29,7 +30,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="5.0.1"
+SCRIPT_VERSION="6.0.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -42,9 +43,9 @@ NORMALIZE_FIRMWARE_TO_USR_LIB="${NORMALIZE_FIRMWARE_TO_USR_LIB:-1}"
 STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
-LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:main}"
-LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
-LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.io/vanilla-os/pico:dev ghcr.io/vanilla-os/pico:latest debian:trixie}"
+LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
+LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-docker}"  # podman|docker
+LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-}"  # v6: no silent non-Pico fallback
 VERIFY_CUSTOM_KERNEL_IN_ISO="${VERIFY_CUSTOM_KERNEL_IN_ISO:-1}"
 INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE:-0}"
 INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE:-0}"
@@ -69,6 +70,8 @@ OCI_ARCHIVE_SHA256=""
 INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 FORCE_CLEAN_LIVE_BUILD="${FORCE_CLEAN_LIVE_BUILD:-1}"
 VERIFY_INSTALLER_RUNTIME_IN_ISO="${VERIFY_INSTALLER_RUNTIME_IN_ISO:-1}"
+VANILLA_DEV_PICO_IMAGE="${VANILLA_DEV_PICO_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
+VANILLA_DEV_DESKTOP_IMAGE="${VANILLA_DEV_DESKTOP_IMAGE:-ghcr.io/vanilla-os/desktop:dev}"
 
 # ----------------------------- UI helpers -----------------------------
 
@@ -106,6 +109,29 @@ hr() { printf '%s\n' '==========================================================
 # Current high-level stage, used by failure diagnostics.
 CURRENT_STAGE="startup"
 LAST_COMMAND_LOG=""
+
+unexpected_error() {
+  # Central failure reporter. Unlike a bare path-only trap, this records the
+  # stage, source line, expanded command, exit code, and the useful tail of the
+  # most recent command log. This is intentionally safe to call from ERR traps.
+  local rc="${1:-1}" line="${2:-unknown}" command="${3:-unknown}"
+  trap - ERR
+  fail "Unexpected failure during stage ${CURRENT_STAGE}."
+  printf 'Exit status: %s
+' "$rc" >&2
+  printf 'Script line: %s
+' "$line" >&2
+  printf 'Command: %s
+' "$command" >&2
+  if [[ -n "${LAST_COMMAND_LOG:-}" ]]; then
+    printf 'Most recent command log: %s
+' "$LAST_COMMAND_LOG" >&2
+    print_failure_tail "$LAST_COMMAND_LOG"
+  else
+    warn "No command log had been registered for this failure boundary."
+  fi
+  exit "$rc"
+}
 
 print_failure_tail() {
   local log="$1"
@@ -407,7 +433,7 @@ run_logged() {
     # Restore shell behavior for the rest of the builder.
     if [[ "$old_errtrace" -eq 1 ]]; then set -E; else set +E; fi
     if [[ "$old_errexit" -eq 1 ]]; then set -e; else set +e; fi
-    trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
+    trap 'unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
     if [[ "$status" -eq 0 ]]; then
       ok "$label completed successfully."
@@ -453,7 +479,7 @@ run_logged() {
   done
 }
 
-trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
+trap 'unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # -------------------------- string/path helpers ------------------------
 
@@ -625,15 +651,15 @@ TMP_DIR="$WORKDIR/tmp"
 STAGED_QCOM_DIR="$WORKDIR/staged-firmware/qcom/$PROFILE"
 PRESTAGED_QCOM_DIR="$WORKDIR/prestaged-firmware/$PROFILE"
 
-CORE_REPO_URL="${CORE_REPO_URL:-https://github.com/vanilla-arm/core-image}"
-DESKTOP_REPO_URL="${DESKTOP_REPO_URL:-https://github.com/vanilla-arm/desktop-image}"
-LIVE_REPO_URL="${LIVE_REPO_URL:-https://github.com/vanilla-arm/live-iso}"
-PICO_REPO_URL="${PICO_REPO_URL:-https://github.com/vanilla-arm/pico-image}"
+CORE_REPO_URL="${CORE_REPO_URL:-https://github.com/Vanilla-OS/core-image}"
+DESKTOP_REPO_URL="${DESKTOP_REPO_URL:-https://github.com/Vanilla-OS/desktop-image}"
+LIVE_REPO_URL="${LIVE_REPO_URL:-https://github.com/Vanilla-OS/live-iso}"
+PICO_REPO_URL="${PICO_REPO_URL:-https://github.com/Vanilla-OS/pico-image}"
 
 CORE_BRANCH="${CORE_BRANCH:-dev}"
 DESKTOP_BRANCH="${DESKTOP_BRANCH:-dev}"
-LIVE_BRANCH="${LIVE_BRANCH:-orchid}"
-PICO_BRANCH="${PICO_BRANCH:-main}"
+LIVE_BRANCH="${LIVE_BRANCH:-orchid}"  # official live-iso build branch; OCI images use :dev
+PICO_BRANCH="${PICO_BRANCH:-dev}"
 
 # Repository handling policy.
 # ask-once: ask for one policy and apply it to all existing repositories.
@@ -645,8 +671,8 @@ REPO_POLICY="${REPO_POLICY:-ask-once}"
 
 BUILD_DATE="$(date -u +%Y%m%d)"
 BUILD_COUNTER_FILE="$WORKDIR/.build-number"
-CORE_IMAGE_TAG="${CORE_IMAGE_TAG:-localhost/conception-vanilla-arm-core:${PROFILE}-${BUILD_DATE}}"
-TARGET_OCI_IMAGE="${TARGET_OCI_IMAGE:-localhost/conception-vanilla-arm-desktop:${PROFILE}-${BUILD_DATE}}"
+CORE_IMAGE_TAG="${CORE_IMAGE_TAG:-localhost/conception-vanilla-core-dev:${PROFILE}-${BUILD_DATE}}"
+TARGET_OCI_IMAGE="${TARGET_OCI_IMAGE:-localhost/conception-vanilla-desktop-dev:${PROFILE}-${BUILD_DATE}}"
 VANILLA_ARM_DESKTOP_IMAGE="${VANILLA_ARM_DESKTOP_IMAGE:-$TARGET_OCI_IMAGE}"
 
 # ------------------------------ logging --------------------------------
@@ -2821,7 +2847,7 @@ EOF
 # ------------------------------- build --------------------------------
 
 repair_known_vib_recipe_yaml() {
-  # Some Vanilla ARM source snapshots have contained malformed YAML indentation
+  # Some VanillaOS source snapshots have contained malformed YAML indentation
   # in recipe.yml. Vib can exit status 1 with no useful stdout/stderr when the
   # recipe cannot be parsed, which makes this failure difficult to diagnose.
   #
@@ -3108,7 +3134,7 @@ vib_deep_diagnostics() {
 
   if [[ "$old_errtrace" -eq 1 ]]; then set -E; else set +E; fi
   if [[ "$old_errexit" -eq 1 ]]; then set -e; else set +e; fi
-  trap 'rc=$?; fail "Unexpected failure at stage ${CURRENT_STAGE}, line ${LINENO}, exit status ${rc}."; [[ -n "${LAST_COMMAND_LOG:-}" ]] && print_failure_tail "$LAST_COMMAND_LOG"; exit "$rc"' ERR
+  trap 'unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
   print_failure_tail "$log"
   warn "Deep Vib diagnostics complete. Review: $log"
@@ -4777,100 +4803,129 @@ build_images() {
 }
 
 
-prepare_oci_v5_tree() {
-  # Prepare the hardware-specific immutable desktop image before the ISO.
-  # Artifact packages are authoritative; no kernel release is hard-coded.
+prepare_oci_v6_tree() {
+  # v6.0.0 principal architecture:
+  #   1. Rebase on the official Vanilla-OS dev repositories/images.
+  #   2. Inject hardware support into CORE, where VanillaOS owns kernel and
+  #      firmware composition, rather than bolting it onto the desktop layer.
+  #   3. Build DESKTOP on top of the locally generated hardware-aware core.
+  #
+  # The supplied artifacts directory remains authoritative. The exact kernel
+  # release is derived from the linux-image package payload and is never
+  # hard-coded in this harness.
   local core="$SOURCES_DIR/core-image"
   local desktop="$SOURCES_DIR/desktop-image"
-  local recipe="$desktop/recipe.yml"
+  local core_recipe="$core/recipe.yml"
+  local desktop_recipe="$desktop/recipe.yml"
   local kver dtb_name module
 
   [[ -d "$core/.git" ]] || die "core-image Git checkout is missing: $core"
   [[ -d "$desktop/.git" ]] || die "desktop-image Git checkout is missing: $desktop"
-  [[ -f "$recipe" ]] || die "desktop-image recipe is missing: $recipe"
+  [[ -f "$core_recipe" ]] || die "core-image recipe is missing: $core_recipe"
+  [[ -f "$desktop_recipe" ]] || die "desktop-image recipe is missing: $desktop_recipe"
 
   kver="$(resolve_custom_kernel_release)"
   dtb_name="$(basename "$PRIMARY_DTB")"
-  module="$desktop/modules/zz-conception-hardware.yml"
+  module="$core/modules/zz-conception-hardware.yml"
 
-  # Remove only builder-managed content from previous runs.
-  rm -rf "$desktop/includes.container/opt/vendor-kernel"
-  rm -rf "$desktop/includes.container/boot/dtbs"
-  rm -rf "$desktop/includes.container/usr/lib/firmware/qcom"
-  rm -rf "$desktop/includes.container/lib/firmware/qcom"
-  mkdir -p "$desktop/includes.container/opt/vendor-kernel" \
-           "$desktop/includes.container/boot/dtbs" \
-           "$desktop/includes.container/usr/lib/firmware" \
-           "$desktop/modules"
+  # Remove only builder-managed state from prior runs. Never remove or rewrite
+  # upstream modules other than the narrow recipe anchors below.
+  rm -rf "$core/includes.container/opt/vendor-kernel"
+  rm -rf "$core/includes.container/boot/dtbs"
+  rm -rf "$core/includes.container/usr/lib/firmware/qcom"
+  rm -rf "$core/includes.container/lib/firmware/qcom"
+  mkdir -p "$core/includes.container/opt/vendor-kernel" \
+           "$core/includes.container/boot/dtbs" \
+           "$core/includes.container/usr/lib/firmware" \
+           "$core/modules"
 
   for f in "${KERNEL_DEBS[@]}"; do
-    cp -a "$f" "$desktop/includes.container/opt/vendor-kernel/"
+    cp -a "$f" "$core/includes.container/opt/vendor-kernel/"
   done
   for f in "${DTB_FILES[@]}"; do
-    cp -a "$f" "$desktop/includes.container/boot/dtbs/"
+    cp -a "$f" "$core/includes.container/boot/dtbs/"
   done
   if [[ -d "$STAGED_QCOM_DIR" ]] && find "$STAGED_QCOM_DIR" -type f | grep -q .; then
-    rsync -a "$STAGED_QCOM_DIR"/ "$desktop/includes.container/usr/lib/firmware"/
-  fi
-  if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
-    mkdir -p "$desktop/includes.container/root"
-    rsync -a "$ROOT_OVERLAY_DIR"/ "$desktop/includes.container/root"/
+    # Firmware objects are copied directly into the immutable core image. They
+    # do not require synthetic .deb packaging because Vib addincludes makes
+    # includes.container part of the OCI filesystem before this module runs.
+    rsync -a "$STAGED_QCOM_DIR"/ "$core/includes.container/usr/lib/firmware"/
   fi
 
-  # Vib's shell module emits each command scalar as a Containerfile RUN.
-  # Use a folded YAML scalar so this entire hardware transaction becomes one
-  # POSIX shell command. A literal block (|) is unsafe here because current Vib
-  # splits its physical lines, causing assignments such as EXPECTED_KERNEL=...
-  # to be parsed as invalid top-level Containerfile instructions.
   cat >"$module" <<EOF_OCI_MODULE
 name: zz-conception-hardware
-type: shell
-commands:
-  - >-
-    set -eu;
-    EXPECTED_KERNEL='$kver';
-    EXPECTED_DTB='$dtb_name';
-    export DEBIAN_FRONTEND=noninteractive;
-    dpkg -i /opt/vendor-kernel/*.deb || apt-get -f install -y;
-    test -d "/lib/modules/\$EXPECTED_KERNEL";
-    test -e "/boot/vmlinuz-\$EXPECTED_KERNEL";
-    test -f "/boot/dtbs/\$EXPECTED_DTB";
-    mkdir -p /etc/initramfs-tools/conf.d;
-    printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-target-modules;
-    rm -f "/boot/initrd.img-\$EXPECTED_KERNEL";
-    update-initramfs -c -k "\$EXPECTED_KERNEL";
-    test -s "/boot/initrd.img-\$EXPECTED_KERNEL";
-    printf '%s\n' "\$EXPECTED_KERNEL" > /etc/conception-custom-kernel-release;
-    printf '%s\n' "\$EXPECTED_DTB" > /etc/conception-custom-dtb
+ type: shell
+ commands:
+   - >-
+     set -eu;
+     EXPECTED_KERNEL='$kver';
+     EXPECTED_DTB='$dtb_name';
+     export DEBIAN_FRONTEND=noninteractive;
+     dpkg -i /opt/vendor-kernel/*.deb || apt-get -f install -y;
+     test -d "/lib/modules/\$EXPECTED_KERNEL";
+     test -e "/boot/vmlinuz-\$EXPECTED_KERNEL";
+     test -f "/boot/dtbs/\$EXPECTED_DTB";
+     mkdir -p /etc/initramfs-tools/conf.d;
+     printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-target-modules;
+     rm -f "/boot/initrd.img-\$EXPECTED_KERNEL";
+     update-initramfs -c -k "\$EXPECTED_KERNEL";
+     test -s "/boot/initrd.img-\$EXPECTED_KERNEL";
+     printf '%s\n' "\$EXPECTED_KERNEL" > /etc/conception-custom-kernel-release;
+     printf '%s\n' "\$EXPECTED_DTB" > /etc/conception-custom-dtb
 EOF_OCI_MODULE
 
+  # Correct accidental leading spaces above if an editor or heredoc transport
+  # changes indentation; Vib requires top-level module keys at column zero.
+  sed -i 's/^ type:/type:/; s/^ commands:/commands:/; s/^   - /  - /' "$module"
 
-  # Insert the hardware module into the desktop recipe's package-module list,
-  # before cleanup, sysconf capture, and FsGuard finalization.
-  python3 - "$recipe" "$CORE_IMAGE_TAG" <<'PY_RECIPE'
+  python3 - "$core_recipe" "$desktop_recipe" "$CORE_IMAGE_TAG" <<'PY_RECIPE'
 from pathlib import Path
-import re
-import sys
-p=Path(sys.argv[1]); core=sys.argv[2]
-s=p.read_text()
-# Use the locally built core image as the actual desktop base.
-s=re.sub(r'(?m)^\s*base:\s*\S+\s*$', f'  base: {core}', s, count=1)
+import re, sys
+core_p=Path(sys.argv[1]); desk_p=Path(sys.argv[2]); local_core=sys.argv[3]
+core=core_p.read_text()
+desk=desk_p.read_text()
+
+# Official dev core is based on Pico :dev. Do not use :main/:latest because the
+# user has verified :dev executes correctly on the native ARM64 build host.
+core, n = re.subn(r'(?m)^(\s*base:)\s*\S+\s*$', r'\1 ghcr.io/vanilla-os/pico:dev', core, count=1)
+if n != 1:
+    raise SystemExit('Unable to set official core recipe base to pico:dev')
+
 inc='      - modules/zz-conception-hardware.yml'
-if inc not in s:
-    marker='      - modules/999-cleanup.yml'
-    if marker not in s:
-        raise SystemExit('desktop recipe lacks expected modules/999-cleanup.yml anchor')
-    s=s.replace(marker, inc+'\n'+marker, 1)
-p.write_text(s)
+if inc not in core:
+    anchor='      - modules/05-firmware.yml'
+    if anchor not in core:
+        raise SystemExit('core recipe lacks modules/05-firmware.yml anchor')
+    core=core.replace(anchor, anchor+'\n'+inc, 1)
+
+# Build the official desktop dev recipe on our local hardware-aware core.
+desk, n = re.subn(r'(?m)^(\s*base:)\s*\S+\s*$', r'\1 '+local_core, desk, count=1)
+if n != 1:
+    raise SystemExit('Unable to set desktop recipe base to local core image')
+
+core_p.write_text(core)
+desk_p.write_text(desk)
 PY_RECIPE
 
-  grep -Fq "base: $CORE_IMAGE_TAG" "$recipe" || die "Desktop recipe does not use local core image $CORE_IMAGE_TAG"
-  grep -Fq 'modules/zz-conception-hardware.yml' "$recipe" || die "Desktop recipe does not include hardware module"
-  grep -Fq "EXPECTED_KERNEL='$kver'" "$module" || die "Hardware module does not contain derived kernel release"
-  ok "Prepared hardware-specific desktop OCI recipe for kernel $kver and DTB $dtb_name."
+  grep -Fq 'base: ghcr.io/vanilla-os/pico:dev' "$core_recipe" \
+    || die "Core recipe does not use ghcr.io/vanilla-os/pico:dev"
+  grep -Fq 'modules/zz-conception-hardware.yml' "$core_recipe" \
+    || die "Core recipe does not include the hardware module"
+  grep -Fq "base: $CORE_IMAGE_TAG" "$desktop_recipe" \
+    || die "Desktop recipe does not use locally built core image $CORE_IMAGE_TAG"
+  grep -Fq "EXPECTED_KERNEL='$kver'" "$module" \
+    || die "Core hardware module does not contain derived kernel release $kver"
+  /bin/sh -n <(python3 - "$module" <<'PY_EXTRACT'
+import sys, yaml
+with open(sys.argv[1]) as f: d=yaml.safe_load(f)
+print(d['commands'][0])
+PY_EXTRACT
+  ) 2>/dev/null || warn "Unable to syntax-check generated hardware command with PyYAML; build-time checks remain authoritative."
+
+  ok "Prepared official VanillaOS dev OCI chain with custom core kernel $kver and DTB $dtb_name."
 }
 
-build_oci_images_v5() {
+build_oci_images_v6() {
   local core="$SOURCES_DIR/core-image"
   local desktop="$SOURCES_DIR/desktop-image"
 
@@ -4890,7 +4945,7 @@ build_oci_images_v5() {
   podman image exists "$TARGET_OCI_IMAGE" || die "Desktop OCI image was not created: $TARGET_OCI_IMAGE"
 }
 
-verify_and_export_target_oci_v5() {
+verify_and_export_target_oci_v6() {
   local kver dtb_name archive inspect_log
   kver="$(resolve_custom_kernel_release)"
   dtb_name="$(basename "$PRIMARY_DTB")"
@@ -4969,48 +5024,32 @@ image_architecture_matches_platform() {
 }
 
 select_live_iso_helper_image() {
-  # Pick the first image that can actually run /bin/bash for the requested
-  # platform. This avoids the observed failure where pico:main resolves to amd64
-  # on an aarch64 host and then fails with Exec format error.
+  # v6 deliberately follows the contributor-proven path. There is no fallback
+  # to Debian/Ubuntu helper containers: such a fallback may produce an ISO but
+  # no longer reproduces VanillaOS assumptions.
   local runtime="$1"
-  local candidate log status
-
-  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-helper-selection-$(date -u +%H%M%S).log"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-pico-dev-selection-$(date -u +%H%M%S).log"
   mkdir -p "$OUTPUT_DIR/logs"
 
+  [[ "$LIVE_ISO_CONTAINER_IMAGE" == "ghcr.io/vanilla-os/pico:dev" ]] \
+    || warn "Using operator override instead of validated pico:dev: $LIVE_ISO_CONTAINER_IMAGE"
+
   {
-    printf '### Live ISO helper image selection\n'
+    printf '### VanillaOS Pico dev validation\n'
     printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '### runtime: %s\n' "$runtime"
-    printf '### requested platform: %s\n' "$LIVE_ISO_CONTAINER_PLATFORM"
-    printf '### initial image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
-    printf '### candidates: %s\n\n' "$LIVE_ISO_CONTAINER_FALLBACK_IMAGES"
-  } >"$log"
+    printf '### image: %s\n\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    "$runtime" pull "$LIVE_ISO_CONTAINER_IMAGE"
+    "$runtime" run --rm --network host "$LIVE_ISO_CONTAINER_IMAGE" \
+      /bin/bash -lc 'set -e; uname -m; test "$(dpkg --print-architecture)" = arm64; echo PICO_DEV_ARM64_OK'
+  } >"$log" 2>&1 || {
+    fail "ghcr.io/vanilla-os/pico:dev could not execute as an ARM64 VanillaOS build environment."
+    fail "The build will not silently fall back to a generic Debian container."
+    print_failure_tail "$log"
+    return 1
+  }
 
-  for candidate in "$LIVE_ISO_CONTAINER_IMAGE" $LIVE_ISO_CONTAINER_FALLBACK_IMAGES; do
-    printf 'Testing live ISO helper image candidate: %s\n' "$candidate" >&2
-    {
-      printf '\n## Candidate: %s\n' "$candidate"
-      "$runtime" pull --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$candidate"
-      "$runtime" image inspect "$candidate" --format 'architecture={{.Architecture}} os={{.Os}}' || true
-      "$runtime" run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$candidate" /bin/bash -lc 'uname -m; command -v bash; echo LIVE_ISO_HELPER_OK'
-    } >>"$log" 2>&1
-    status=$?
-
-    if [[ "$status" -eq 0 ]] && image_architecture_matches_platform "$runtime" "$candidate" "$LIVE_ISO_CONTAINER_PLATFORM"; then
-      LIVE_ISO_CONTAINER_IMAGE="$candidate"
-      ok "Selected live ISO helper image: $LIVE_ISO_CONTAINER_IMAGE"
-      printf 'Selection log:\n  %s\n' "$log" >&2
-      return 0
-    fi
-
-    warn "Rejected live ISO helper image candidate: $candidate"
-  done
-
-  fail "No usable live ISO helper image found for $LIVE_ISO_CONTAINER_PLATFORM."
-  warn "Selection log: $log"
-  print_failure_tail "$log"
-  return 1
+  ok "Validated contributor-compatible ARM64 Pico dev helper image."
 }
 
 preflight_live_iso_container() {
@@ -5044,7 +5083,7 @@ preflight_live_iso_container() {
     printf '\n'
 
     printf '## image pull\n'
-    "$runtime" pull --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE"
+    "$runtime" pull "$LIVE_ISO_CONTAINER_IMAGE"
     printf '\n'
 
     printf '## local image inspection\n'
@@ -5056,7 +5095,7 @@ preflight_live_iso_container() {
     printf '\n'
 
     printf '## execution probe\n'
-    "$runtime" run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -lc 'uname -m; echo LIVE_ISO_CONTAINER_EXEC_OK'
+    "$runtime" run --rm --network host "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -lc 'set -e; test "$(dpkg --print-architecture)" = arm64; uname -m; echo LIVE_ISO_CONTAINER_EXEC_OK'
   } >"$log" 2>&1 || status=$?
 
   if [[ "$status" -ne 0 ]]; then
@@ -5104,7 +5143,7 @@ isolated to Stage 9." "1" \
 
 
 prepare_live_iso_v4_tree() {
-  # Configure the proven vanilla-arm/live-iso fork for an ARM64 installer-only
+  # Configure the official Vanilla-OS/live-iso tree for an ARM64 installer-only
   # build. Preserve the fork's native architecture-aware build.sh behavior.
   # The live medium remains an installer environment; the immutable installed
   # system is selected through Vanilla Installer's Custom Image workflow.
@@ -5125,39 +5164,30 @@ prepare_live_iso_v4_tree() {
   [[ -f "$conf" ]] || die "live-iso terraform.conf is missing: $conf"
   [[ -f "$build" ]] || die "live-iso build.sh is missing: $build"
 
-  # The vanilla-arm fork supports arm64 natively and uses BUILD_ARCH in its
-  # temporary and output paths. Set the architecture explicitly and verify the
-  # native behavior rather than rewriting the fork back into an upstream shape.
+  # Configure official live-iso for ARM64. The harness patches only the historical
+  # hard-coded output filename; package composition remains upstream-controlled.
   sed -i 's/^ARCH=.*/ARCH="arm64"/' "$conf"
   grep -q '^ARCH=' "$conf" || printf 'ARCH="arm64"\n' >>"$conf"
   sed -i 's/^PACKAGE_LISTS_SUFFIX=.*/PACKAGE_LISTS_SUFFIX="vanilla-installer"/' "$conf"
   grep -q '^PACKAGE_LISTS_SUFFIX=' "$conf" || printf 'PACKAGE_LISTS_SUFFIX="vanilla-installer"\n' >>"$conf"
 
-  grep -Fq 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build" || {
-    fail "The selected live-iso checkout lacks the vanilla-arm architecture-aware ISO output path."
-    fail "Expected build.sh to reference tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso"
-    return 1
-  }
+  # Official live-iso historically hard-coded the amd64 output path. Patch only
+  # that output move so the dev-era ARM64 build is archived correctly.
+  if ! grep -Fq 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build"; then
+    python3 - "$build" <<'PY_LIVE_BUILD'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); s=p.read_text()
+s=s.replace('tmp/amd64/live-image-amd64.hybrid.iso', 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso')
+s=s.replace('FNAME="VanillaOS-$VERSION-$CHANNEL.$YYYYMMDD$OUTPUT_SUFFIX"', 'FNAME="VanillaOS-$VERSION-$CHANNEL-$BUILD_ARCH.$YYYYMMDD$OUTPUT_SUFFIX"')
+p.write_text(s)
+PY_LIVE_BUILD
+  fi
+  grep -Fq 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build"     || die "Unable to make official live-iso output path architecture-aware"
 
-  # Keep the live package closure narrowly scoped to the graphical installer.
-  # The target desktop is not copied into filesystem.squashfs; it is installed
-  # from the ARM OCI image selected in Vanilla Installer.
-  mkdir -p "$pkgdir"
-  cat >"$runtime_list" <<'EOF_RUNTIME'
-# Graphical installer-session runtime only. The target immutable desktop is
-# deployed by Vanilla Installer from an OCI image.
-vanilla-installer
-gnome-shell
-gnome-session
-gnome-session-bin
-mutter
-mutter-common
-gdm3
-xwayland
-network-manager
-sudo
-dbus-x11
-EOF_RUNTIME
+  # Preserve the official live-iso package closure unchanged. The contributor-
+  # validated Pico :dev build already includes the graphical installer runtime.
+  rm -f "$runtime_list"
 
   # ARM64 CPU topology can omit socket information. The known Vanilla Installer
   # workaround is IGNORE_CPU=1. Apply it only to the live installer service and
@@ -5196,7 +5226,7 @@ VANILLA_ARM_DESKTOP_IMAGE=$VANILLA_ARM_DESKTOP_IMAGE
 EOF_DEFAULTS
 
   cat >"$motd" <<EOF_MOTD
-Conception Vanilla ARM64 installer
+Conception VanillaOS ARM64 installer
 
 If the graphical installer does not start automatically, run:
   vanilla-installer-arm64
@@ -5207,11 +5237,11 @@ EOF_MOTD
 
   grep -q '^ARCH="arm64"' "$conf" || die "Unable to set ARM64 in terraform.conf"
   grep -q '^PACKAGE_LISTS_SUFFIX="vanilla-installer"' "$conf" || die "Unable to select installer-only package lists"
-  [[ -s "$runtime_list" ]] || die "Installer runtime package list was not created"
+  [[ ! -e "$runtime_list" ]] || die "Builder-managed runtime list unexpectedly remains; refusing to alter official package closure"
   grep -q '^Environment=IGNORE_CPU=' "$override" || die "Installer system-service CPU override was not created"
   grep -q '^Environment=IGNORE_CPU=' "$user_override" || die "Installer user-service CPU override was not created"
   grep -Fq "$VANILLA_ARM_DESKTOP_IMAGE" "$defaults" || die "ARM desktop image default was not recorded"
-  ok "Prepared vanilla-arm live-iso tree for ARM64 custom-image installation."
+  ok "Prepared official Vanilla-OS live-iso tree for ARM64 custom-image installation."
 }
 
 patch_live_conf() {
@@ -5274,8 +5304,7 @@ build_iso() {
   set +e
   (
     cd "$live" || exit 97
-    "$runtime" run --privileged --platform "$LIVE_ISO_CONTAINER_PLATFORM" \
-      --network host \
+    "$runtime" run --privileged --network host \
       -i \
       -v /proc:/proc \
       -v "$PWD":/working_dir \
@@ -5496,7 +5525,7 @@ fi
 
 cat >&2 <<EOF
 
-Conception Vanilla ARM64 OCI-First Release Builder
+Conception VanillaOS ARM64 OCI-First Dev Release Builder
 Version: $SCRIPT_VERSION
 
 Primary host assumption:
@@ -5521,7 +5550,7 @@ EOF
 stage 1 12 "Checking host dependencies."
 check_dependencies
 
-stage 2 12 "Refreshing Vanilla ARM core, desktop, and live-ISO repositories."
+stage 2 12 "Refreshing official VanillaOS dev core, desktop, and live-ISO repositories."
 choose_repo_policy_once
 repair_source_tree_ownership_for_git
 sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
@@ -5538,21 +5567,21 @@ stage 5 12 "Staging Qualcomm firmware without modifying the build host."
 stage_qcom_firmware
 
 stage 6 12 "Preparing the OCI-first hardware-specific desktop recipe."
-prepare_oci_v5_tree
+prepare_oci_v6_tree
 
-stage 7 12 "Building hardware-specific Vanilla ARM core and desktop OCI images."
-build_oci_images_v5
+stage 7 12 "Building hardware-specific VanillaOS core and desktop OCI images."
+build_oci_images_v6
 
 stage 8 12 "Verifying and exporting the target desktop OCI image."
-verify_and_export_target_oci_v5
+verify_and_export_target_oci_v6
 
-stage 9 12 "Preparing the proven Vanilla ARM installer ISO source tree."
+stage 9 12 "Preparing the proven VanillaOS installer ISO source tree."
 prepare_live_iso_v4_tree
 release_id="$(next_release_id)"
 release_dir_preview="$RELEASES_DIR/${BUILD_DATE}-${release_id}-${PROFILE}"
 mkdir -p "$release_dir_preview/logs"
 cat >"$release_dir_preview/BUILD-PLAN.md" <<EOF
-# Conception Vanilla ARM64 OCI-First Build Plan
+# Conception VanillaOS ARM64 OCI-First Build Plan
 
 Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -5577,7 +5606,7 @@ EOF
 stage 10 12 "Staging the same kernel, DTB, firmware, installer guidance, and GRUB configuration into the ISO."
 stage_customizations
 
-stage 11 12 "Building the Vanilla ARM64 installer ISO."
+stage 11 12 "Building the VanillaOS64 installer ISO."
 build_iso
 
 stage 12 12 "Archiving and verifying the paired OCI and ISO release artifacts."
