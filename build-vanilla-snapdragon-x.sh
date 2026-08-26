@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.2.1
+# Version: 2.3.0
 #
 # Purpose:
 #   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.3.0"
 SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
 
 # -----------------------------
@@ -658,47 +658,345 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 # -----------------------------
-# Dependency validation
+# Dependency validation and guided remediation
 # -----------------------------
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || missing_cmds+=("$1")
 }
 
+refresh_container_engine() {
+  if command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE="podman"
+  elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE="docker"
+  else
+    CONTAINER_ENGINE=""
+  fi
+}
+
+apt_install_common_dependencies() {
+  # Debian 13 dependency path. This intentionally installs only host build tools.
+  # Qualcomm extraction tools remain isolated inside disposable containers.
+  local apt_bin=""
+  if command -v apt >/dev/null 2>&1; then
+    apt_bin="apt"
+  else
+    fail "apt was not found. This dependency installer is written for Debian/Ubuntu-style hosts."
+    return 1
+  fi
+
+  local sudo_prefix=()
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo_prefix=(sudo)
+    else
+      fail "This user is not root and sudo is unavailable; cannot install packages automatically."
+      return 1
+    fi
+  fi
+
+  cat >&2 <<EOF
+
+==================================================================
+APT Dependency Installation
+
+The builder will install missing Debian 13 host-side packages using apt.
+This does not install target firmware onto the host.
+
+Packages requested:
+  git curl ca-certificates gawk coreutils findutils tar gzip unzip
+  python3 podman docker.io xorriso genisoimage jq
+
+Purpose:
+  • git/curl/python3/coreutils: repository and manifest handling
+  • podman/docker.io: disposable containers and image builds
+  • xorriso/genisoimage: ISO inspection and verification
+  • jq: useful release/debug inspection; not required for manifest generation
+
+Select an action:
+
+  1) Install/refresh these packages with apt [DEFAULT]
+  2) Open an interactive shell before apt install
+  3) Skip apt installation and return to dependency check
+  4) Abort build
+==================================================================
+EOF
+  local choice=""
+  read -r -p "Selection [1]: " choice || true
+  choice="${choice:-1}"
+  case "$choice" in
+    1)
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        warn "Dry-run: would run apt update and apt install."
+        return 0
+      fi
+      "${sudo_prefix[@]}" "$apt_bin" update
+      "${sudo_prefix[@]}" "$apt_bin" install -y \
+        git curl ca-certificates gawk coreutils findutils tar gzip unzip \
+        python3 podman docker.io xorriso genisoimage jq
+      ;;
+    2|!)
+      open_interactive_shell "$WORKDIR"
+      ;;
+    3)
+      return 0
+      ;;
+    4|q|Q)
+      fail "User aborted during apt dependency installation."
+      exit "$EX_DEPENDENCY"
+      ;;
+    *)
+      warn "Invalid selection; returning to dependency check."
+      ;;
+  esac
+}
+
+install_vib_from_github_release() {
+  # Vib is distributed as a release binary by Vanilla OS. The resolver below
+  # avoids hard-coding a release asset name: it queries the latest release,
+  # selects a Linux asset matching the build host architecture, then installs
+  # the contained/direct vib executable into PATH.
+  # Sources checked while creating this revision:
+  #   - Vanilla OS docs: Vib is a single downloadable binary.
+  #   - Vanilla-OS/Vib README: build command is `vib build recipe.yml`.
+  local install_dir tmpdir api_url asset_url asset_name machine arch_regex sudo_prefix=()
+  api_url="https://api.github.com/repos/Vanilla-OS/Vib/releases/latest"
+  tmpdir="$TMP_DIR/vib-install-$$"
+  mkdir -p "$tmpdir"
+
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    install_dir="/usr/local/bin"
+  else
+    install_dir="$HOME/.local/bin"
+    mkdir -p "$install_dir"
+  fi
+
+  machine="$(uname -m)"
+  case "$machine" in
+    aarch64|arm64) arch_regex='(arm64|aarch64)' ;;
+    x86_64|amd64) arch_regex='(amd64|x86_64)' ;;
+    *) arch_regex="$machine" ;;
+  esac
+
+  cat >&2 <<EOF
+
+==================================================================
+Vib Installation
+
+Vib is required because the Vanilla image repositories use:
+  vib build recipe.yml
+
+The builder can download the latest Vib release from GitHub and install it.
+Install destination:
+  $install_dir/vib
+
+Host architecture detected:
+  $machine
+
+Select an action:
+
+  1) Download and install latest Vib release [DEFAULT]
+  2) Open an interactive shell to install Vib manually
+  3) Re-check PATH for an already-installed vib
+  4) Abort build
+==================================================================
+EOF
+  local choice=""
+  read -r -p "Selection [1]: " choice || true
+  choice="${choice:-1}"
+  case "$choice" in
+    1)
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        warn "Dry-run: would download and install Vib from GitHub releases."
+        return 0
+      fi
+      log "Querying latest Vib release metadata from GitHub."
+      curl -fsSL "$api_url" -o "$tmpdir/release.json"
+      asset_url="$(python3 - "$tmpdir/release.json" "$arch_regex" <<'PY'
+import json, re, sys
+path, arch_regex = sys.argv[1], sys.argv[2]
+data = json.load(open(path, 'r', encoding='utf-8'))
+assets = data.get('assets', [])
+linux = []
+for a in assets:
+    name = a.get('name','')
+    url = a.get('browser_download_url','')
+    if not url:
+        continue
+    n = name.lower()
+    if 'linux' in n and re.search(arch_regex, n, re.I):
+        linux.append((name, url))
+for name, url in linux:
+    if re.search(r'vib', name, re.I):
+        print(url)
+        sys.exit(0)
+if linux:
+    print(linux[0][1])
+    sys.exit(0)
+for a in assets:
+    name = a.get('name','')
+    url = a.get('browser_download_url','')
+    if url and re.search(arch_regex, name, re.I):
+        print(url)
+        sys.exit(0)
+print('')
+PY
+)"
+      if [[ -z "$asset_url" ]]; then
+        fail "Could not identify a suitable Vib release asset for architecture regex: $arch_regex"
+        echo "Open https://github.com/Vanilla-OS/Vib/releases and install vib manually, then rerun." | tee -a "$LOG_FILE"
+        return 1
+      fi
+      asset_name="${asset_url##*/}"
+      log "Downloading Vib asset: $asset_name"
+      curl -fL "$asset_url" -o "$tmpdir/$asset_name"
+
+      case "$asset_name" in
+        *.tar.gz|*.tgz)
+          tar -xzf "$tmpdir/$asset_name" -C "$tmpdir"
+          ;;
+        *.zip)
+          unzip -q "$tmpdir/$asset_name" -d "$tmpdir"
+          ;;
+        *)
+          cp "$tmpdir/$asset_name" "$tmpdir/vib"
+          ;;
+      esac
+
+      local vib_candidate=""
+      vib_candidate="$(find "$tmpdir" \( -type f -name 'vib' -o -name 'Vib' \) | head -1 || true)"
+      if [[ -z "$vib_candidate" ]]; then
+        vib_candidate="$(find "$tmpdir" -type f -iname '*vib*' | head -1 || true)"
+      fi
+      if [[ -z "$vib_candidate" ]]; then
+        fail "Downloaded Vib asset did not contain an identifiable vib executable."
+        open_interactive_shell "$tmpdir"
+        return 1
+      fi
+      chmod +x "$vib_candidate"
+      if [[ ! -w "$install_dir" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+          sudo_prefix=(sudo)
+        else
+          fail "Install directory is not writable and sudo is unavailable: $install_dir"
+          return 1
+        fi
+      fi
+      "${sudo_prefix[@]}" install -m 0755 "$vib_candidate" "$install_dir/vib"
+      hash -r || true
+      if ! command -v vib >/dev/null 2>&1; then
+        warn "Vib was installed to $install_dir but is not currently in PATH."
+        warn "Add this to PATH or rerun with PATH=$install_dir:\$PATH"
+        return 1
+      fi
+      ok "Vib installed: $(command -v vib)"
+      ;;
+    2|!)
+      open_interactive_shell "$WORKDIR"
+      ;;
+    3)
+      return 0
+      ;;
+    4|q|Q)
+      fail "User aborted during Vib installation."
+      exit "$EX_DEPENDENCY"
+      ;;
+    *)
+      warn "Invalid selection; returning to dependency check."
+      ;;
+  esac
+}
+
+check_host_dependencies_once() {
+  missing_cmds=()
+  for c in git curl sed awk find sort sha256sum date tee stat cp mkdir rm chmod grep tar gzip python3; do
+    need_cmd "$c"
+  done
+  refresh_container_engine
+  if [[ -z "$CONTAINER_ENGINE" ]]; then
+    missing_cmds+=("podman-or-docker")
+  fi
+  if ! command -v vib >/dev/null 2>&1; then
+    missing_cmds+=("vib")
+  fi
+  if ! command -v isoinfo >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
+    missing_cmds+=("isoinfo-or-xorriso")
+  fi
+}
+
+remediate_dependencies() {
+  local choice=""
+  while true; do
+    check_host_dependencies_once
+    if [[ ${#missing_cmds[@]} -eq 0 ]]; then
+      ok "Dependencies available. Container engine: $CONTAINER_ENGINE"
+      return 0
+    fi
+
+    fail "Missing required tools: ${missing_cmds[*]}"
+    cat >&2 <<EOF
+
+==================================================================
+Dependency Remediation
+
+The builder cannot continue until required host tools are available.
+
+Missing:
+  ${missing_cmds[*]}
+
+Recommended action for Debian 13:
+  1) Install apt-managed tools, then install/resolve Vib [DEFAULT]
+
+Other actions:
+  2) Install apt-managed tools only
+  3) Install/resolve Vib only
+  4) Open an interactive shell to fix dependencies manually
+  5) Re-check dependencies
+  6) Abort build
+
+Notes:
+  • xorriso or genisoimage supplies ISO inspection capability.
+  • Vib is not treated as an apt package here; it is resolved from the
+    Vanilla-OS/Vib GitHub release path or by manual shell install.
+  • Qualcomm extraction dependencies are installed inside disposable containers,
+    not on this build host.
+==================================================================
+EOF
+    read -r -p "Selection [1]: " choice || true
+    choice="${choice:-1}"
+    case "$choice" in
+      1)
+        apt_install_common_dependencies || true
+        if ! command -v vib >/dev/null 2>&1; then
+          install_vib_from_github_release || true
+        fi
+        ;;
+      2)
+        apt_install_common_dependencies || true
+        ;;
+      3)
+        install_vib_from_github_release || true
+        ;;
+      4|!)
+        open_interactive_shell "$WORKDIR"
+        ;;
+      5)
+        ;;
+      6|q|Q)
+        fail "Dependency remediation aborted by user."
+        exit "$EX_DEPENDENCY"
+        ;;
+      \?)
+        ;;
+      *)
+        warn "Invalid selection: '$choice'. Please enter a number from 1 through 6."
+        ;;
+    esac
+  done
+}
+
 log "Checking host dependencies."
-missing_cmds=()
-for c in git curl sed awk find sort sha256sum date tee stat cp mkdir rm chmod grep tar python3; do
-  need_cmd "$c"
-done
-if command -v podman >/dev/null 2>&1; then
-  CONTAINER_ENGINE="podman"
-elif command -v docker >/dev/null 2>&1; then
-  CONTAINER_ENGINE="docker"
-else
-  missing_cmds+=("podman-or-docker")
-fi
-if ! command -v vib >/dev/null 2>&1; then
-  missing_cmds+=("vib")
-fi
-if ! command -v isoinfo >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
-  missing_cmds+=("isoinfo-or-xorriso")
-fi
-
-if [[ ${#missing_cmds[@]} -gt 0 ]]; then
-  fail "Missing required tools: ${missing_cmds[*]}"
-  cat <<'DEPS' | tee -a "$LOG_FILE"
-Suggested Debian 13 packages for common tools:
-  sudo apt update
-  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 podman docker.io xorriso genisoimage
-
-Additional builder requirement:
-  vib must be installed according to Vanilla OS build tooling instructions.
-
-Qualcomm firmware extraction dependencies are installed only inside an isolated disposable container when enabled:
-  7zip msitools unzip curl ca-certificates zstd
-DEPS
-  exit "$EX_DEPENDENCY"
-fi
-ok "Dependencies available. Container engine: $CONTAINER_ENGINE"
+remediate_dependencies
 
 # -----------------------------
 # Artifact validation
