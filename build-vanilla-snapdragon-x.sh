@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.0.sh
+# build-vanilla-arm64-release-v2.7.1.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.0
+# Version: 2.7.1
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.7.1"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2411,12 +2411,143 @@ vib_preflight() {
 }
 
 
+
+patch_known_unavailable_packages_before_vib() {
+  # Vib consumes modules/*.yml before it generates the Containerfile. Therefore
+  # unavailable package removal must happen before `vib build recipe.yml`.
+  #
+  # This function is deliberately narrower than the post-Vib generated-context
+  # patcher: it touches only Vib input YAML files and validates apt module shape
+  # immediately. This prevents:
+  #   json: cannot unmarshal string into Go struct field AptModule.sources of type api.Source
+  local repo="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-pre-vib-unavailable-package-patch-$(date -u +%H%M%S).log"
+  local pkg file backup tmp changed_any=0
+
+  [[ "$ALLOW_MISSING_OPTIONAL_PACKAGES" == "1" ]] || return 0
+  mkdir -p "$OUTPUT_DIR/logs"
+  : > "$log"
+
+  printf 'Pre-Vib unavailable package YAML patch log\n' >>"$log"
+  printf 'Repository: %s\n' "$repo" >>"$log"
+  printf 'Packages: %s\n\n' "$KNOWN_UNAVAILABLE_PACKAGES" >>"$log"
+
+  for pkg in $KNOWN_UNAVAILABLE_PACKAGES; do
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      grep -qw -- "$pkg" "$file" || continue
+
+      backup="$file.builder-backup-previb-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
+      tmp="$file.builder-patched.$$"
+
+      if python3 - "$file" "$tmp" "$pkg" <<'PY'
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+pkg = sys.argv[3]
+
+try:
+    import yaml
+except Exception as exc:
+    print(f"ERROR: PyYAML import failed: {exc}", file=sys.stderr)
+    sys.exit(10)
+
+data = yaml.safe_load(src.read_text(encoding="utf-8"))
+changed = False
+
+def remove_pkg(obj):
+    global changed
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "packages" and isinstance(v, list):
+                nv = [x for x in v if x != pkg]
+                if len(nv) != len(v):
+                    obj[k] = nv
+                    changed = True
+            else:
+                remove_pkg(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            remove_pkg(item)
+
+remove_pkg(data)
+
+if not changed:
+    sys.exit(2)
+
+def validate_apt_shape(obj, path="root"):
+    if isinstance(obj, dict):
+        if obj.get("type") == "apt":
+            sources = obj.get("sources")
+            if not isinstance(sources, list):
+                raise TypeError(f"{path}.sources must be list, got {type(sources).__name__}")
+            for i, source in enumerate(sources):
+                if not isinstance(source, dict):
+                    raise TypeError(f"{path}.sources[{i}] must be mapping, got {type(source).__name__}")
+                packages = source.get("packages")
+                if packages is not None and not isinstance(packages, list):
+                    raise TypeError(f"{path}.sources[{i}].packages must be list, got {type(packages).__name__}")
+        for k, v in obj.items():
+            validate_apt_shape(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            validate_apt_shape(item, f"{path}[{i}]")
+
+validate_apt_shape(data)
+
+# Use block style. PyYAML may alter comments/formatting, but preserves structure.
+dst.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False), encoding="utf-8")
+sys.exit(0)
+PY
+      then
+        cp -a "$file" "$backup"
+        mv "$tmp" "$file"
+        changed_any=1
+        {
+          printf 'PATCHED pre-Vib YAML package: %s\n' "$pkg"
+          printf 'File: %s\n' "$file"
+          printf 'Backup: %s\n' "$backup"
+          printf 'Diff:\n'
+          diff -u "$backup" "$file" || true
+          printf '\n'
+        } >>"$log"
+        warn "Pre-Vib removed optional unavailable package '$pkg' from $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+      else
+        rc=$?
+        rm -f "$tmp"
+        if [[ "$rc" -ne 2 ]]; then
+          fail "Pre-Vib YAML package patch failed for $file"
+          print_failure_tail "$log"
+          return "$rc"
+        fi
+      fi
+    done < <(
+      {
+        [[ -d "$repo/modules" ]] && grep -RIl -- "$pkg" "$repo/modules" 2>/dev/null || true
+        [[ -f "$repo/recipe.yml" ]] && grep -Il -- "$pkg" "$repo/recipe.yml" 2>/dev/null || true
+      } | grep -E '\.(ya?ml)$' | sort -u
+    )
+  done
+
+  validate_vib_apt_module_yaml_shapes "$repo" "$label" "$log" || return $?
+
+  if [[ "$changed_any" -eq 1 ]]; then
+    warn "Pre-Vib unavailable package patch applied. Log: $log"
+  else
+    ok "No pre-Vib unavailable package tokens found for $label."
+  fi
+}
+
 run_vib_build_with_diagnostics() {
   local label="$1"
   local workdir="$2"
   local action
 
   while true; do
+    patch_known_unavailable_packages_before_vib "$workdir" "$safe"
     prepare_repo_for_vib_user "$workdir"
     if ! vib_preflight "$workdir" "$label"; then
       action="$(command_failure_menu "Vib preflight for $label" "$workdir" "$LAST_COMMAND_LOG" "1")"
@@ -2653,7 +2784,7 @@ PY
           return "$rc"
         fi
       fi
-    done < <(grep -RIl -- "$pkg" "$repo/modules" "$repo/sources" "$repo/recipe.yml" 2>/dev/null | grep -E '\.(ya?ml)$' || true)
+    done < <(false)
 
     # Patch generated Containerfile/Dockerfile text command lines only.
     while IFS= read -r file; do
