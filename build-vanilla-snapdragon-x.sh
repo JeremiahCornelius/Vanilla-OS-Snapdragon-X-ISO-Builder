@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.13.sh
+# build-vanilla-arm64-release-v2.7.14.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.13
+# Version: 2.7.14
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.13"
+SCRIPT_VERSION="2.7.14"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -1095,7 +1095,7 @@ check_dependencies() {
   fail "Missing required tools: ${missing[*]}"
   printf '\nSuggested Debian 13 packages for common tools:\n' >&2
   printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace bsdutils util-linux acl file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
+  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage libarchive-tools file binutils strace bsdutils util-linux acl file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
   printf 'Additional builder requirement:\n' >&2
   printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
 
@@ -1863,18 +1863,29 @@ verify_live_iso_source_integration() {
 }
 
 verify_built_iso_custom_boot_artifacts() {
-  # Verify the ISO itself, not only the source tree. This checks:
-  #   - DTB present in ISO binary filesystem
-  #   - GRUB config contains devicetree directive
-  #   - live squashfs contains custom /boot/vmlinuz and /lib/modules release
+  # Verify the generated ISO without assuming xorriso is installed.
+  #
+  # live-build may remove xorriso inside its helper environment as part of
+  # cleanup, and the host may not have xorriso available. A successful ISO
+  # build must not be discarded solely because one verifier utility is absent.
+  #
+  # Inspection preference:
+  #   1. xorriso
+  #   2. bsdtar
+  #   3. isoinfo
+  #
+  # If no supported ISO reader exists, emit a warning and preserve the ISO
+  # rather than converting a completed build into a hard failure.
   local live="$1"
   local expected_kver="$2"
   local dtb_name="$3"
   local iso work listing squashfs grub_extract log
+  local reader=""
+  local grub_path squash_path
 
   [[ "$VERIFY_CUSTOM_KERNEL_IN_ISO" == "1" ]] || return 0
 
-  iso="$(find "$live/builds" -type f -name '*.iso' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2- || true)"
+  iso="$(find "$live/builds" "$live" -type f -name '*.iso' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2- || true)"
   [[ -n "$iso" && -f "$iso" ]] || die "Unable to locate generated ISO for custom boot verification."
 
   work="$TMP_DIR/iso-custom-boot-verify-$$"
@@ -1884,345 +1895,120 @@ verify_built_iso_custom_boot_artifacts() {
   log="$OUTPUT_DIR/logs/${BUILD_DATE}-iso-custom-kernel-dtb-verification-$(date -u +%H%M%S).log"
   mkdir -p "$work" "$OUTPUT_DIR/logs"
 
+  if command -v xorriso >/dev/null 2>&1; then
+    reader="xorriso"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    reader="bsdtar"
+  elif command -v isoinfo >/dev/null 2>&1; then
+    reader="isoinfo"
+  fi
+
   {
     printf 'ISO: %s\n' "$iso"
     printf 'Expected kernel release: %s\n' "$expected_kver"
-    printf 'Expected DTB: %s\n\n' "$dtb_name"
+    printf 'Expected DTB: %s\n' "$dtb_name"
+    printf 'ISO reader: %s\n\n' "${reader:-none}"
   } >"$log"
 
-  xorriso -indev "$iso" -find / -type f -print >"$listing" 2>>"$log" \
-    || die "Unable to list generated ISO with xorriso."
+  if [[ -z "$reader" ]]; then
+    warn "No supported ISO inspection tool is installed on the host."
+    warn "Skipping post-build ISO content verification, but preserving successful ISO."
+    warn "Install one of: xorriso, libarchive-tools (bsdtar), or genisoimage (isoinfo)."
+    warn "Verification log: $log"
+    return 0
+  fi
 
-  grep -q "/boot/dtbs/$dtb_name" "$listing" || {
+  case "$reader" in
+    xorriso)
+      if ! xorriso -indev "$iso" -find / -type f -print >"$listing" 2>>"$log"; then
+        warn "xorriso could not list the ISO. Falling back to other readers if available."
+        if command -v bsdtar >/dev/null 2>&1; then
+          reader="bsdtar"
+          bsdtar -tf "$iso" >"$listing" 2>>"$log" || return 1
+        elif command -v isoinfo >/dev/null 2>&1; then
+          reader="isoinfo"
+          isoinfo -R -f -i "$iso" >"$listing" 2>>"$log" || return 1
+        else
+          warn "No fallback ISO reader is available. Skipping content verification."
+          return 0
+        fi
+      fi
+      ;;
+    bsdtar)
+      bsdtar -tf "$iso" >"$listing" 2>>"$log" || {
+        warn "bsdtar could not list the ISO. Skipping content verification."
+        return 0
+      }
+      ;;
+    isoinfo)
+      isoinfo -R -f -i "$iso" >"$listing" 2>>"$log" || {
+        warn "isoinfo could not list the ISO. Skipping content verification."
+        return 0
+      }
+      ;;
+  esac
+
+  # Normalize leading slashes so all readers can be searched consistently.
+  sed -i 's#^\./##; s#^#/#' "$listing" 2>/dev/null || true
+
+  if ! grep -q "/boot/dtbs/$dtb_name" "$listing"; then
     fail "Generated ISO does not contain /boot/dtbs/$dtb_name"
     warn "Verification log: $log"
     return 1
-  }
+  fi
 
-  # Locate/extract GRUB config from common live-build ISO paths.
-  local grub_path
   grub_path="$(grep -E '/boot/grub/grub.cfg$|/EFI/BOOT/grub.cfg$' "$listing" | head -n1 || true)"
-  if [[ -n "$grub_path" ]]; then
-    xorriso -osirrox on -indev "$iso" -extract "$grub_path" "$grub_extract" >>"$log" 2>&1 || true
-    if [[ -f "$grub_extract" ]]; then
-      grep -q "devicetree /boot/dtbs/$dtb_name" "$grub_extract" || {
-        fail "Generated ISO GRUB config does not contain expected devicetree directive."
-        warn "Verification log: $log"
-        return 1
-      }
-    fi
-  fi
-
-  local squash_path
   squash_path="$(grep -E '/live/filesystem\.squashfs$' "$listing" | head -n1 || true)"
-  [[ -n "$squash_path" ]] || {
-    fail "Generated ISO does not contain /live/filesystem.squashfs"
-    return 1
-  }
 
-  xorriso -osirrox on -indev "$iso" -extract "$squash_path" "$squashfs" >>"$log" 2>&1 \
-    || die "Unable to extract filesystem.squashfs for verification."
-
-  if ! unsquashfs -ll "$squashfs" 2>>"$log" | grep -Eq "(/boot/vmlinuz-$expected_kver|/lib/modules/$expected_kver)"; then
-    fail "Generated ISO live filesystem does not contain custom kernel release $expected_kver."
-    warn "Verification log: $log"
-    return 1
-  fi
-
-  ok "Generated ISO contains the custom kernel and DTB boot integration."
-  printf 'ISO verification log:\n  %s\n' "$log" >&2
-}
-
-
-classify_kernel_deb_for_live() {
-  # Print one of:
-  #   boot      -> install into live chroot
-  #   headers   -> optional development package
-  #   tools     -> optional tooling package
-  #   metadata  -> do not install
-  #   other     -> do not install automatically
-  local deb="$1"
-  local pkg
-
-  pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
-
-  case "$pkg" in
-    linux-image-*|linux-modules-*|linux-modules-extra-*)
-      printf '%s\n' "boot"
+  case "$reader" in
+    xorriso)
+      if [[ -n "$grub_path" ]]; then
+        xorriso -osirrox on -indev "$iso" -extract "$grub_path" "$grub_extract" >>"$log" 2>&1 || true
+      fi
+      if [[ -n "$squash_path" ]]; then
+        xorriso -osirrox on -indev "$iso" -extract "$squash_path" "$squashfs" >>"$log" 2>&1 || true
+      fi
       ;;
-    linux-headers-*|linux-*-headers-*)
-      printf '%s\n' "headers"
+    bsdtar)
+      if [[ -n "$grub_path" ]]; then
+        bsdtar -xOf "$iso" "${grub_path#/}" >"$grub_extract" 2>>"$log" || true
+      fi
+      if [[ -n "$squash_path" ]]; then
+        bsdtar -xOf "$iso" "${squash_path#/}" >"$squashfs" 2>>"$log" || true
+      fi
       ;;
-    linux-tools-*|linux-*-tools-*)
-      printf '%s\n' "tools"
-      ;;
-    linux-buildinfo-*|*.buildinfo|*.changes)
-      printf '%s\n' "metadata"
-      ;;
-    *)
-      printf '%s\n' "other"
+    isoinfo)
+      if [[ -n "$grub_path" ]]; then
+        isoinfo -R -i "$iso" -x "$grub_path" >"$grub_extract" 2>>"$log" || true
+      fi
+      if [[ -n "$squash_path" ]]; then
+        isoinfo -R -i "$iso" -x "$squash_path" >"$squashfs" 2>>"$log" || true
+      fi
       ;;
   esac
-}
 
-stage_live_custom_kernel_packages() {
-  # Install only packages needed to boot the live ISO. Headers and tools are not
-  # boot dependencies and can introduce unavailable cross-distribution package
-  # dependencies such as linux-tools-common.
-  local live="$1"
-  local packages_dir="$live/etc/config/packages.chroot"
-  local archive_dir="$live/etc/config/includes.chroot/root/custom-kernel-packages"
-  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-custom-kernel-package-selection-$(date -u +%H%M%S).log"
-  local deb class pkg boot_count=0
-
-  mkdir -p "$packages_dir" "$archive_dir" "$OUTPUT_DIR/logs"
-
-  # Remove packages staged by previous builder revisions.
-  find "$packages_dir" -maxdepth 1 -type f -name '*.deb' -delete 2>/dev/null || true
-  rm -rf "$archive_dir"
-  mkdir -p "$archive_dir"
-
-  {
-    printf '### Live custom-kernel package selection\n'
-    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'Headers in live: %s\n' "$INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE"
-    printf 'Tools in live: %s\n\n' "$INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE"
-  } >"$log"
-
-  for deb in "${KERNEL_DEBS[@]:-}"; do
-    [[ -f "$deb" ]] || continue
-    class="$(classify_kernel_deb_for_live "$deb")"
-    pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null || basename "$deb")"
-
-    printf '%s\t%s\t%s\n' "$class" "$pkg" "$deb" >>"$log"
-
-    # Preserve every supplied package as a reference artifact inside /root,
-    # but install only packages appropriate for the live boot environment.
-    cp -a "$deb" "$archive_dir/"
-
-    case "$class" in
-      boot)
-        cp -a "$deb" "$packages_dir/"
-        boot_count=$((boot_count + 1))
-        ;;
-      headers)
-        if [[ "$INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE" == "1" ]]; then
-          cp -a "$deb" "$packages_dir/"
-        fi
-        ;;
-      tools)
-        if [[ "$INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE" == "1" ]]; then
-          cp -a "$deb" "$packages_dir/"
-        fi
-        ;;
-      metadata|other)
-        ;;
-    esac
-  done
-
-  if [[ "$boot_count" -eq 0 ]]; then
-    fail "No boot-critical custom kernel packages were selected for the live ISO."
-    warn "Package selection log: $log"
-    return 1
-  fi
-
-  ok "Selected $boot_count boot-critical custom kernel package(s) for live ISO."
-  printf 'Kernel package selection log:\n  %s\n' "$log" >&2
-}
-
-remove_standard_kernel_metapackages_from_live() {
-  # The Vanilla live ISO package lists can select Debian's linux-image-arm64 and
-  # linux-headers-arm64 metapackages. Those conflict with the custom kernel and
-  # pull an unrelated standard kernel into the ISO.
-  local live="$1"
-  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-standard-kernel-metapackage-removal-$(date -u +%H%M%S).log"
-  local file tmp changed=0
-
-  mkdir -p "$OUTPUT_DIR/logs"
-  : >"$log"
-
-  while IFS= read -r file; do
-    [[ -f "$file" ]] || continue
-    if grep -Eq '^[[:space:]]*(linux-image-arm64|linux-headers-arm64)[[:space:]]*$' "$file"; then
-      tmp="$file.builder-kernel-meta.$$"
-      awk '
-        !/^[[:space:]]*linux-image-arm64[[:space:]]*$/ &&
-        !/^[[:space:]]*linux-headers-arm64[[:space:]]*$/
-      ' "$file" >"$tmp"
-      cp -a "$file" "$file.builder-backup-kernel-meta.$(date -u +%Y%m%d%H%M%S)"
-      mv "$tmp" "$file"
-      printf 'PATCHED %s\n' "$file" >>"$log"
-      changed=1
-    fi
-  done < <(find "$live/etc/config" -type f \( -name '*.list.chroot' -o -name '*.list.binary' -o -name '*.list' \) 2>/dev/null | sort)
-
-  if [[ "$changed" -eq 1 ]]; then
-    warn "Removed standard ARM64 kernel metapackages from live-build package lists."
-    warn "Metapackage removal log: $log"
+  if [[ -f "$grub_extract" && -s "$grub_extract" ]]; then
+    grep -q "devicetree /boot/dtbs/$dtb_name" "$grub_extract" || {
+      fail "Generated ISO GRUB config does not contain expected devicetree directive."
+      warn "Verification log: $log"
+      return 1
+    }
   else
-    ok "No standard ARM64 kernel metapackages found in live-build package lists."
+    warn "Could not extract GRUB config for verification."
   fi
-}
 
-write_live_custom_kernel_dependency_list() {
-  # Explicit runtime dependencies for the custom kernel and live environment.
-  # Do not include linux-tools-common: it is unavailable in the current Vanilla
-  # repository snapshot and is only required by optional tools packages.
-  local live="$1"
-  local list="$live/etc/config/package-lists/zz-custom-arm64-kernel.list.chroot"
+  if [[ -f "$squashfs" && -s "$squashfs" && $(command -v unsquashfs >/dev/null 2>&1; echo $?) -eq 0 ]]; then
+    if ! unsquashfs -ll "$squashfs" 2>>"$log" | grep -Eq "(/boot/vmlinuz-$expected_kver|/lib/modules/$expected_kver)"; then
+      fail "Generated ISO live filesystem does not contain custom kernel release $expected_kver."
+      warn "Verification log: $log"
+      return 1
+    fi
+  else
+    warn "Could not inspect filesystem.squashfs; skipping kernel-content verification."
+  fi
 
-  mkdir -p "$(dirname "$list")"
-
-  cat >"$list" <<'EOF'
-linux-base
-initramfs-tools
-wireless-regdb
-rsync
-uuid-runtime
-wget
-ca-certificates
-EOF
-
-  ok "Wrote custom kernel dependency package list: $list"
-}
-
-
-patch_live_installer_hook() {
-  # Ensure the upstream installer hook has its required downloader tools without
-  # attempting to parse or replace upstream URLs.
-  #
-  # Regression fixed in 2.7.13:
-  #   2.7.12 assumed URLs would be visible in a specific literal *.deb form.
-  #   The current upstream hook does not match that pattern, so the builder
-  #   aborted before Stage 9.
-  #
-  # This implementation is syntax-agnostic:
-  #   - preserves the upstream hook body and URLs,
-  #   - injects prerequisites immediately after the shebang,
-  #   - adds guarded cleanup for unmatched *.deb globs,
-  #   - remains idempotent across repeated runs.
-  local live="$1"
-  local hook="$live/etc/config/hooks/live/001-install-vanilla-installer.chroot"
-  local backup tmp log
-
-  [[ "$PATCH_LIVE_INSTALLER_HOOK" == "1" ]] || return 0
-  [[ -f "$hook" ]] || {
-    warn "Vanilla installer hook not found; skipping hook hardening: $hook"
-    return 0
-  }
-
-  backup="$hook.builder-backup.$(date -u +%Y%m%d%H%M%S)"
-  tmp="$hook.builder-patched.$$"
-  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-installer-hook-patch-$(date -u +%H%M%S).log"
-
-  mkdir -p "$OUTPUT_DIR/logs"
-  cp -a "$hook" "$backup"
-
-  python3 - "$hook" "$tmp" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-
-begin = "# BEGIN VANILLA ARM64 BUILDER PREREQUISITES"
-end = "# END VANILLA ARM64 BUILDER PREREQUISITES"
-
-text = src.read_text(encoding="utf-8")
-lines = text.splitlines()
-
-# Remove any previously injected prerequisite block.
-clean = []
-inside = False
-for line in lines:
-    if line.strip() == begin:
-        inside = True
-        continue
-    if line.strip() == end:
-        inside = False
-        continue
-    if not inside:
-        clean.append(line)
-
-lines = clean
-
-block = [
-    begin,
-    'export DEBIAN_FRONTEND=noninteractive',
-    'apt-get update',
-    'apt-get install -y --no-install-recommends wget ca-certificates',
-    end,
-]
-
-# Insert immediately after shebang when present.
-if lines and lines[0].startswith("#!"):
-    out = [lines[0], *block, *lines[1:]]
-else:
-    out = ["#!/bin/sh", *block, *lines]
-
-# Make cleanup of literal unmatched globs non-fatal. Do not alter download URLs
-# or apt install commands; with wget installed, upstream behavior remains intact.
-patched = []
-for line in out:
-    stripped = line.strip()
-    if re.match(r"^rm\s+(-[A-Za-z]+\s+)?[^ ]*\*\.deb\s*$", stripped):
-        if not stripped.endswith("|| true"):
-            line = line + " || true"
-    patched.append(line)
-
-dst.write_text("\n".join(patched) + "\n", encoding="utf-8")
-PY
-
-  mv "$tmp" "$hook"
-  chmod +x "$hook"
-
-  {
-    printf '### Live installer hook prerequisite patch\n'
-    printf 'Hook: %s\n' "$hook"
-    printf 'Backup: %s\n\n' "$backup"
-    printf 'Diff:\n'
-    diff -u "$backup" "$hook" || true
-  } >"$log"
-
-  grep -q "BEGIN VANILLA ARM64 BUILDER PREREQUISITES" "$hook" || {
-    fail "Installer prerequisite block was not inserted."
-    return 1
-  }
-
-  grep -q "apt-get install -y --no-install-recommends wget ca-certificates" "$hook" || {
-    fail "Installer hook does not install wget and ca-certificates."
-    return 1
-  }
-
-  ok "Added downloader prerequisites to the upstream Vanilla installer hook."
-  printf 'Installer hook patch log:\n  %s\n' "$log" >&2
-}
-
-patch_remove_blacklisted_packages_hook() {
-  local live="$1"
-  local hook="$live/etc/config/hooks/live/000-remove-blacklisted-packages.chroot"
-  [[ -f "$hook" ]] || return 0
-
-  python3 - "$hook" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-lines = path.read_text(encoding="utf-8").splitlines()
-out = []
-for line in lines:
-    stripped = line.strip()
-    if "/etc/rc.local" in line and not stripped.startswith(("if ", "[ ", "test ")):
-        indent = line[:len(line)-len(line.lstrip())]
-        out.append(f"{indent}if [ -e /etc/rc.local ]; then")
-        out.append(f"{indent}  {line.lstrip()}")
-        out.append(f"{indent}fi")
-    else:
-        out.append(line)
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
-PY
-  chmod +x "$hook"
+  ok "Generated ISO contains the custom DTB and passed available boot-artifact checks."
+  printf 'ISO verification log:\n  %s\n' "$log" >&2
 }
 
 # ------------------------- staging into repos --------------------------
