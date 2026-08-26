@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.5
+# Version 7.0.6
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,28 +11,24 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.5 corrections after the v7.0.4 field test:
-#   - Restores the canonical source checkout name sources/live-iso. The v7-only
-#     name sources/live-iso-v7 was unnecessary and diverged from the established
-#     source tree used by earlier builder generations.
-#   - Safely migrates an existing clean sources/live-iso-v7 checkout to
-#     sources/live-iso when the canonical path is absent and its origin matches
-#     the configured official repository.
-#   - Preserves pre-existing core-image, desktop-image, live-iso, and
-#     qcom-firmware-updater checkouts. core-image and desktop-image are retained
-#     as historical/optional sources but are not rebuilt by the v7 architecture.
-#   - Resolves the external FsGuard plugin from GitHub release metadata by exact
-#     architecture-specific asset name instead of constructing an unverified
-#     release URL. The default version is auto: the newest non-draft release
-#     containing fsguard-<arch>.so is selected and recorded.
-#   - Preserves normalized root Vib execution, repository validation,
-#     interactive firmware alternatives, host safeguards, custom-image
-#     architecture, and live graphical package-closure protections.
+# v7.0.6 corrections after the v7.0.5 source-layout field test:
+#   - Fixes an errexit control-flow defect in report_preserved_source_layout.
+#     After a successful live-iso-v7 -> live-iso migration, the final false
+#     legacy-path test became the function return status and aborted Stage 3.
+#   - Reporting and source-layout helper functions now return success
+#     explicitly after normal optional/absent conditions.
+#   - Menu headings now render embedded \n sequences as actual line breaks.
+#   - Removes the stale v7.0.2 banner text and derives it from SCRIPT_VERSION.
+#   - Adds a regression test for a clean legacy migration with absent optional
+#     core-image, desktop-image, and qcom-firmware-updater directories.
+#   - Preserves the v7.0.5 canonical source layout, GitHub FsGuard asset
+#     resolver, normalized Vib execution, interactive firmware choices,
+#     custom-image architecture, and live graphical package-closure controls.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.5"
+SCRIPT_VERSION="7.0.6"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -202,7 +198,7 @@ menu() {
   while true; do
     printf '\n' >&2
     hr >&2
-    printf '%s\n\n' "$title" >&2
+    printf '%b\n\n' "$title" >&2
     for opt in "$@"; do
       IFS='|' read -r n label desc <<<"$opt"
       if [[ "$n" == "$default" ]]; then
@@ -416,7 +412,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.5-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.6-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -699,9 +695,9 @@ Profile:          $PROFILE
 Artifact default: $ARTIFACT_DIR
 Sources:          $SOURCES_DIR
 
-v7.0.2 applies the selected Git source action before the remaining artifact,
-firmware, target-image, and build-confirmation questions. --execute does not
-suppress interactive questions.
+v$SCRIPT_VERSION applies the selected Git source action before the remaining
+artifact, firmware, target-image, and build-confirmation questions. --execute
+does not suppress interactive questions.
 EOF
 }
 
@@ -1070,10 +1066,16 @@ report_repository_plan_state() {
   info "core-image retained state:  $(source_checkout_summary "$CORE_IMAGE_SOURCE")"
   info "desktop-image retained:     $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
   info "qcom updater state:         $(source_checkout_summary "$QCOM_UPDATER_DIR")"
-  [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]] &&     warn "Legacy live-iso-v7 path is present and will be normalized in execute mode when safe."
+
+  if [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
+    warn "Legacy live-iso-v7 path is present and will be normalized in execute mode when safe."
+  fi
+
   if [[ ! -d "$CUSTOM_IMAGE_SOURCE/.git" || ! -d "$LIVE_ISO_SOURCE/.git" ]]; then
     warn "One or both required source checkouts are absent. Execute mode will create them using policy '$REPO_POLICY'."
   fi
+
+  return 0
 }
 
 source_checkout_summary() {
@@ -1085,6 +1087,7 @@ source_checkout_summary() {
   else
     printf 'absent'
   fi
+  return 0
 }
 
 normalize_live_iso_source_path() {
@@ -1134,6 +1137,8 @@ normalize_live_iso_source_path() {
   elif [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
     warn "Legacy path exists but is not a Git checkout and will be preserved: $LEGACY_LIVE_ISO_SOURCE"
   fi
+
+  return 0
 }
 
 report_preserved_source_layout() {
@@ -1144,8 +1149,13 @@ report_preserved_source_layout() {
   info "  desktop-image:         $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
   info "  qcom-firmware-updater: $(source_checkout_summary "$QCOM_UPDATER_DIR")"
 
-  [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]] && \
+  if [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
     warn "Legacy source path remains present: $LEGACY_LIVE_ISO_SOURCE"
+  fi
+
+  # This is a reporting function. Optional absent source trees are normal and
+  # must never become its return status under `set -e`.
+  return 0
 }
 
 sync_repo() {
@@ -1249,6 +1259,7 @@ sync_required_repositories() {
   CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"
   LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"
   verify_required_source_checkouts
+  return 0
 }
 
 # ------------------------- firmware staging ------------------------------
