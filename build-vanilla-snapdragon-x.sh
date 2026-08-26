@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.2.0
+# Version: 2.2.1
 #
 # Purpose:
 #   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
 
 # -----------------------------
@@ -372,6 +372,62 @@ EOF
   done
 }
 
+
+prompt_qcom_firmware_input_method() {
+  # Numbered, self-describing Qualcomm firmware source selection.
+  # Stdout returns one of: archive, url, prestaged, shell, skip.
+  local choice=""
+  while true; do
+    cat >&2 <<EOF
+
+==================================================================
+Qualcomm Firmware Source
+
+Qualcomm firmware handling is intentionally isolated.
+The builder will NOT install firmware onto this Debian build host.
+
+Choose how the builder should obtain firmware for the target image:
+
+  1) Use a local Qualcomm Windows Graphics Driver ZIP/EXE [RECOMMENDED]
+     Best choice for reproducible builds. You provide a downloaded archive;
+     the builder extracts firmware inside a disposable container and copies
+     only the resulting /lib/firmware tree into the target image staging area.
+
+  2) Use a direct Qualcomm driver URL
+     The builder downloads/extracts in the disposable container. This is less
+     reproducible unless the downloaded archive is preserved in the release.
+
+  3) Use a pre-staged firmware directory
+     Use this when you already have a directory containing the target firmware
+     tree to inject, typically matching /lib/firmware/... layout.
+
+  4) Open an interactive shell before choosing
+     Inspect/edit qcom-firmware-updater inputs or prepare files manually, then
+     type 'exit' to return to this menu.
+
+  5) Skip Qualcomm firmware extraction for this build
+     The ISO will be built without this firmware staging step.
+
+Special commands:
+  ?  Show this menu again
+  !  Open an interactive shell
+==================================================================
+EOF
+    read -r -p "Selection [1]: " choice || true
+    choice="${choice:-1}"
+    case "$choice" in
+      1) printf 'archive'; return 0 ;;
+      2) printf 'url'; return 0 ;;
+      3) printf 'prestaged'; return 0 ;;
+      4|!) open_interactive_shell "$WORKDIR" ;;
+      5|s|S|skip|SKIP) printf 'skip'; return 0 ;;
+      q|Q) fail "User cancelled while selecting Qualcomm firmware source."; exit "$EX_USAGE" ;;
+      \?) ;;
+      *) ui_blank; ui_line "Invalid selection: '$choice'. Please enter a number from 1 through 5." ;;
+    esac
+  done
+}
+
 print_build_summary_prompt() {
   cat >&2 <<EOF
 
@@ -520,29 +576,53 @@ ROOT_OVERLAY_DIR="$(prompt_existing_dir_or_create "Optional /root overlay direct
 if prompt_yes_no "Extract Qualcomm firmware into a target-image staging area?" "$([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo y || echo n)"; then
   ENABLE_QCOM_FW=1
   QCOM_DEVICE_PATH="$(prompt_value "qcom-firmware-updater device path" "$QCOM_DEVICE_PATH")"
-  cat >&2 <<'QCOMNOTE'
 
-Qualcomm firmware handling is intentionally isolated.
-The builder will NOT install firmware onto this Debian build host.
-
-Select one input method:
-  • Local Qualcomm Windows Graphics Driver ZIP/EXE: preferred for reproducible builds.
-  • Direct Qualcomm driver URL: accepted, but less reproducible unless archived later.
-  • Pre-staged firmware directory: use when you have already extracted the needed /lib/firmware tree.
-
-If no archive, URL, or pre-staged directory is supplied, Qualcomm firmware extraction is skipped.
-QCOMNOTE
-  if [[ -z "$QCOM_PRESTAGED_DIR" ]]; then
-    QCOM_PRESTAGED_DIR="$(prompt_existing_dir_or_create "Optional pre-staged Qualcomm firmware directory" "$WORKDIR/prestaged-firmware/$PROFILE")"
-  fi
-  if [[ -z "$(find "$QCOM_PRESTAGED_DIR" -type f 2>/dev/null | head -1 || true)" ]]; then
-    QCOM_PRESTAGED_DIR=""
-  fi
-  if [[ -z "$QCOM_PRESTAGED_DIR" && -z "$QCOM_DRIVER_ARCHIVE" ]]; then
-    QCOM_DRIVER_ARCHIVE="$(prompt_file_optional "Local Qualcomm driver ZIP/EXE file, blank to skip" "")"
-  fi
+  # If the operator supplied a Qualcomm source by command-line option, keep it.
+  # Otherwise use a numbered menu rather than prose/bullets so the next action is explicit.
   if [[ -z "$QCOM_PRESTAGED_DIR" && -z "$QCOM_DRIVER_ARCHIVE" && -z "$QCOM_DRIVER_URL" ]]; then
-    QCOM_DRIVER_URL="$(prompt_value "Qualcomm driver direct URL, blank to skip extraction" "")"
+    qcom_method="$(prompt_qcom_firmware_input_method)"
+    case "$qcom_method" in
+      archive)
+        QCOM_DRIVER_ARCHIVE="$(prompt_file_optional "Local Qualcomm Windows Graphics Driver ZIP/EXE" "$WORKDIR/downloads/qualcomm-windows-graphics-driver.zip")"
+        if [[ -z "$QCOM_DRIVER_ARCHIVE" ]]; then
+          warn "No local Qualcomm driver archive selected; Qualcomm firmware extraction will be skipped."
+          ENABLE_QCOM_FW=0
+        fi
+        ;;
+      url)
+        QCOM_DRIVER_URL="$(prompt_value "Direct Qualcomm Windows Graphics Driver URL" "")"
+        if [[ -z "$QCOM_DRIVER_URL" ]]; then
+          warn "No Qualcomm driver URL supplied; Qualcomm firmware extraction will be skipped."
+          ENABLE_QCOM_FW=0
+        fi
+        ;;
+      prestaged)
+        QCOM_PRESTAGED_DIR="$(prompt_existing_dir_or_create "Pre-staged Qualcomm firmware directory" "$WORKDIR/prestaged-firmware/$PROFILE")"
+        if [[ -z "$(find "$QCOM_PRESTAGED_DIR" -type f 2>/dev/null | head -1 || true)" ]]; then
+          warn "Pre-staged Qualcomm firmware directory is empty; Qualcomm firmware extraction will be skipped."
+          ENABLE_QCOM_FW=0
+          QCOM_PRESTAGED_DIR=""
+        fi
+        ;;
+      skip)
+        ENABLE_QCOM_FW=0
+        ;;
+    esac
+  else
+    cat >&2 <<EOF
+
+==================================================================
+Qualcomm Firmware Source
+
+A Qualcomm firmware source was supplied by command-line option or environment.
+The builder will use the supplied value and will not prompt for another source.
+
+Configured source summary:
+  Local archive:        ${QCOM_DRIVER_ARCHIVE:-<none>}
+  Direct URL:           ${QCOM_DRIVER_URL:-<none>}
+  Pre-staged directory: ${QCOM_PRESTAGED_DIR:-<none>}
+==================================================================
+EOF
   fi
 else
   ENABLE_QCOM_FW=0
