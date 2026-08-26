@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.9.sh
+# build-vanilla-arm64-release-v2.6.0.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.9
+# Version: 2.6.0
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,8 +29,9 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.9"
+SCRIPT_VERSION="2.6.0"
 SCRIPT_NAME="$(basename "$0")"
+LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -96,6 +97,27 @@ log_has_only_header() {
 }
 
 
+summarize_deep_diagnostic_log() {
+  # Extract the most useful high-signal lines from a deep Vib diagnostic log so
+  # the operator does not have to manually open a second file after a silent
+  # primary `vib build` failure.
+  local log="$1"
+  [[ -f "$log" ]] || return 0
+
+  printf '\nDeep diagnostic log:\n  %s\n' "$log" >&2
+  printf '\nHigh-signal diagnostic summary:\n' >&2
+
+  grep -nE \
+    'recipe vibversion:|installed vib version|raw vib --version|VIB_|YAML_|FSGUARD_|Direct exit status|Debug-env exit status|script-wrapped exit status|strace-wrapped exit status|execve\\(|openat\\(.*recipe.yml|ENOENT|EACCES|EPERM|SIGSEGV|SIGILL|panic|error|Error|ERROR|failed|Failed|FAIL' \
+    "$log" 2>/dev/null | tail -n 120 >&2 || true
+
+  printf '\nLast 120 lines from deep diagnostic log:\n' >&2
+  printf '%s\n' '------------------------------------------------------------------' >&2
+  tail -n 120 "$log" >&2 || true
+  printf '%s\n' '------------------------------------------------------------------' >&2
+}
+
+
 command_failure_menu() {
   # Print diagnostics for a failed subprocess and return the operator's desired
   # next action on stdout. This function must return status 0 so that callers
@@ -114,6 +136,14 @@ command_failure_menu() {
   printf 'Command log:   %s
 ' "$log" >&2
   print_failure_tail "$log"
+
+  if [[ -n "${LAST_DEEP_DIAGNOSTIC_LOG:-}" && -f "$LAST_DEEP_DIAGNOSTIC_LOG" ]]; then
+    if log_has_only_header "$log"; then
+      warn "The primary command log contains no child-process output."
+      warn "Showing the deep diagnostic log instead."
+      summarize_deep_diagnostic_log "$LAST_DEEP_DIAGNOSTIC_LOG"
+    fi
+  fi
 
   choice="$(menu "Build Command Failure
 
@@ -200,6 +230,8 @@ run_logged() {
         warn "The Vib command failed but produced no stdout/stderr beyond the command header."
         warn "Running deep Vib diagnostics automatically before presenting the failure menu."
         vib_deep_diagnostics "$workdir" "$safe"
+        warn "Primary Vib log was empty. Deep diagnostic log:"
+        warn "  $LAST_DEEP_DIAGNOSTIC_LOG"
       fi
     fi
 
@@ -217,6 +249,9 @@ run_logged() {
         else
           warn "Deep diagnostics are currently implemented for Vib commands only."
         fi
+        ;;
+      logshell)
+        open_shell "$OUTPUT_DIR/logs"
         ;;
       abort|*)
         die "Build aborted after command failure. See log: $log"
@@ -1744,6 +1779,7 @@ vib_deep_diagnostics() {
 
   mkdir -p "$OUTPUT_DIR/logs"
   LAST_COMMAND_LOG="$log"
+  LAST_DEEP_DIAGNOSTIC_LOG="$log"
 
   info "Running deep Vib diagnostics for $label"
   printf 'Deep diagnostic log: %s\n' "$log" >&2
