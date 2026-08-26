@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.17.sh
+# build-vanilla-arm64-release-v2.7.19.sh
 #
 # Conception Vanilla ARM64 Release Builder
-# Version: 2.7.17
+# Version: 2.7.19
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.17"
+SCRIPT_VERSION="2.7.19"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -1718,7 +1718,7 @@ patch_live_iso_grub_for_custom_dtb() {
   # The upstream file may be minified onto one physical line, so line-oriented
   # sed insertion is deliberately avoided.
   #
-  # Boot strategy in v2.7.17:
+  # Boot strategy in v2.7.19:
   #   1. Preserve every existing menuentry and its proven kernel/initrd paths.
   #   2. Preserve the selected board DTB before every live initrd command.
   #   3. Make the first live entry diagnostic by removing quiet/splash and
@@ -1836,38 +1836,30 @@ if not live_entries:
 
 
 def rewrite_linux_args(block: str, desired: str) -> str:
-    # Keep LINUX_LIVE and all upstream-required boot=live/config/user/findiso
-    # tokens. Replace only presentation/debug tokens controlled by this builder.
-    # Match the live kernel command independent of physical line layout.
-    # Upstream templates may be conventionally multiline, folded, or minified
-    # onto one line. Bound the match at the first kernel-argument terminator
-    # (`---`) after LINUX_LIVE rather than requiring start/end-of-line anchors.
+    # Preserve the upstream live-build placeholders exactly. The current
+    # Vanilla ARM template uses:
+    #
+    #   linux KERNEL_LIVE APPEND_LIVE ---
+    #
+    # Older revisions may use LINUX_LIVE with explicit arguments. Diagnostic
+    # arguments are appended immediately before `---`, so APPEND_LIVE continues
+    # to supply the proven boot=live/config/user/findiso command line.
     linux_re = re.compile(
-        r"(\blinux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)"
+        r"(\blinux(?:efi)?[ \t]+(?:KERNEL_LIVE|LINUX_LIVE)\b)"
         r"(.*?)"
-        r"([ \t]+---)"
-        r"(?=[ \t\r\n]*(?:#|devicetree\b|initrd(?:efi)?\b|\}))",
+        r"([ \t]+---)",
         re.S,
     )
     m = linux_re.search(block)
     if not m:
-        # Conservative fallback for templates where another harmless token or
-        # delimiter follows `---`. This still remains confined to the first
-        # LINUX_LIVE command inside the already identified live menuentry.
-        linux_re = re.compile(
-            r"(\blinux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)"
-            r"(.*?)"
-            r"([ \t]+---)",
-            re.S,
-        )
-        m = linux_re.search(block)
-    if not m:
         compact = " ".join(block.split())[:500]
         raise SystemExit(
-            "live menuentry lacks a parseable LINUX_LIVE kernel command; "
-            f"entry excerpt: {compact}"
+            "live menuentry lacks a parseable KERNEL_LIVE/LINUX_LIVE "
+            f"kernel command; entry excerpt: {compact}"
         )
-    args = m.group(2)
+
+    middle = m.group(2)
+    tokens = middle.split()
     controlled = {
         "quiet", "splash", "bgrt_disable", "nomodeset", "initcall_debug",
         "keep_bootcon", "ignore_loglevel", "earlycon",
@@ -1876,7 +1868,12 @@ def rewrite_linux_args(block: str, desired: str) -> str:
         "systemd.log_target=console", "rd.systemd.log_target=console",
     }
     kept = []
-    for token in args.split():
+    for token in tokens:
+        # APPEND_LIVE is an opaque upstream placeholder and must never be
+        # removed or expanded by this builder.
+        if token == "APPEND_LIVE":
+            kept.append(token)
+            continue
         if token in controlled:
             continue
         if token.startswith("loglevel=") or token.startswith("console="):
@@ -1884,7 +1881,9 @@ def rewrite_linux_args(block: str, desired: str) -> str:
         if token.startswith("modprobe.blacklist=nouveau"):
             continue
         kept.append(token)
-    merged = " ".join(kept + desired.split())
+
+    merged_tokens = kept + desired.split()
+    merged = " " + " ".join(merged_tokens) if merged_tokens else ""
     return block[:m.start(2)] + merged + block[m.end(2):]
 
 # Rewrite from the end so offsets remain valid.
