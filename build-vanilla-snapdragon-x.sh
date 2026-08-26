@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.6.sh
+# build-vanilla-arm64-release-v2.4.7.sh
 #
 # Constructive Vanilla ARM64 Release Builder
 # Version: 2.4.6
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.6"
+SCRIPT_VERSION="2.4.7"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -1230,17 +1230,134 @@ EOF
 
 # ------------------------------- build --------------------------------
 
+vib_preflight() {
+  # Emit a detailed, command-log-friendly Vib diagnostic before invoking
+  # `vib build`. This exists because some Vib failures can return exit status 1
+  # with little or no output. The preflight makes wrong binary selection,
+  # architecture mismatch, missing execute bit, missing plugins, or missing
+  # recipe files visible before the build command is attempted.
+  local workdir="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-vib-preflight-$(date -u +%H%M%S).log"
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  LAST_COMMAND_LOG="$log"
+
+  info "Running Vib preflight diagnostics for $label"
+  printf 'Preflight log: %s\n' "$log" >&2
+
+  {
+    printf '### Vib preflight for %s\n' "$label"
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### PWD: %s\n\n' "$workdir"
+
+    printf '## Host\n'
+    uname -a || true
+    printf '\n'
+
+    printf '## PATH\n%s\n\n' "$PATH"
+
+    printf '## Vib discovery\n'
+    if command -v vib >/dev/null 2>&1; then
+      printf 'vib path: %s\n' "$(command -v vib)"
+      ls -l "$(command -v vib)" || true
+      if command -v file >/dev/null 2>&1; then
+        file "$(command -v vib)" || true
+      fi
+      if command -v ldd >/dev/null 2>&1; then
+        printf '\nldd output, if dynamically linked:\n'
+        ldd "$(command -v vib)" || true
+      fi
+      printf '\nvib --version:\n'
+      vib --version || true
+      printf '\nvib --help, first 80 lines:\n'
+      vib --help 2>&1 | sed -n '1,80p' || true
+    else
+      printf 'vib was not found in PATH.\n'
+    fi
+
+    printf '\n## Repository build files\n'
+    cd "$workdir" || exit 0
+    pwd
+    printf '\nrecipe.yml:\n'
+    ls -l recipe.yml || true
+    printf '\nContainerfile / Dockerfile:\n'
+    ls -l Containerfile Dockerfile 2>/dev/null || true
+    printf '\nplugins directory:\n'
+    find plugins -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null | sort || true
+    printf '\nTop-level files:\n'
+    find . -maxdepth 2 -type f | sort | sed -n '1,200p' || true
+
+    printf '\n## Vib dry diagnostics\n'
+    printf 'Attempting: vib build --help\n'
+    vib build --help 2>&1 | sed -n '1,120p' || true
+  } >"$log" 2>&1
+
+  # Hard validation checks that should stop before an opaque `vib build`.
+  if ! command -v vib >/dev/null 2>&1; then
+    fail "vib is not available in PATH."
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  if [[ ! -x "$(command -v vib)" ]]; then
+    fail "vib exists but is not executable: $(command -v vib)"
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  if [[ ! -f "$workdir/recipe.yml" ]]; then
+    fail "recipe.yml is missing in $workdir"
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  # Vanilla image recipes commonly expect plugin bundles, especially fsguard.
+  # Missing plugins may be a legitimate setup issue. Warn rather than fail,
+  # because upstream recipe requirements can change.
+  if [[ ! -d "$workdir/plugins" ]] || ! find "$workdir/plugins" -type f | grep -q .; then
+    warn "No Vib plugin files were found under $workdir/plugins."
+    warn "If recipe.yml requires fsguard or other Vib plugins, `vib build` will fail."
+    warn "See preflight log: $log"
+  fi
+
+  ok "Vib preflight completed for $label."
+  return 0
+}
+
+run_vib_build_with_diagnostics() {
+  local label="$1"
+  local workdir="$2"
+  local action
+
+  while true; do
+    if ! vib_preflight "$workdir" "$label"; then
+      action="$(command_failure_menu "Vib preflight for $label" "$workdir" "$LAST_COMMAND_LOG" "1")"
+      case "$action" in
+        shell) open_shell "$workdir" ;;
+        retry) continue ;;
+        abort|*) die "Build aborted after Vib preflight failure. See log: $LAST_COMMAND_LOG" ;;
+      esac
+    fi
+
+    run_logged "Build $label with Vib" "$workdir" vib build recipe.yml
+    return 0
+  done
+}
+
 build_images() {
   local core="$SOURCES_DIR/core-image"
   local desktop="$SOURCES_DIR/desktop-image"
+
   if [[ -d "$core" ]]; then
-    run_logged "Build core image with Vib" "$core" vib build recipe.yml
+    run_vib_build_with_diagnostics "core image" "$core"
     run_logged "Build local core container image" "$core" podman image build -t "local/vanilla-core:$PROFILE-$BUILD_DATE" .
   else
     warn "core-image source directory is missing; skipping core image build."
   fi
+
   if [[ -d "$desktop" ]]; then
-    run_logged "Build desktop image with Vib" "$desktop" vib build recipe.yml
+    run_vib_build_with_diagnostics "desktop image" "$desktop"
     run_logged "Build local desktop container image" "$desktop" podman image build -t "local/vanilla-desktop:$PROFILE-$BUILD_DATE" .
   else
     warn "desktop-image source directory is missing; skipping desktop image build."
