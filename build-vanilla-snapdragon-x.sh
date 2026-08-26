@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.0.sh
+# build-vanilla-arm64-release-v2.6.1.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.0
+# Version: 2.6.1
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,9 +29,11 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
+VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
+VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -167,6 +169,55 @@ The previous command failed. If the command produced no useful output, the build
 }
 
 
+ensure_vib_run_user() {
+  # Vib appears to exit immediately when executed as UID 0. Strace showed:
+  #   getuid() = 0
+  #   exit_group(1)
+  # with no stdout/stderr. Therefore the builder must run Vib as a non-root
+  # user while preserving root for privileged container/ISO steps.
+  #
+  # If the script itself is not running as root, no special handling is needed.
+  # If running as root, create/use VIB_RUN_USER and grant ownership over the
+  # working tree so the non-root Vib process can read/write recipe outputs.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$VIB_ALLOW_ROOT" == "1" ]]; then
+    warn "VIB_ALLOW_ROOT=1 is set; Vib will be attempted as root despite known silent-exit behavior."
+    return 0
+  fi
+
+  if ! id "$VIB_RUN_USER" >/dev/null 2>&1; then
+    info "Creating non-root Vib build user: $VIB_RUN_USER"
+    useradd --system --create-home --shell /bin/bash "$VIB_RUN_USER" \
+      || die "Unable to create Vib build user: $VIB_RUN_USER"
+  fi
+
+  info "Ensuring build workspace is writable by $VIB_RUN_USER for Vib stages."
+  chown -R "$VIB_RUN_USER:$VIB_RUN_USER" "$WORKDIR" \
+    || die "Unable to chown build workspace to $VIB_RUN_USER: $WORKDIR"
+}
+
+run_as_vib_user() {
+  # Run a command as the non-root Vib user when the builder itself is root.
+  # Arguments: working-directory command args...
+  local workdir="$1"; shift
+
+  if [[ "$(id -u)" -eq 0 && "$VIB_ALLOW_ROOT" != "1" ]]; then
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$VIB_RUN_USER" -- bash -lc "cd $(printf '%q' "$workdir") && PATH=$(printf '%q' "$PATH") exec $(printf '%q ' "$@")"
+    elif command -v su >/dev/null 2>&1; then
+      su -s /bin/bash "$VIB_RUN_USER" -c "cd $(printf '%q' "$workdir") && PATH=$(printf '%q' "$PATH") exec $(printf '%q ' "$@")"
+    else
+      die "Neither runuser nor su is available to run Vib as non-root."
+    fi
+  else
+    ( cd "$workdir" && "$@" )
+  fi
+}
+
+
 run_logged() {
   # Run a command with explicit per-command logging and failure diagnostics.
   # Usage: run_logged "human label" "/working/dir" command arg ...
@@ -209,10 +260,14 @@ run_logged() {
     trap - ERR
     set +e
     set +E
-    (
-      cd "$workdir" || exit 97
-      "$@"
-    ) >> "$log" 2>&1
+    if [[ "$label" == *"Vib"* || "$*" == *"vib"* ]]; then
+      run_as_vib_user "$workdir" "$@" >> "$log" 2>&1
+    else
+      (
+        cd "$workdir" || exit 97
+        "$@"
+      ) >> "$log" 2>&1
+    fi
     status=$?
 
     # Restore shell behavior for the rest of the builder.
@@ -1834,17 +1889,18 @@ vib_deep_diagnostics() {
     command -v docker && docker --version || true
     printf '\n'
 
-    printf '## Direct vib execution, stdout+stderr\n'
-    vib build recipe.yml 2>&1
+    printf '## Direct vib execution as configured Vib user, stdout+stderr\n'
+    printf 'current diagnostic uid: %s\n' "$(id -u)"
+    run_as_vib_user "$PWD" vib build recipe.yml 2>&1
     printf '\nDirect exit status: %s\n\n' "$?"
 
-    printf '## Vib execution with debug-ish environment, stdout+stderr\n'
-    VIB_LOG_LEVEL=debug RUST_BACKTRACE=full RUST_LOG=debug vib build recipe.yml 2>&1
+    printf '## Vib execution with debug-ish environment as configured Vib user, stdout+stderr\n'
+    run_as_vib_user "$PWD" env VIB_LOG_LEVEL=debug RUST_BACKTRACE=full RUST_LOG=debug vib build recipe.yml 2>&1
     printf '\nDebug-env exit status: %s\n\n' "$?"
 
     if command -v script >/dev/null 2>&1; then
       printf '## Vib execution under pseudo-TTY via script(1)\n'
-      script -q -e -c 'vib build recipe.yml' /tmp/vib-build.typescript
+      script -q -e -c "runuser -u $VIB_RUN_USER -- bash -lc 'cd $(pwd) && vib build recipe.yml'" /tmp/vib-build.typescript
       printf 'script-wrapped exit status: %s\n' "$?"
       printf '\n--- typescript output ---\n'
       cat /tmp/vib-build.typescript || true
@@ -1855,7 +1911,7 @@ vib_deep_diagnostics() {
 
     if command -v strace >/dev/null 2>&1; then
       printf '## strace vib build, last 240 lines\n'
-      strace -f -s 256 -o /tmp/vib-build.strace vib build recipe.yml
+      strace -f -s 256 -o /tmp/vib-build.strace runuser -u "$VIB_RUN_USER" -- bash -lc "cd $(pwd) && vib build recipe.yml"
       printf 'strace-wrapped exit status: %s\n\n' "$?"
       tail -n 240 /tmp/vib-build.strace || true
       printf '\n'
@@ -2136,6 +2192,20 @@ vib_preflight() {
   fi
   printf 'PASS vib-executable-bit\n' >>"$log"
 
+  {
+    printf '\n## Vib root-execution guard\n'
+    printf 'builder uid: %s\n' "$(id -u)"
+    printf 'VIB_RUN_USER: %s\n' "$VIB_RUN_USER"
+    printf 'VIB_ALLOW_ROOT: %s\n' "$VIB_ALLOW_ROOT"
+    if [[ "$(id -u)" -eq 0 && "$VIB_ALLOW_ROOT" != "1" ]]; then
+      printf 'PASS vib-root-guard: Vib will be run via non-root user %s\n' "$VIB_RUN_USER"
+    elif [[ "$(id -u)" -eq 0 && "$VIB_ALLOW_ROOT" == "1" ]]; then
+      printf 'WARN vib-root-guard: Vib will run as root because VIB_ALLOW_ROOT=1\n'
+    else
+      printf 'PASS vib-root-guard: builder is already non-root\n'
+    fi
+  } >>"$log"
+
   if [[ ! -f "$workdir/recipe.yml" ]]; then
     failed_check="recipe-present"
     printf 'FAIL %s: recipe.yml is missing in %s\n' "$failed_check" "$workdir" >>"$log"
@@ -2224,6 +2294,7 @@ run_vib_build_with_diagnostics() {
 }
 
 build_images() {
+  ensure_vib_run_user
   local core="$SOURCES_DIR/core-image"
   local desktop="$SOURCES_DIR/desktop-image"
 
