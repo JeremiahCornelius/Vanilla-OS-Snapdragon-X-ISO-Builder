@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v6.0.2.sh
+# build-vanilla-arm64-release-v6.0.3.sh
 #
 # Conception VanillaOS ARM64 OCI-First Dev Release Builder
-# Version: 6.0.2
+# Version: 6.0.3
 #
 # Purpose:
 #   Deterministically build the upstream VanillaOS installer-only ARM64 UEFI ISO
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.0.2"
+SCRIPT_VERSION="6.0.3"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -70,7 +70,7 @@ INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 FORCE_CLEAN_LIVE_BUILD="${FORCE_CLEAN_LIVE_BUILD:-1}"
 VERIFY_INSTALLER_RUNTIME_IN_ISO="${VERIFY_INSTALLER_RUNTIME_IN_ISO:-1}"
 
-# v6.0.2 artifact and capacity policy.
+# v6.0.3 artifact and capacity policy.
 # OCI export is intentionally optional because the local Podman image is the
 # primary build product and a large OCI archive is not required to build the ISO.
 EXPORT_OCI_ARCHIVE="${EXPORT_OCI_ARCHIVE:-0}"
@@ -5181,17 +5181,40 @@ prepare_live_iso_v4_tree() {
   [[ -f "$conf" ]] || die "live-iso terraform.conf is missing: $conf"
   [[ -f "$build" ]] || die "live-iso build.sh is missing: $build"
 
-  # The vanilla-arm fork supports arm64 natively and uses BUILD_ARCH in its
-  # temporary and output paths. Set the architecture explicitly and verify the
-  # native behavior rather than rewriting the fork back into an upstream shape.
+  # The official VanillaOS live-iso repository now accepts ARCH=arm64 and
+  # creates the live-build workspace under tmp/$BUILD_ARCH.  However, the
+  # current orchid build.sh still contains one legacy AMD64-only move command:
+  #
+  #   mv $BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso ...
+  #
+  # That stale source path prevents a successful ARM64 build from being moved
+  # into builds/arm64.  Do not reject the official checkout.  Normalize only
+  # that output-source expression to the architecture variable already used by
+  # the rest of upstream build.sh.  This is a narrow, deterministic correction
+  # and preserves the official Pico/live-build flow.
   sed -i 's/^ARCH=.*/ARCH="arm64"/' "$conf"
   grep -q '^ARCH=' "$conf" || printf 'ARCH="arm64"\n' >>"$conf"
   sed -i 's/^PACKAGE_LISTS_SUFFIX=.*/PACKAGE_LISTS_SUFFIX="vanilla-installer"/' "$conf"
   grep -q '^PACKAGE_LISTS_SUFFIX=' "$conf" || printf 'PACKAGE_LISTS_SUFFIX="vanilla-installer"\n' >>"$conf"
 
-  grep -Fq 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build" || {
-    fail "The selected live-iso checkout lacks the vanilla-arm architecture-aware ISO output path."
-    fail "Expected build.sh to reference tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso"
+  if grep -Fq '$BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso' "$build"; then
+    info "Correcting legacy AMD64-only live-iso output move for ARM64."
+    cp -a "$build" "$build.builder-backup.$(date -u +%Y%m%d%H%M%S)"
+    sed -i 's#\$BASE_DIR/tmp/amd64/live-image-amd64\.hybrid\.iso#\$BASE_DIR/tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso#g' "$build"
+  fi
+
+  grep -Fq '$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build" || {
+    fail "Unable to establish architecture-aware live-iso output handling."
+    fail "Expected build.sh to move from: \$BASE_DIR/tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso"
+    return 1
+  }
+
+  # Also verify that the destination remains architecture-specific.  Upstream
+  # already uses builds/$BUILD_ARCH; this guard prevents a future checkout from
+  # silently collapsing ARM64 output into an unrelated directory.
+  grep -Fq 'OUTPUT_DIR="$BASE_DIR/builds/$BUILD_ARCH"' "$build" || {
+    fail "The live-iso build script no longer declares an architecture-specific builds directory."
+    fail "Expected: OUTPUT_DIR="\$BASE_DIR/builds/\$BUILD_ARCH""
     return 1
   }
 
