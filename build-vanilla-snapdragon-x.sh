@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.8
+# Version 7.0.9
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,28 +11,26 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.8 corrections after the v7.0.7 package-selection field test:
-#   - Fixes the payload fallback that incorrectly classified a linux-headers
-#     package as boot-critical merely because it contained the conventional
-#     /lib/modules/<release>/build symlink.
-#   - Header, tools, development, and metadata package classes are now rejected
-#     before any payload-based fallback is considered.
-#   - An unrecognized package is selected only when its complete dpkg archive
-#     listing contains a regular /boot/vmlinuz-<release> file or an actual
-#     regular kernel module object (*.ko, *.ko.gz, *.ko.xz, or *.ko.zst).
-#   - Adds a second fail-closed selection guard immediately before staging the
-#     target OCI package transaction.
-#   - Module verification no longer accepts directories or build/source
-#     symlinks as evidence of runtime kernel modules.
-#   - Adds an exact regression test for a headers package containing
-#     /lib/modules/<release>/build -> /usr/src/linux-headers-<release>.
-#   - Preserves all v7.0.7 source, Vib/FsGuard, firmware, DTB, package archive,
-#     target OCI, and live graphical package-closure safeguards.
+# v7.0.9 corrections after the v7.0.8 target-verification field test:
+#   - Removes the invalid assumption that dpkg-query remains available inside
+#     the locked final VanillaOS target image.
+#   - Verifies every selected local package immediately after APT installation,
+#     while dpkg-query is still available, and writes a persistent signed-off
+#     package receipt under /usr/lib/conception.
+#   - Final OCI verification compares that receipt against host-derived package
+#     name, version, and architecture expectations without invoking APT or dpkg.
+#   - Desktop-layer preservation is verified by executable paths for GNOME
+#     Shell, Mutter, GDM, and NetworkManager rather than package-manager state.
+#   - Exports the actual installed-package receipt into release evidence.
+#   - Adds a regression test proving final verification succeeds in a target
+#     root where dpkg-query is deliberately absent.
+#   - Preserves all v7.0.8 source, Vib/FsGuard, firmware, DTB, package
+#     classification, package archive, OCI, and live-ISO closure safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.8"
+SCRIPT_VERSION="7.0.9"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -418,7 +416,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.8-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.9-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -1718,6 +1716,8 @@ Safety invariants:
   - dpkg-deb archive listings complete before any grep validation.
   - Only named boot packages or packages with regular kernel/module objects
     enter target or live package transactions.
+  - Package registration is attested during the unlocked build stage; the final
+    immutable target is not expected to retain apt, dpkg, or dpkg-query.
   - /lib/modules/<release>/build and source symlinks never qualify as modules.
   - Optional tools, headers, development, and metadata .debs are reference-only.
   - Official live package lists are never edited.
@@ -2054,6 +2054,8 @@ capture_vib_diagnostics() {
     "$CUSTOM_PROJECT/recipe.yml" \
     "$CUSTOM_PROJECT/Containerfile" \
     "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" \
+    "$TMP_ROOT/target-installed-kernel-packages.actual.tsv" \
+    "$TMP_ROOT/target-installed-package-expectations.tsv" \
     "$TMP_ROOT/vib-core-plugin-archive.inventory" \
     "$TMP_ROOT/vib-plugin-inventory.txt" \
     "$TMP_ROOT/vib-plugin-checksums.sha256" \
@@ -2271,15 +2273,82 @@ PACKAGE_ARCHIVE_README
 #!/usr/bin/env bash
 set -Eeuo pipefail
 shopt -s nullglob
+
 packages=(/deb-pkgs/*.deb)
-((${#packages[@]} > 0)) || { echo "No local hardware .deb packages were included" >&2; exit 1; }
+((${#packages[@]} > 0)) || {
+  echo "No local hardware .deb packages were included" >&2
+  exit 1
+}
+
+command -v apt-get >/dev/null 2>&1 || {
+  echo "apt-get is unavailable before the VanillaOS package layer was unlocked" >&2
+  exit 1
+}
+command -v dpkg-deb >/dev/null 2>&1 || {
+  echo "dpkg-deb is unavailable during the package-install stage" >&2
+  exit 1
+}
+command -v dpkg-query >/dev/null 2>&1 || {
+  echo "dpkg-query is unavailable during the package-install stage" >&2
+  exit 1
+}
+
 apt-get update
+
 # Only the boot-critical image/module closure is staged here. Optional headers,
 # tools, development packages, and metadata are archived under
 # /root/custom-kernel-packages and never enter this APT transaction.
 printf 'Installing selected boot-critical local packages:\n'
 printf '  %s\n' "${packages[@]}"
 apt-get install -y "${packages[@]}"
+
+# VanillaOS locks the package layer later in the recipe. Package-manager
+# executables therefore cannot be assumed to exist in the finished image.
+# Verify the transaction now, while dpkg-query is available, and persist an
+# immutable receipt for post-build verification.
+receipt_dir=/usr/lib/conception
+receipt_tmp="$receipt_dir/target-installed-kernel-packages.tsv.tmp"
+receipt="$receipt_dir/target-installed-kernel-packages.tsv"
+receipt_checksum="$receipt.sha256"
+
+mkdir -p "$receipt_dir"
+printf 'package\trequested_version\tinstalled_version\tarchitecture\tstatus\tsource_deb\tsource_sha256\n' > "$receipt_tmp"
+
+for package_file in "${packages[@]}"; do
+  package_name="$(dpkg-deb -f "$package_file" Package)"
+  requested_version="$(dpkg-deb -f "$package_file" Version)"
+  requested_architecture="$(dpkg-deb -f "$package_file" Architecture)"
+  installed_version="$(dpkg-query -W -f='${Version}' "$package_name")"
+  installed_architecture="$(dpkg-query -W -f='${Architecture}' "$package_name")"
+  installed_status="$(dpkg-query -W -f='${Status}' "$package_name")"
+  source_sha256="$(sha256sum "$package_file" | awk '{print $1}')"
+
+  [[ "$installed_status" == "install ok installed" ]] || {
+    printf 'Package did not reach installed state: %s (%s)\n'       "$package_name" "$installed_status" >&2
+    exit 1
+  }
+  [[ "$installed_version" == "$requested_version" ]] || {
+    printf 'Installed version mismatch for %s: requested=%s installed=%s\n'       "$package_name" "$requested_version" "$installed_version" >&2
+    exit 1
+  }
+  [[ "$installed_architecture" == "$requested_architecture" ]] || {
+    printf 'Installed architecture mismatch for %s: requested=%s installed=%s\n'       "$package_name" "$requested_architecture" "$installed_architecture" >&2
+    exit 1
+  }
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n'     "$package_name"     "$requested_version"     "$installed_version"     "$installed_architecture"     "$installed_status"     "$(basename "$package_file")"     "$source_sha256"     >> "$receipt_tmp"
+done
+
+mv -f "$receipt_tmp" "$receipt"
+(
+  cd "$receipt_dir"
+  sha256sum "$(basename "$receipt")" > "$(basename "$receipt_checksum")"
+)
+
+test -s "$receipt"
+test -s "$receipt_checksum"
+printf 'Recorded verified local-package receipt: %s\n' "$receipt"
+cat "$receipt"
 INSTALL_DEBS_EOF
   chmod 0755 "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
 
@@ -2451,18 +2520,23 @@ build_target_oci() {
 
 verify_target_oci() {
   local verify_script="$TMP_ROOT/verify-target-oci.sh"
-  local expected_packages="$TMP_ROOT/target-installed-package-names.txt"
-  local deb pkg
+  local expected_packages="$TMP_ROOT/target-installed-package-expectations.tsv"
+  local actual_receipt="$TMP_ROOT/target-installed-kernel-packages.actual.tsv"
+  local deb pkg version arch
+
   : > "$expected_packages"
   for deb in "${TARGET_KERNEL_DEBS[@]}"; do
     pkg="$(package_field "$deb" Package)"
-    printf '%s\n' "$pkg" >> "$expected_packages"
+    version="$(package_field "$deb" Version)"
+    arch="$(package_field "$deb" Architecture)"
+    printf '%s\t%s\t%s\n' "$pkg" "$version" "$arch" >> "$expected_packages"
   done
   LC_ALL=C sort -u -o "$expected_packages" "$expected_packages"
 
   cat > "$verify_script" <<'VERIFY_OCI_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 release="$1"
 dtb="$2"
 abroot_name="$3"
@@ -2470,6 +2544,9 @@ firmware_probe="$4"
 root_probe="$5"
 expected_archive_count="$6"
 expected_package_file="$7"
+
+receipt=/usr/lib/conception/target-installed-kernel-packages.tsv
+receipt_checksum=/usr/lib/conception/target-installed-kernel-packages.tsv.sha256
 
 test -s "/boot/vmlinuz-$release"
 test -d "/usr/lib/modules/$release" || test -d "/lib/modules/$release"
@@ -2480,20 +2557,85 @@ test -s "/boot/dtbs/$dtb"
 grep -Fxq "$release" /usr/lib/conception-kernel-release
 grep -Fxq "$dtb" /usr/lib/conception-dtb
 grep -Fq "$abroot_name" /usr/share/abroot/abroot.json
-# Protect the desktop layer from unintended local-package dependency removals.
-dpkg-query -W gnome-shell mutter gdm3 network-manager >/dev/null
-command -v gnome-shell >/dev/null
-command -v NetworkManager >/dev/null
 
-while IFS= read -r package; do
+# The official custom-image cleanup locks the package layer before FsGuard.
+# Do not require apt, dpkg, or dpkg-query in the finished immutable image.
+# Protect the graphical desktop by checking the actual runtime executables.
+test -x /usr/bin/gnome-shell
+test -x /usr/bin/mutter
+if [[ -x /usr/sbin/gdm3 ]]; then
+  :
+elif [[ -x /usr/sbin/gdm ]]; then
+  :
+else
+  echo "GDM executable is absent from the target desktop image" >&2
+  exit 1
+fi
+if [[ -x /usr/bin/NetworkManager ]]; then
+  :
+elif [[ -x /usr/sbin/NetworkManager ]]; then
+  :
+else
+  echo "NetworkManager executable is absent from the target desktop image" >&2
+  exit 1
+fi
+
+# Validate the receipt written during the unlocked package-install stage.
+test -s "$receipt"
+test -s "$receipt_checksum"
+(
+  cd "$(dirname "$receipt")"
+  sha256sum -c "$(basename "$receipt_checksum")"
+)
+
+header="$(sed -n '1p' "$receipt")"
+expected_header=$'package\trequested_version\tinstalled_version\tarchitecture\tstatus\tsource_deb\tsource_sha256'
+[[ "$header" == "$expected_header" ]] || {
+  echo "Unexpected installed-package receipt header" >&2
+  printf 'expected: %q\nactual:   %q\n' "$expected_header" "$header" >&2
+  exit 1
+}
+
+expected_count="$(wc -l < "$expected_package_file" | tr -d '[:space:]')"
+actual_count="$(awk 'NR > 1 { count++ } END { print count + 0 }' "$receipt")"
+[[ "$actual_count" == "$expected_count" ]] || {
+  echo "Installed-package receipt count mismatch: expected=$expected_count actual=$actual_count" >&2
+  exit 1
+}
+
+while IFS=$'\t' read -r package requested_version architecture; do
   [[ -n "$package" ]] || continue
-  dpkg-query -W -f='${Status}\n' "$package" | grep -Fxq 'install ok installed'
+
+  awk -F '\t' \
+    -v package="$package" \
+    -v requested="$requested_version" \
+    -v architecture="$architecture" '
+      NR > 1 &&
+      $1 == package &&
+      $2 == requested &&
+      $3 == requested &&
+      $4 == architecture &&
+      $5 == "install ok installed" {
+        found=1
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$receipt" || {
+      echo "Verified build-time package receipt is missing or mismatched: $package $requested_version $architecture" >&2
+      exit 1
+    }
 done < "$expected_package_file"
 
 test -s /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
 test -s /root/custom-kernel-packages/README.txt
-actual_archive_count="$(find /root/custom-kernel-packages -maxdepth 1 -type f -name '*.deb' | wc -l)"
-test "$actual_archive_count" -eq "$expected_archive_count"
+actual_archive_count="$(
+  find /root/custom-kernel-packages -maxdepth 1 -type f -name '*.deb' |
+    wc -l |
+    tr -d '[:space:]'
+)"
+[[ "$actual_archive_count" == "$expected_archive_count" ]] || {
+  echo "Archived package count mismatch: expected=$expected_archive_count actual=$actual_archive_count" >&2
+  exit 1
+}
 
 if [[ -n "$firmware_probe" ]]; then
   test -s "/usr/lib/firmware/$firmware_probe" || test -s "/lib/firmware/$firmware_probe"
@@ -2501,18 +2643,37 @@ fi
 if [[ -n "$root_probe" ]]; then
   test -e "/root/$root_probe"
 fi
+
+if command -v dpkg-query >/dev/null 2>&1; then
+  echo "Informational: dpkg-query remains available in this target image."
+else
+  echo "Informational: dpkg-query is absent after package-layer locking; persistent receipt validation was used."
+fi
 VERIFY_OCI_EOF
   chmod 0755 "$verify_script"
 
   run_logged "verify-target-oci" "$OCI_RUNTIME" run --rm \
     -v "$verify_script:/verify-target-oci.sh:ro" \
-    -v "$expected_packages:/expected-target-packages.txt:ro" \
+    -v "$expected_packages:/expected-target-packages.tsv:ro" \
     --entrypoint /bin/bash "$TARGET_IMAGE_REF" \
     /verify-target-oci.sh "$KERNEL_RELEASE" "$DTB_NAME" "$ABROOT_IMAGE_NAME" \
     "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL" "${#KERNEL_DEBS[@]}" \
-    /expected-target-packages.txt
-  ok "Target OCI verification passed."
+    /expected-target-packages.tsv
+
+  # Export the exact receipt from the verified image into release evidence.
+  "$OCI_RUNTIME" run --rm \
+    --entrypoint /bin/cat \
+    "$TARGET_IMAGE_REF" \
+    /usr/lib/conception/target-installed-kernel-packages.tsv \
+    > "$actual_receipt"
+  [[ -s "$actual_receipt" ]] || die "Unable to export the target installed-package receipt."
+
+  cp -a "$actual_receipt" "$RELEASE_DIR/target-installed-kernel-packages.tsv"
+  cp -a "$expected_packages" "$RELEASE_DIR/target-installed-package-expectations.tsv"
+
+  ok "Target OCI verification passed without requiring runtime package-manager tools."
 }
+
 
 # --------------------------- live ISO build ------------------------------
 
@@ -2831,6 +2992,8 @@ Supplied kernel .debs:       ${#KERNEL_DEBS[@]}
 Target-installed .debs:      ${#TARGET_KERNEL_DEBS[@]}
 Target-excluded .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
 Target archive location:     /root/custom-kernel-packages
+Installed package receipt:   /usr/lib/conception/target-installed-kernel-packages.tsv
+Runtime dpkg-query required: no
 Live boot .debs:             ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
 Firmware source:             ${FIRMWARE_SOURCE:-none}
