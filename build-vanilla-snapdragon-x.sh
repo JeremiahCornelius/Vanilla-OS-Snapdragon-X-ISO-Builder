@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.5.sh
+# build-vanilla-arm64-release-v2.5.6.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.5
+# Version: 2.5.6
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.5"
+SCRIPT_VERSION="2.5.6"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -1778,7 +1778,15 @@ vib_preflight() {
       printf '\nvib --version:\n'
       vib --version || true
       printf '\nvib --help, first 80 lines:\n'
-      vib --help 2>&1 | sed -n '1,80p' || true
+      set +e
+      set +o pipefail
+      vib --help > /tmp/vib-help-preflight.$$ 2>&1
+      _vib_help_preflight_status=$?
+      sed -n '1,80p' /tmp/vib-help-preflight.$$ || true
+      rm -f /tmp/vib-help-preflight.$$
+      printf '\nvib --help exit status: %s\n' "$_vib_help_preflight_status"
+      set -o pipefail
+      set -e
     else
       printf 'vib was not found in PATH.\n'
     fi
@@ -1806,10 +1814,27 @@ vib_preflight() {
 
     printf '\n## Vib dry diagnostics\n'
     printf 'Attempting: vib build --help\n'
-    vib build --help 2>&1 | sed -n '1,120p' || true
+    set +e
+    set +o pipefail
+    vib build --help > /tmp/vib-build-help.$$ 2>&1
+    _vib_build_help_status=$?
+    sed -n '1,120p' /tmp/vib-build-help.$$ || true
+    rm -f /tmp/vib-build-help.$$
+    printf '\nvib build --help exit status: %s\n' "$_vib_build_help_status"
+
+    printf '\nAttempting: vib --help\n'
+    vib --help > /tmp/vib-help.$$ 2>&1
+    _vib_help_status=$?
+    sed -n '1,120p' /tmp/vib-help.$$ || true
+    rm -f /tmp/vib-help.$$
+    printf '\nvib --help exit status: %s\n' "$_vib_help_status"
+
+    set -o pipefail
+    set -e
   } >"$log" 2>&1
 
-  # Hard validation checks that should stop before an opaque `vib build`.
+  # Hard validation checks below may stop before an opaque `vib build`.
+  # Informational probes above must never stop preflight merely because a help command returns non-zero.
   if ! command -v vib >/dev/null 2>&1; then
     fail "vib is not available in PATH."
     print_failure_tail "$log"
