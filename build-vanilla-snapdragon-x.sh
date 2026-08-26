@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.6.sh
+# build-vanilla-arm64-release-v2.5.7.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.6
+# Version: 2.5.7
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.6"
+SCRIPT_VERSION="2.5.7"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -1738,14 +1738,14 @@ vib_deep_diagnostics() {
 
 
 vib_preflight() {
-  # Emit a detailed, command-log-friendly Vib diagnostic before invoking
-  # `vib build`. This exists because some Vib failures can return exit status 1
-  # with little or no output. The preflight makes wrong binary selection,
-  # architecture mismatch, missing execute bit, missing plugins, or missing
-  # recipe files visible before the build command is attempted.
+  # Emit detailed, command-log-friendly Vib diagnostics before invoking
+  # `vib build`. This version prints an explicit PASS/FAIL verdict for every
+  # hard validation so the failure reason is visible even when the last 80 log
+  # lines only show non-fatal help probes.
   local workdir="$1"
   local label="$2"
   local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-vib-preflight-$(date -u +%H%M%S).log"
+  local failed_check=""
 
   mkdir -p "$OUTPUT_DIR/logs"
   LAST_COMMAND_LOG="$log"
@@ -1776,16 +1776,9 @@ vib_preflight() {
         ldd "$(command -v vib)" || true
       fi
       printf '\nvib --version:\n'
-      vib --version || true
-      printf '\nvib --help, first 80 lines:\n'
       set +e
-      set +o pipefail
-      vib --help > /tmp/vib-help-preflight.$$ 2>&1
-      _vib_help_preflight_status=$?
-      sed -n '1,80p' /tmp/vib-help-preflight.$$ || true
-      rm -f /tmp/vib-help-preflight.$$
-      printf '\nvib --help exit status: %s\n' "$_vib_help_preflight_status"
-      set -o pipefail
+      vib --version
+      printf 'vib --version exit status: %s\n' "$?"
       set -e
     else
       printf 'vib was not found in PATH.\n'
@@ -1797,7 +1790,7 @@ vib_preflight() {
     printf '\nrecipe.yml:\n'
     ls -l recipe.yml || true
     printf '\nrecipe.yml focused excerpt around known fragile sections:\n'
-    grep -nE 'mandb|runroot|fsguard|cleanup2' recipe.yml 2>/dev/null || true
+    grep -nE 'mandb|runroot|fsguard|cleanup2|vibversion' recipe.yml 2>/dev/null || true
     printf '\nContainerfile / Dockerfile:\n'
     ls -l Containerfile Dockerfile 2>/dev/null || true
     printf '\nplugins directory:\n'
@@ -1807,12 +1800,12 @@ vib_preflight() {
 
     printf '\n## Known YAML indentation issue check\n'
     if grep -nE '^[[:space:]]{3}- mandb -c$|^[[:space:]]{3}- name: runroot$|^- name: cleanup2$' recipe.yml 2>/dev/null; then
-      printf 'Known malformed recipe.yml indentation remains. Builder repair did not run or did not succeed.\n'
+      printf 'FAIL known malformed recipe.yml indentation remains.\n'
     else
-      printf 'No known malformed indentation patterns detected.\n'
+      printf 'PASS no known malformed indentation patterns detected.\n'
     fi
 
-    printf '\n## Vib dry diagnostics\n'
+    printf '\n## Vib dry diagnostics, informational only\n'
     printf 'Attempting: vib build --help\n'
     set +e
     set +o pipefail
@@ -1828,76 +1821,97 @@ vib_preflight() {
     sed -n '1,120p' /tmp/vib-help.$$ || true
     rm -f /tmp/vib-help.$$
     printf '\nvib --help exit status: %s\n' "$_vib_help_status"
-
     set -o pipefail
     set -e
   } >"$log" 2>&1
 
-  # Hard validation checks below may stop before an opaque `vib build`.
-  # Informational probes above must never stop preflight merely because a help command returns non-zero.
+  # Hard validation checks. Every return path writes a visible verdict into the
+  # same log before returning failure.
+  {
+    printf '\n## Hard preflight validation verdicts\n'
+  } >>"$log"
+
   if ! command -v vib >/dev/null 2>&1; then
-    fail "vib is not available in PATH."
+    failed_check="vib-path"
+    printf 'FAIL %s: vib is not available in PATH.\n' "$failed_check" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS vib-path: %s\n' "$(command -v vib)" >>"$log"
 
   if [[ ! -x "$(command -v vib)" ]]; then
-    fail "vib exists but is not executable: $(command -v vib)"
+    failed_check="vib-executable-bit"
+    printf 'FAIL %s: vib exists but is not executable: %s\n' "$failed_check" "$(command -v vib)" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS vib-executable-bit\n' >>"$log"
 
   if [[ ! -f "$workdir/recipe.yml" ]]; then
-    fail "recipe.yml is missing in $workdir"
+    failed_check="recipe-present"
+    printf 'FAIL %s: recipe.yml is missing in %s\n' "$failed_check" "$workdir" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS recipe-present\n' >>"$log"
 
   if ! validate_vib_version_matches_recipe "$workdir" "$log"; then
-    fail "Vib version compatibility validation failed before Vib execution."
+    failed_check="vib-version-compatibility"
+    printf 'FAIL %s\n' "$failed_check" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS vib-version-compatibility\n' >>"$log"
 
   if ! validate_recipe_yaml_parse "$workdir" "$log"; then
-    fail "recipe.yml failed YAML parse/structure validation before Vib execution."
+    failed_check="recipe-yaml-parse"
+    printf 'FAIL %s\n' "$failed_check" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     warn "This explains a silent 'vib build recipe.yml' exit."
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS recipe-yaml-parse\n' >>"$log"
 
   if ! validate_required_recipe_plugins "$workdir" "$log"; then
-    fail "A recipe-specific Vib plugin failed validation before Vib execution."
+    failed_check="recipe-plugin-validation"
+    printf 'FAIL %s\n' "$failed_check" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     warn "Most likely causes: wrong plugin architecture, missing symbols, or unresolved shared-library dependency."
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS recipe-plugin-validation\n' >>"$log"
 
-  # Vanilla image recipes commonly expect plugin bundles, especially fsguard.
-  # By this point the builder should already have resolved plugins from the
-  # Vib release bundle. Treat an empty plugins directory as a setup failure
-  # rather than continuing to an opaque Vib failure.
   if [[ ! -d "$workdir/plugins" ]] || ! find "$workdir/plugins" -type f | grep -q .; then
-    fail "No Vib plugin files were found under $workdir/plugins."
-    warn "The builder should have installed plugins before Stage 8."
-    warn "See preflight log: $log"
+    failed_check="plugins-present"
+    printf 'FAIL %s: no Vib plugin files under %s/plugins\n' "$failed_check" "$workdir" >>"$log"
+    fail "Vib preflight failed: $failed_check"
     print_failure_tail "$log"
     return 1
   fi
+  printf 'PASS plugins-present\n' >>"$log"
 
   if grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$workdir/recipe.yml"; then
     if [[ ! -s "$workdir/plugins/fsguard.so" ]]; then
-      fail "recipe.yml uses 'type: fsguard' but $workdir/plugins/fsguard.so is missing."
-      warn "The generic Vib plugin bundle is not sufficient for this recipe."
-      warn "See preflight log: $log"
+      failed_check="fsguard-plugin-present"
+      printf 'FAIL %s: recipe uses fsguard but %s/plugins/fsguard.so is missing\n' "$failed_check" "$workdir" >>"$log"
+      fail "Vib preflight failed: $failed_check"
       print_failure_tail "$log"
       return 1
     fi
+    printf 'PASS fsguard-plugin-present\n' >>"$log"
   fi
 
+  printf '\nPRELIGHT_RESULT: PASS\n' >>"$log"
   ok "Vib preflight completed for $label."
   return 0
 }
+
 
 run_vib_build_with_diagnostics() {
   local label="$1"
