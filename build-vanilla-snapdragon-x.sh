@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.9.sh
+# build-vanilla-arm64-release-v2.7.0.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.9
+# Version: 2.7.0
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.9"
+SCRIPT_VERSION="2.7.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2525,16 +2525,19 @@ PY
 }
 
 patch_known_unavailable_packages() {
-  # Patch known unavailable or transiently removed packages out of Vib-generated
-  # module files before the generated Containerfile is built.
+  # YAML-aware and Containerfile-aware optional package removal.
   #
-  # Current known failure:
-  #   network-manager-fortisslvpn has no installation candidate in the pinned
-  #   Vanilla repo snapshot used by ghcr.io/vanilla-os/pico:dev.
+  # Regression fixed in 2.7.0:
+  #   The previous raw token-removal logic also patched Vib module YAML files
+  #   line-by-line. That can corrupt apt module structure and produce:
+  #     json: cannot unmarshal string into Go struct field AptModule.sources of type api.Source
   #
-  # This package is a NetworkManager VPN plugin, not required for baseline boot,
-  # Wi-Fi, kernel, DTB, Qualcomm firmware, or ISO generation. Treat it as
-  # optional by default and record the patch.
+  # This implementation:
+  #   - uses PyYAML for *.yml/*.yaml files and preserves the expected
+  #     sources: [ { packages: [...] } ] structure,
+  #   - uses text token removal only for generated Containerfile/Dockerfile,
+  #   - validates apt modules after patching,
+  #   - creates backups and logs diffs.
   local repo="$1"
   local label="$2"
   local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-known-unavailable-package-patch-$(date -u +%H%M%S).log"
@@ -2553,51 +2556,150 @@ patch_known_unavailable_packages() {
   printf 'Packages: %s\n\n' "$KNOWN_UNAVAILABLE_PACKAGES" >>"$log"
 
   for pkg in $KNOWN_UNAVAILABLE_PACKAGES; do
+    # Patch Vib YAML modules structurally.
     while IFS= read -r file; do
       [[ -f "$file" ]] || continue
-      if grep -qw -- "$pkg" "$file"; then
-        changed_any=1
-        backup="$file.builder-backup-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
-        tmp="$file.builder-patched.$$"
-        cp -a "$file" "$backup"
+      grep -qw -- "$pkg" "$file" || continue
 
-        # Remove the exact package token while preserving the rest of the file.
-        # This handles both one-package-per-line YAML lists and inline generated
-        # apt-get command package lists.
-        python3 - "$file" "$tmp" "$pkg" <<'PY'
-import re, sys
-src, dst, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
-pat_token = re.compile(r'(^|[\s"\'])' + re.escape(pkg) + r'($|[\s"\'])')
-out = []
-with open(src, "r", encoding="utf-8") as f:
-    for line in f:
-        original = line
+      backup="$file.builder-backup-yaml-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
+      tmp="$file.builder-patched.$$"
 
-        # Remove YAML list item lines that contain only the package.
-        if re.match(r'^\s*-\s*["\']?' + re.escape(pkg) + r'["\']?\s*$', line):
-            continue
+      if python3 - "$file" "$tmp" "$pkg" <<'PY'
+import sys
+from pathlib import Path
 
-        # Remove exact package tokens from inline command/package lists.
-        line = re.sub(r'(?<![A-Za-z0-9_.+-])' + re.escape(pkg) + r'(?![A-Za-z0-9_.+-])', '', line)
-        line = re.sub(r'[ \t]{2,}', ' ', line)
-        out.append(line)
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+pkg = sys.argv[3]
 
-with open(dst, "w", encoding="utf-8") as f:
-    f.writelines(out)
+try:
+    import yaml
+except Exception as exc:
+    print(f"ERROR: PyYAML import failed: {exc}", file=sys.stderr)
+    sys.exit(10)
+
+try:
+    data = yaml.safe_load(src.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"ERROR: YAML parse failed for {src}: {exc}", file=sys.stderr)
+    sys.exit(11)
+
+changed = False
+
+def remove_pkg_from_obj(obj):
+    global changed
+    if isinstance(obj, dict):
+        for key, value in list(obj.items()):
+            if key == "packages" and isinstance(value, list):
+                new_value = [x for x in value if x != pkg]
+                if len(new_value) != len(value):
+                    obj[key] = new_value
+                    changed = True
+            else:
+                remove_pkg_from_obj(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            remove_pkg_from_obj(item)
+
+remove_pkg_from_obj(data)
+
+if not changed:
+    sys.exit(2)
+
+# Validate Vib apt module shape where present. The apt plugin expects sources to
+# be a list of mappings, not strings.
+def validate_apt_shape(obj, path="root"):
+    if isinstance(obj, dict):
+        if obj.get("type") == "apt":
+            sources = obj.get("sources")
+            if sources is not None:
+                if not isinstance(sources, list):
+                    raise TypeError(f"{path}.sources must be list, got {type(sources).__name__}")
+                for i, source in enumerate(sources):
+                    if not isinstance(source, dict):
+                        raise TypeError(f"{path}.sources[{i}] must be mapping, got {type(source).__name__}")
+                    if "packages" in source and not isinstance(source["packages"], list):
+                        raise TypeError(f"{path}.sources[{i}].packages must be list, got {type(source['packages']).__name__}")
+        for k, v in obj.items():
+            validate_apt_shape(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            validate_apt_shape(item, f"{path}[{i}]")
+
+validate_apt_shape(data)
+
+dst.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False), encoding="utf-8")
+sys.exit(0)
 PY
+      then
+        cp -a "$file" "$backup"
         mv "$tmp" "$file"
+        changed_any=1
         {
-          printf 'PATCHED package: %s\n' "$pkg"
+          printf 'PATCHED YAML package: %s\n' "$pkg"
           printf 'File: %s\n' "$file"
           printf 'Backup: %s\n' "$backup"
           printf 'Diff:\n'
           diff -u "$backup" "$file" || true
           printf '\n'
         } >>"$log"
-        warn "Removed optional unavailable package '$pkg' from $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+        warn "Removed optional unavailable package '$pkg' from YAML $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+      else
+        rc=$?
+        rm -f "$tmp"
+        if [[ "$rc" -ne 2 ]]; then
+          fail "Failed YAML-aware optional package patch for $file"
+          warn "Patch log: $log"
+          return "$rc"
+        fi
       fi
-    done < <(grep -RIl -- "$pkg" "$repo/modules" "$repo/sources" "$repo/recipe.yml" "$repo/Containerfile" "$repo/Dockerfile" 2>/dev/null || true)
+    done < <(grep -RIl -- "$pkg" "$repo/modules" "$repo/sources" "$repo/recipe.yml" 2>/dev/null | grep -E '\.(ya?ml)$' || true)
+
+    # Patch generated Containerfile/Dockerfile text command lines only.
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      grep -qw -- "$pkg" "$file" || continue
+
+      backup="$file.builder-backup-text-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
+      tmp="$file.builder-patched.$$"
+      cp -a "$file" "$backup"
+
+      python3 - "$file" "$tmp" "$pkg" <<'PY'
+import re, sys
+src, dst, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+changed = False
+out = []
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        new = re.sub(r'(?<![A-Za-z0-9_.+-])' + re.escape(pkg) + r'(?![A-Za-z0-9_.+-])', '', line)
+        new = re.sub(r'[ \t]{2,}', ' ', new)
+        if new != line:
+            changed = True
+        out.append(new)
+with open(dst, "w", encoding="utf-8") as f:
+    f.writelines(out)
+sys.exit(0 if changed else 2)
+PY
+      rc=$?
+      if [[ "$rc" -eq 0 ]]; then
+        mv "$tmp" "$file"
+        changed_any=1
+        {
+          printf 'PATCHED Containerfile package: %s\n' "$pkg"
+          printf 'File: %s\n' "$file"
+          printf 'Backup: %s\n' "$backup"
+          printf 'Diff:\n'
+          diff -u "$backup" "$file" || true
+          printf '\n'
+        } >>"$log"
+        warn "Removed optional unavailable package '$pkg' from generated build file $(basename "$file")"
+      else
+        rm -f "$tmp"
+      fi
+    done < <(grep -RIl -- "$pkg" "$repo/Containerfile" "$repo/Dockerfile" 2>/dev/null || true)
   done
+
+  validate_vib_apt_module_yaml_shapes "$repo" "$label" "$log" || return $?
 
   if [[ "$changed_any" -eq 1 ]]; then
     warn "Known unavailable package patch applied. Log: $log"
@@ -2605,6 +2707,80 @@ PY
     ok "No known unavailable package tokens found to patch for $label."
   fi
 }
+
+validate_vib_apt_module_yaml_shapes() {
+  local repo="$1"
+  local label="$2"
+  local log="${3:-$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-apt-yaml-shape-validation-$(date -u +%H%M%S).log}"
+
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  python3 - "$repo" >>"$log" 2>&1 <<'PY'
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+
+try:
+    import yaml
+except Exception as exc:
+    print(f"APT_YAML_VALIDATION_ERROR: PyYAML import failed: {exc}")
+    sys.exit(10)
+
+bad = []
+
+def validate_file(path: Path):
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        bad.append((str(path), f"YAML parse error: {exc}"))
+        return
+
+    def walk(obj, trail):
+        if isinstance(obj, dict):
+            if obj.get("type") == "apt":
+                sources = obj.get("sources")
+                if sources is not None:
+                    if not isinstance(sources, list):
+                        bad.append((str(path), f"{trail}.sources must be list, got {type(sources).__name__}"))
+                    else:
+                        for i, source in enumerate(sources):
+                            if not isinstance(source, dict):
+                                bad.append((str(path), f"{trail}.sources[{i}] must be mapping, got {type(source).__name__}"))
+                            elif "packages" in source and not isinstance(source["packages"], list):
+                                bad.append((str(path), f"{trail}.sources[{i}].packages must be list, got {type(source['packages']).__name__}"))
+            for k, v in obj.items():
+                walk(v, f"{trail}.{k}")
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                walk(item, f"{trail}[{i}]")
+
+    walk(data, "root")
+
+for base in [repo / "modules", repo / "sources"]:
+    if base.exists():
+        for path in sorted(list(base.rglob("*.yml")) + list(base.rglob("*.yaml"))):
+            validate_file(path)
+
+if bad:
+    print("APT_YAML_SHAPE_VALIDATION_FAIL")
+    for path, msg in bad:
+        print(f"{path}: {msg}")
+    sys.exit(1)
+
+print("APT_YAML_SHAPE_VALIDATION_OK")
+PY
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "Vib apt module YAML shape validation failed for $label."
+    warn "This would cause Vib errors such as: json: cannot unmarshal string into Go struct field AptModule.sources"
+    print_failure_tail "$log"
+    return "$rc"
+  fi
+  ok "Vib apt module YAML shape validation passed for $label."
+  return 0
+}
+
 
 classify_container_build_failure() {
   # Provide concise classification for common generated-container failures.
@@ -2625,6 +2801,10 @@ classify_container_build_failure() {
     fail "Container build failed because a Debian changelog has a non-policy timestamp."
     grep -nE "Could not parse timestamp|uses full .* instead of abbreviated month name|debian/changelog" "$log" >&2 || true
     warn "The builder can patch known changelog date issues when PATCH_KNOWN_DEBIAN_CHANGELOG_DATES=1."
+  elif grep -q "cannot unmarshal string into Go struct field AptModule.sources" "$log"; then
+    fail "Vib failed because an apt module YAML file has an invalid sources shape."
+    grep -n "cannot unmarshal string into Go struct field AptModule.sources" "$log" >&2 || true
+    warn "The optional package patcher is now YAML-aware and validates apt module shape before Vib."
   fi
 }
 
