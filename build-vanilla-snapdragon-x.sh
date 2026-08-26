@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 8.0.0
+# Version 8.0.1
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,23 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.1 corrections after the first offline-installer field test:
+#   - Separates the logical image name consumed by Albius from the physical
+#     loopback endpoint. The installer now uses a port-free logical reference
+#     under oci.conception.invalid, remapped by containers/image to
+#     127.0.0.1:<port>.
+#   - Avoids an Albius/Prometheus storage-name defect. Prometheus replaces '/'
+#     but not ':' when creating its containers-storage destination name; a
+#     source containing both ':<port>' and ':<tag>' therefore becomes invalid
+#     after manifest discovery and before any layer blobs are requested.
+#   - Keeps the bridge on loopback plaintext HTTP with an explicit insecure
+#     registry rule. HTTPS ClientHello probes are expected fallback behavior and
+#     are suppressed from the local bridge log.
+#   - Adds a complete local bridge self-test that validates the tag manifest,
+#     nested OCI indexes, config, layers, sizes, and SHA-256 digests before
+#     Vanilla Installer is launched.
+#   - Records both logical and physical registry references in release evidence.
 #
 # v8.0.0 installed-image architecture:
 #   - Freezes v7.0.13 as the proven bootable live-environment milestone and
@@ -38,7 +55,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.0"
+SCRIPT_VERSION="8.0.1"
 SCRIPT_NAME="$(basename "$0")"
 
 # Record whether profile-resolvable values were explicitly supplied through the
@@ -116,6 +133,8 @@ ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-}"
 EMBEDDED_IMAGE_TAG="${EMBEDDED_IMAGE_TAG:-}"
 LOCAL_REGISTRY_HOST="${LOCAL_REGISTRY_HOST:-127.0.0.1}"
 LOCAL_REGISTRY_PORT="${LOCAL_REGISTRY_PORT:-5000}"
+LOCAL_REGISTRY_LOGICAL_HOST="${LOCAL_REGISTRY_LOGICAL_HOST:-oci.conception.invalid}"
+LOCAL_REGISTRY_NAMESPACE="${LOCAL_REGISTRY_NAMESPACE:-conception}"
 INSTALLER_AUTOSTART="${INSTALLER_AUTOSTART:-1}"
 INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="${INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE:-1}"
@@ -446,6 +465,10 @@ Options:
   --registry-image REF            Registry source used in registry mode.
   --iso-image-path PATH           ISO path for the embedded OCI layout.
   --local-registry-port PORT      Loopback registry bridge port.
+  --local-registry-logical-host HOST
+                                  Port-free logical registry hostname remapped
+                                  to the loopback bridge. Default:
+                                  oci.conception.invalid
   --live-ref REF                  live-iso branch, tag, or commit.
   --custom-image-ref REF          custom-image branch, tag, or commit.
   --push-target-image             Push target OCI after local verification.
@@ -568,6 +591,7 @@ parse_args() {
       --registry-image) [[ $# -ge 2 ]] || die "--registry-image requires a value"; REGISTRY_IMAGE_REF="$2"; shift 2 ;;
       --iso-image-path) [[ $# -ge 2 ]] || die "--iso-image-path requires a value"; ISO_IMAGE_LAYOUT_PATH="$2"; shift 2 ;;
       --local-registry-port) [[ $# -ge 2 ]] || die "--local-registry-port requires a value"; LOCAL_REGISTRY_PORT="$2"; shift 2 ;;
+      --local-registry-logical-host) [[ $# -ge 2 ]] || die "--local-registry-logical-host requires a value"; LOCAL_REGISTRY_LOGICAL_HOST="$2"; shift 2 ;;
       --live-ref) [[ $# -ge 2 ]] || die "--live-ref requires a value"; LIVE_ISO_REF="$2"; shift 2 ;;
       --custom-image-ref) [[ $# -ge 2 ]] || die "--custom-image-ref requires a value"; CUSTOM_IMAGE_REF="$2"; shift 2 ;;
       --push-target-image) PUSH_TARGET_IMAGE=1; shift ;;
@@ -592,7 +616,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.0-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.1-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -825,6 +849,19 @@ load_hardware_profile() {
     die "ISO image-layout path must be beneath /target-images: $ISO_IMAGE_LAYOUT_PATH"
   [[ "$LOCAL_REGISTRY_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_REGISTRY_PORT >= 1024 && LOCAL_REGISTRY_PORT <= 65535 )) || \
     die "Invalid unprivileged local registry port: $LOCAL_REGISTRY_PORT"
+
+  case "$LOCAL_REGISTRY_HOST" in
+    127.0.0.1|localhost) : ;;
+    *) die "The embedded registry bridge must remain loopback-only: $LOCAL_REGISTRY_HOST" ;;
+  esac
+  [[ "$LOCAL_REGISTRY_LOGICAL_HOST" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] || \
+    die "Invalid logical local-registry host: $LOCAL_REGISTRY_LOGICAL_HOST"
+  [[ "$LOCAL_REGISTRY_LOGICAL_HOST" == *.* ]] || \
+    die "Logical local-registry host must be fully qualified: $LOCAL_REGISTRY_LOGICAL_HOST"
+  [[ "$LOCAL_REGISTRY_LOGICAL_HOST" != *:* ]] || \
+    die "Logical local-registry host must not contain a port: $LOCAL_REGISTRY_LOGICAL_HOST"
+  [[ "$LOCAL_REGISTRY_NAMESPACE" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || \
+    die "Invalid local-registry namespace: $LOCAL_REGISTRY_NAMESPACE"
 
   case "$DELIVERY_MODE" in
     iso-oci) : ;;
@@ -2303,6 +2340,8 @@ Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
 Installer delivery:        $DELIVERY_MODE
 ISO OCI layout path:       $ISO_IMAGE_LAYOUT_PATH
+Logical registry host:      $LOCAL_REGISTRY_LOGICAL_HOST
+Physical registry endpoint: $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
 Registry fallback:         ${REGISTRY_IMAGE_REF:-none}
 Profile manifest:          $PROFILE_FILE_RESOLVED
 Kernel package directory:  $KERNEL_DEB_DIR
@@ -3422,6 +3461,40 @@ VERIFY_OCI_EOF
 
 # ---------------------- embedded target image ----------------------------
 
+local_registry_repository() {
+  printf '%s/%s' "$LOCAL_REGISTRY_NAMESPACE" "$PROFILE"
+}
+
+local_registry_logical_prefix() {
+  printf '%s/%s/%s' \
+    "$LOCAL_REGISTRY_LOGICAL_HOST" "$LOCAL_REGISTRY_NAMESPACE" "$PROFILE"
+}
+
+local_registry_physical_prefix() {
+  printf '%s:%s/%s/%s' \
+    "$LOCAL_REGISTRY_HOST" "$LOCAL_REGISTRY_PORT" \
+    "$LOCAL_REGISTRY_NAMESPACE" "$PROFILE"
+}
+
+compose_local_install_image_ref() {
+  local tag="$1"
+  printf '%s:%s' "$(local_registry_logical_prefix)" "$tag"
+}
+
+validate_prometheus_storage_reference_compatibility() {
+  # Albius currently derives a storage name with:
+  #   strings.ReplaceAll(imageSource, "/", "-")
+  # A port-bearing source retains two ':' characters after that operation and
+  # is rejected by the containers-storage reference parser.
+  local image_ref="$1"
+  local derived="${image_ref//\//-}"
+
+  [[ "$image_ref" != *"://"* ]] || \
+    die "Installer image reference must not include a transport prefix: $image_ref"
+  [[ "$derived" =~ ^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || \
+    die "Installer image reference is incompatible with Albius storage naming: source=$image_ref derived=$derived"
+}
+
 local_image_transport_ref() {
   case "$OCI_RUNTIME" in
     podman) printf 'containers-storage:%s' "$TARGET_IMAGE_REF" ;;
@@ -3442,7 +3515,8 @@ export_target_oci_for_installer() {
   local source_ref descriptor digest_hex manifest_blob
   source_ref="$(local_image_transport_ref)"
   EMBEDDED_IMAGE_TAG="${EMBEDDED_IMAGE_TAG:-${BUILD_DATE}-${RELEASE_ID}}"
-  LOCAL_INSTALL_IMAGE_REF="${LOCAL_REGISTRY_HOST}:${LOCAL_REGISTRY_PORT}/conception/${PROFILE}:${EMBEDDED_IMAGE_TAG}"
+  LOCAL_INSTALL_IMAGE_REF="$(compose_local_install_image_ref "$EMBEDDED_IMAGE_TAG")"
+  validate_prometheus_storage_reference_compatibility "$LOCAL_INSTALL_IMAGE_REF"
 
   rm -rf "$EMBEDDED_OCI_LAYOUT"
   mkdir -p "$EMBEDDED_OCI_LAYOUT"
@@ -3491,12 +3565,15 @@ export_target_oci_for_installer() {
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg layout "$ISO_IMAGE_LAYOUT_PATH" \
     --arg local_ref "$LOCAL_INSTALL_IMAGE_REF" \
+    --arg physical_ref "$(local_registry_physical_prefix):$EMBEDDED_IMAGE_TAG" \
     --arg installer_ref "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg delivery "$DELIVERY_MODE" \
     --arg kernel "$KERNEL_RELEASE" \
     --arg dtb "$DTB_NAME" \
     '{profile:$profile, tag:$tag, manifest_digest:$digest, iso_layout_path:$layout,
-      local_registry_reference:$local_ref, installer_reference:$installer_ref,
+      local_registry_reference:$local_ref,
+      physical_registry_reference:$physical_ref,
+      installer_reference:$installer_ref,
       delivery_mode:$delivery, kernel_release:$kernel, dtb:$dtb}' \
     > "$TMP_ROOT/embedded-target-image.json"
 
@@ -4468,10 +4545,26 @@ def descriptor_for_reference(reference: str):
     return None
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ConceptionOCIRegistry/1.0"
+    server_version = "ConceptionOCIRegistry/1.1"
 
     def log_message(self, fmt, *values):
-        print(f"registry: {self.address_string()} {fmt % values}", flush=True)
+        rendered = fmt % values
+        # containers/image commonly probes HTTPS before falling back to the
+        # explicitly permitted plaintext HTTP endpoint.
+        if "Bad request version" in rendered:
+            return
+        request_line = getattr(self, "requestline", "")
+        if request_line and any(
+            ord(ch) < 32 and ch not in "\t\r\n" for ch in request_line
+        ):
+            return
+        print(f"registry: {self.address_string()} {rendered}", flush=True)
+
+    def log_error(self, fmt, *values):
+        rendered = fmt % values
+        if "Bad request version" in rendered:
+            return
+        self.log_message(fmt, *values)
 
     def _send_file(self, path: Path, content_type: str, digest: str | None = None, head=False):
         if not path.is_file():
@@ -4731,7 +4824,9 @@ profile=$(printf '%q' "$PROFILE")
 delivery=$(printf '%q' "$DELIVERY_MODE")
 layout_path=$(printf '%q' "$ISO_IMAGE_LAYOUT_PATH")
 tag=$(printf '%q' "$EMBEDDED_IMAGE_TAG")
-repository=$(printf '%q' "conception/$PROFILE")
+repository=$(printf '%q' "$LOCAL_REGISTRY_NAMESPACE/$PROFILE")
+logical_image=$(printf '%q' "$LOCAL_INSTALL_IMAGE_REF")
+expected_digest=$(printf '%q' "$TARGET_IMAGE_MANIFEST_DIGEST")
 host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
 port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
 recipe=/etc/vanilla-installer/profiles/$PROFILE/recipe.json
@@ -4765,20 +4860,129 @@ if [[ "\$delivery" == "iso-oci" ]]; then
     > /tmp/conception-local-registry.log 2>&1 &
   server_pid=\$!
 
-  python3 - "\$host" "\$port" <<'PY_WAIT_REGISTRY'
-import socket, sys, time
-host, port = sys.argv[1], int(sys.argv[2])
-for _ in range(100):
+  python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import time
+import urllib.request
+
+host, port, repository, tag, expected_digest = sys.argv[1:]
+base = f"http://{host}:{port}"
+seen_manifests: set[str] = set()
+seen_blobs: set[str] = set()
+
+accept = ", ".join(
+    [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+)
+
+def request(path: str):
+    req = urllib.request.Request(base + path, method="GET")
+    req.add_header("Accept", accept)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.headers, response.read()
+
+for attempt in range(100):
     try:
-        with socket.create_connection((host, port), timeout=0.2):
-            raise SystemExit(0)
-    except OSError:
+        request("/v2/")
+        break
+    except Exception:
+        if attempt == 99:
+            raise SystemExit("local OCI registry bridge did not become ready")
         time.sleep(0.1)
-raise SystemExit("local OCI registry bridge did not become ready")
-PY_WAIT_REGISTRY
+
+def verify_digest(raw: bytes, expected: str, context: str) -> None:
+    algorithm, encoded = expected.split(":", 1)
+    if algorithm != "sha256":
+        raise SystemExit(f"{context}: unsupported digest algorithm {algorithm}")
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != encoded:
+        raise SystemExit(
+            f"{context}: expected={expected} actual=sha256:{actual}"
+        )
+
+def fetch_blob(descriptor: dict) -> None:
+    digest = descriptor["digest"]
+    if digest in seen_blobs:
+        return
+    _headers, raw = request(f"/v2/{repository}/blobs/{digest}")
+    verify_digest(raw, digest, f"blob {digest}")
+    expected_size = descriptor.get("size")
+    if expected_size is not None and len(raw) != expected_size:
+        raise SystemExit(
+            f"blob {digest}: expected size {expected_size}, received {len(raw)}"
+        )
+    seen_blobs.add(digest)
+
+def fetch_manifest(reference: str, expected: str | None = None) -> str:
+    headers, raw = request(f"/v2/{repository}/manifests/{reference}")
+    digest = headers.get("Docker-Content-Digest")
+    if not digest:
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    verify_digest(raw, digest, f"manifest {reference}")
+    if expected and digest != expected:
+        raise SystemExit(
+            f"manifest {reference}: expected {expected}, received {digest}"
+        )
+    if digest in seen_manifests:
+        return digest
+    seen_manifests.add(digest)
+
+    document = json.loads(raw)
+    media_type = document.get("mediaType", headers.get_content_type())
+    if "manifest.list" in media_type or media_type.endswith("image.index.v1+json"):
+        descriptors = document.get("manifests", [])
+        if not descriptors:
+            raise SystemExit(f"manifest index {digest} has no child manifests")
+        for descriptor in descriptors:
+            child = descriptor["digest"]
+            fetch_manifest(child, child)
+        return digest
+
+    config = document.get("config")
+    layers = document.get("layers", [])
+    if not config or not layers:
+        raise SystemExit(f"image manifest {digest} lacks config or layers")
+    fetch_blob(config)
+    for descriptor in layers:
+        fetch_blob(descriptor)
+    return digest
+
+actual_digest = fetch_manifest(tag, expected_digest)
+summary = {
+    "physical_endpoint": base,
+    "repository": repository,
+    "tag": tag,
+    "expected_digest": expected_digest,
+    "actual_digest": actual_digest,
+    "manifests_verified": len(seen_manifests),
+    "blobs_verified": len(seen_blobs),
+}
+with open(
+    "/tmp/conception-local-registry-selftest.json", "w", encoding="utf-8"
+) as handle:
+    json.dump(summary, handle, indent=2)
+    handle.write("\n")
+
+print(
+    f"Local OCI bridge verified: manifests={len(seen_manifests)} "
+    f"blobs={len(seen_blobs)} digest={actual_digest}"
+)
+PY_VERIFY_REGISTRY
+
+  printf 'Installer logical image: %s\n' "$logical_image"
+  printf 'Physical loopback endpoint: http://%s:%s/%s\n' \
+    "$host" "$port" "$repository"
 fi
 
-export VANILLA_CUSTOM_RECIPE="\$recipe"
+export VANILLA_CUSTOM_RECIPE="$recipe"
 EOF_INSTALLER_WRAPPER
   if [[ "$INSTALLER_IGNORE_CPU" == "1" ]]; then
     printf 'export IGNORE_CPU=1\n' >> "$wrapper"
@@ -4794,8 +4998,11 @@ EOF_INSTALLER_WRAPPER_END
   chmod 0755 "$wrapper"
 
   cat > "$root/etc/containers/registries.conf.d/90-conception-local.conf" <<EOF_REGISTRY_CONF
+# Keep the image name given to Albius port-free. containers/image remaps this
+# exact logical repository to the loopback-only physical bridge.
 [[registry]]
-location = "$LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT"
+prefix = "$(local_registry_logical_prefix)"
+location = "$(local_registry_physical_prefix)"
 insecure = true
 blocked = false
 EOF_REGISTRY_CONF
@@ -4818,6 +5025,14 @@ EOF_INSTALLER_DESKTOP
   fi
 
   bash -n "$wrapper"
+  grep -Fqx "prefix = \"$(local_registry_logical_prefix)\"" \
+    "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
+    die "Generated registry remapping lacks its logical prefix."
+  grep -Fqx "location = \"$(local_registry_physical_prefix)\"" \
+    "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
+    die "Generated registry remapping lacks its physical endpoint."
+  validate_prometheus_storage_reference_compatibility "$INSTALLER_DEFAULT_IMAGE_REF"
+
   jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg profile "$PROFILE" \
     '.images.default == $image and .conception_profile == $profile' \
@@ -5117,6 +5332,7 @@ Kernel:                   $KERNEL_RELEASE
 DTB:                      $DTB_NAME
 Installer delivery:       $DELIVERY_MODE
 Installer image source:   $INSTALLER_DEFAULT_IMAGE_REF
+Physical bridge endpoint: http://$(local_registry_physical_prefix)
 ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
 Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
 Built:                    $(date -u --iso-8601=seconds)
@@ -5153,7 +5369,8 @@ Installer delivery mode:     $DELIVERY_MODE
 Installer default image:     $INSTALLER_DEFAULT_IMAGE_REF
 Embedded OCI layout path:    $ISO_IMAGE_LAYOUT_PATH
 Embedded OCI tag:            $EMBEDDED_IMAGE_TAG
-Local registry bridge:       $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
+Logical registry reference:  $LOCAL_INSTALL_IMAGE_REF
+Physical registry bridge:      $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
 Registry fallback:           ${REGISTRY_IMAGE_REF:-none}
 Target OCI base:             $CUSTOM_IMAGE_BASE
 Vib version:                 $VIB_DETECTED_VERSION
