@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 8.0.2
+# Version 8.0.3
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -14,22 +14,28 @@
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
 #
-# v8.0.2 corrections after the v8.0.1 late-stage remaster field test:
-#   - Fixes an unquoted installer-wrapper heredoc regression. Runtime wrapper
-#     variables such as $host, $port, $repository, $tag, $expected_digest,
-#     $logical_image, and $recipe were expanded by the builder itself while
-#     set -u was active, causing "host: unbound variable" before the live
-#     filesystem could be repacked.
-#   - Generates the wrapper in two deterministic sections: a build-time header
-#     containing shell-escaped resolved values, followed by a single-quoted
-#     runtime body whose variable references cannot be expanded by the builder.
-#   - Adds a regression harness that invokes the complete installer-overlay
-#     generator with no outer host variable defined, validates the generated
-#     wrapper and registries.conf, and executes the wrapper in registry mode
-#     through a controlled fake vanilla-installer command.
-#   - Preserves all v8.0.1 logical-to-physical registry remapping, insecure
-#     loopback HTTP behavior, complete OCI bridge self-test, profile support,
-#     target-image delivery, and v7 live-boot functionality.
+# v8.0.3 corrections after the first successful offline OCI installation
+# transfer and the subsequent installed-system verification failure:
+#   - Preserves image-provided content below /home, /mnt, /root, and /srv before
+#     Vanilla Installer relocates those paths to /var. The stock processor
+#     deleted the OCI /root payload before creating /root -> var/root, causing
+#     root-overlay checksum entries to report FAILED open or read.
+#   - Adds explicit installed-root migration evidence and verifies the resulting
+#     /root symlink, custom package archive, user-supplied root overlay, kernel,
+#     DTB, firmware, and ABRoot binding with named failure diagnostics.
+#   - Makes /etc/vanilla/installer.log a real Albius transcript. The installer
+#     VTE now runs Albius through root-owned bash/tee with pipefail, preserving
+#     the visible console output and the actual Albius exit status.
+#   - Persists the generated Albius recipe at
+#     /tmp/conception-albius-install-recipe.json for deterministic diagnosis.
+#   - Generates a live-system diagnostic collector at
+#     /usr/local/sbin/conception-collect-installer-diagnostics.
+#   - Rebuilds the profile launcher generator without the unquoted-heredoc
+#     expansion defect from v8.0.1 and without the duplicated runtime body that
+#     was present in the superseded v8.0.2 draft.
+#   - Preserves v8.0.1 logical-to-physical registry remapping, complete OCI
+#     manifest/blob self-test, hardware-profile support, and all v7 live-boot
+#     kernel, firmware, DTB, graphical, and GRUB safeguards.
 #
 # v8.0.1 corrections after the first offline-installer field test:
 #   - Separates the logical image name consumed by Albius from the physical
@@ -72,7 +78,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.2"
+SCRIPT_VERSION="8.0.3"
 SCRIPT_NAME="$(basename "$0")"
 
 # Record whether profile-resolvable values were explicitly supplied through the
@@ -633,7 +639,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.2-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.3-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -3090,6 +3096,7 @@ EOF_FINALIZE
   cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot" <<EOF_INSTALLED_VERIFY
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 expected_profile=$(printf '%q' "$PROFILE")
 expected_release=$(printf '%q' "$KERNEL_RELEASE")
 expected_dtb=$(printf '%q' "$DTB_NAME")
@@ -3098,63 +3105,137 @@ initramfs_probes=$initramfs_array
 installed_paths=$installed_array
 cmdline_append=$cmdline_array
 
-profile="\$(cat /usr/lib/conception-profile)"
-release="\$(cat /usr/lib/conception-kernel-release)"
-dtb="\$(cat /usr/lib/conception-dtb)"
-[[ "\$profile" == "\$expected_profile" ]]
-[[ "\$release" == "\$expected_release" ]]
-[[ "\$dtb" == "\$expected_dtb" ]]
+fail_verify() {
+  local code="\$1"
+  shift
+  printf 'CONCEPTION INSTALLED-BOOT VERIFY FAILED: %s\n' "\$*" >&2
+  exit "\$code"
+}
+
+require_nonempty_file() {
+  local path="\$1" label="\$2" code="\$3"
+  [[ -r "\$path" ]] || fail_verify "\$code" "\$label is not readable: \$path"
+  [[ -s "\$path" ]] || fail_verify "\$code" "\$label is empty: \$path"
+}
+
+require_directory() {
+  local path="\$1" label="\$2" code="\$3"
+  [[ -d "\$path" ]] || fail_verify "\$code" "\$label is missing: \$path"
+}
+
+read_required_marker() {
+  local path="\$1" label="\$2" code="\$3" value
+  require_nonempty_file "\$path" "\$label marker" "\$code"
+  value="\$(cat "\$path")" || fail_verify "\$code" "Unable to read \$label marker: \$path"
+  [[ -n "\$value" ]] || fail_verify "\$code" "\$label marker resolved empty: \$path"
+  printf '%s' "\$value"
+}
+
+profile="\$(read_required_marker /usr/lib/conception-profile profile 101)"
+release="\$(read_required_marker /usr/lib/conception-kernel-release kernel 102)"
+dtb="\$(read_required_marker /usr/lib/conception-dtb DTB 103)"
+
+[[ "\$profile" == "\$expected_profile" ]] || \
+  fail_verify 104 "Profile mismatch: expected=\$expected_profile installed=\$profile"
+[[ "\$release" == "\$expected_release" ]] || \
+  fail_verify 105 "Kernel mismatch: expected=\$expected_release installed=\$release"
+[[ "\$dtb" == "\$expected_dtb" ]] || \
+  fail_verify 106 "DTB mismatch: expected=\$expected_dtb installed=\$dtb"
+
+[[ -r /usr/lib/conception-kernel-command-line ]] || \
+  fail_verify 107 "Kernel command-line marker is unreadable"
+
+require_directory "/usr/lib/modules/\$release" "selected kernel module tree" 108
+require_nonempty_file "/boot/init/vos-a/vmlinuz-\$release" "ABRoot A kernel" 109
+require_nonempty_file "/boot/init/vos-a/initrd.img-\$release" "ABRoot A initramfs" 110
+require_nonempty_file "/boot/init/vos-a/dtbs/\$dtb" "ABRoot A DTB" 111
+require_nonempty_file "/boot/init/vos-b/dtbs/\$dtb" "ABRoot B DTB seed" 112
 
 state=/boot/init/vos-a
 cfg="\$state/abroot.cfg"
-test -s "\$state/vmlinuz-\$release"
-test -s "\$state/initrd.img-\$release"
-test -s "\$state/dtbs/\$dtb"
-test -s "\$cfg"
+require_nonempty_file "\$cfg" "ABRoot A configuration" 113
 
-grep -Fq "vmlinuz-\$release" "\$cfg"
-grep -Fq "devicetree (lvm/vos--root-init)/vos-a/dtbs/\$dtb" "\$cfg"
-grep -Fq "initrd.img-\$release" "\$cfg"
-awk -v dtb="devicetree (lvm/vos--root-init)/vos-a/dtbs/\$dtb" \
-    -v initrd="initrd (lvm/vos--root-init)/vos-a/initrd.img-\$release" '
+grep -Fq "vmlinuz-\$release" "\$cfg" || \
+  fail_verify 114 "ABRoot configuration does not reference selected kernel \$release"
+
+dtb_line="devicetree (lvm/vos--root-init)/vos-a/dtbs/\$dtb"
+initrd_line="initrd (lvm/vos--root-init)/vos-a/initrd.img-\$release"
+
+[[ "\$(grep -Fxc "\$dtb_line" "\$cfg" || true)" == "1" ]] || \
+  fail_verify 115 "ABRoot configuration must contain exactly one selected DTB directive"
+[[ "\$(grep -Fxc "\$initrd_line" "\$cfg" || true)" == "1" ]] || \
+  fail_verify 116 "ABRoot configuration must contain exactly one selected initramfs directive"
+
+awk -v dtb="\$dtb_line" -v initrd="\$initrd_line" '
   index(\$0, dtb) { d=NR }
   index(\$0, initrd) { i=NR }
   END { exit(d > 0 && i > 0 && d < i ? 0 : 1) }
-' "\$cfg"
+' "\$cfg" || fail_verify 117 "ABRoot DTB directive does not precede initrd"
+
+mapfile -t configured_kernels < <(
+  grep -oE 'vmlinuz-[^[:space:]]+' "\$cfg" | LC_ALL=C sort -u
+)
+[[ "\${#configured_kernels[@]}" -eq 1 ]] || \
+  fail_verify 118 "ABRoot configuration references multiple kernel images: \${configured_kernels[*]:-none}"
+[[ "\${configured_kernels[0]}" == "vmlinuz-\$release" ]] || \
+  fail_verify 119 "ABRoot configuration references the wrong kernel: \${configured_kernels[0]}"
+
 for argument in "\${cmdline_append[@]}"; do
   [[ -n "\$argument" ]] || continue
-  grep -Fq -- "\$argument" "\$cfg" || {
-    echo "Installed ABRoot config lacks required kernel argument: \$argument" >&2
-    exit 94
-  }
+  grep -Fq -- "\$argument" "\$cfg" || \
+    fail_verify 120 "ABRoot config lacks required kernel argument: \$argument"
 done
 
 for probe in "\${firmware_probes[@]}"; do
-  [[ -e "/usr/lib/firmware/\$probe" || -e "/lib/firmware/\$probe" ]]
-done
-for path in "\${installed_paths[@]}"; do
-  [[ -e "\$path" ]]
+  [[ -e "/usr/lib/firmware/\$probe" || -e "/lib/firmware/\$probe" ]] || \
+    fail_verify 121 "Installed firmware probe is missing: \$probe"
 done
 
+for path in "\${installed_paths[@]}"; do
+  [[ -e "\$path" ]] || fail_verify 122 "Required installed path is missing: \$path"
+done
+
+[[ -L /root ]] || fail_verify 123 "/root was not converted to the expected /var-backed symlink"
+root_link="\$(readlink /root)" || fail_verify 124 "Unable to read the /root symlink"
+case "\$root_link" in
+  var/root|/var/root) : ;;
+  *) fail_verify 125 "Unexpected /root symlink target: \$root_link" ;;
+esac
+
+require_nonempty_file \
+  /usr/lib/conception/relocated-var-payload.status \
+  "relocated payload status" 126
+require_nonempty_file \
+  /root/custom-kernel-packages/PACKAGE-SELECTION.tsv \
+  "preserved custom-kernel package selection archive" 127
+
 if (( \${#initramfs_probes[@]} > 0 )); then
-  command -v lsinitramfs >/dev/null 2>&1 || {
-    echo "lsinitramfs is required for configured initramfs firmware probes" >&2
-    exit 92
-  }
+  command -v lsinitramfs >/dev/null 2>&1 || \
+    fail_verify 128 "lsinitramfs is required for configured initramfs probes"
   listing="\$(mktemp)"
   trap 'rm -f "\$listing"' EXIT
-  lsinitramfs "\$state/initrd.img-\$release" > "\$listing"
+  lsinitramfs "\$state/initrd.img-\$release" > "\$listing" || \
+    fail_verify 129 "Unable to list the installed initramfs"
   for probe in "\${initramfs_probes[@]}"; do
     normalized="\${probe#/}"
-    grep -Fq "\$normalized" "\$listing" || {
-      echo "Installed initramfs lacks required probe: \$probe" >&2
-      exit 93
-    }
+    grep -Fq "\$normalized" "\$listing" || \
+      fail_verify 130 "Installed initramfs lacks required probe: \$probe"
   done
 fi
 
+root_overlay_status="not-configured"
 if [[ -s /usr/lib/conception/root-overlay.sha256 ]]; then
-  sha256sum -c /usr/lib/conception/root-overlay.sha256
+  checksum_output="\$(mktemp)"
+  if ! sha256sum -c /usr/lib/conception/root-overlay.sha256 \
+      > "\$checksum_output" 2>&1; then
+    cat "\$checksum_output" >&2 || true
+    rm -f "\$checksum_output"
+    fail_verify 131 \
+      "Root overlay checksum validation failed after Vanilla /root relocation"
+  fi
+  cat "\$checksum_output"
+  rm -f "\$checksum_output"
+  root_overlay_status="pass"
 fi
 
 mkdir -p /usr/lib/conception
@@ -3165,7 +3246,14 @@ mkdir -p /usr/lib/conception
   printf 'dtb\tpass\t%s\n' "\$dtb"
   printf 'abroot_a\tpass\t%s\n' "\$cfg"
   printf 'initramfs\tpass\t%s\n' "\$state/initrd.img-\$release"
+  printf 'root_relocation\tpass\t%s\n' "\$root_link"
+  printf 'root_overlay\t%s\t%s\n' "\$root_overlay_status" \
+    /usr/lib/conception/root-overlay.sha256
+  printf 'package_archive\tpass\t%s\n' \
+    /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
 } > /usr/lib/conception/installed-boot-validation.tsv
+
+printf 'Conception installed-boot verification passed for profile %s.\n' "\$profile"
 EOF_INSTALLED_VERIFY
   chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot"
 
@@ -4666,21 +4754,45 @@ PY_VALIDATE_REGISTRY_SERVER
 }
 
 patch_vanilla_installer_processor() {
-  local root="$1" processor original patched diff_file
-  processor="$(find "$root/usr" -type f -path '*/vanilla_installer/utils/processor.py' -print -quit 2>/dev/null || true)"
-  [[ -n "$processor" ]] || die "Unable to locate Vanilla Installer processor.py in live filesystem."
+  local root="$1"
+  local processor progress
+  local processor_original processor_patched processor_diff
+  local progress_original progress_patched progress_diff
 
-  original="$TMP_ROOT/installer-processor.original.py"
-  patched="$TMP_ROOT/installer-processor.patched.py"
-  diff_file="$TMP_ROOT/installer-processor.diff"
-  cp -a "$processor" "$original"
+  processor="$(
+    find "$root/usr" -type f \
+      -path '*/vanilla_installer/utils/processor.py' \
+      -print -quit 2>/dev/null || true
+  )"
+  progress="$(
+    find "$root/usr" -type f \
+      -path '*/vanilla_installer/views/progress.py' \
+      -print -quit 2>/dev/null || true
+  )"
 
-  python3 - "$processor" <<'PATCH_INSTALLER_PROCESSOR'
+  [[ -n "$processor" ]] || \
+    die "Unable to locate Vanilla Installer processor.py in live filesystem."
+  [[ -n "$progress" ]] || \
+    die "Unable to locate Vanilla Installer progress.py in live filesystem."
+
+  processor_original="$TMP_ROOT/installer-processor.original.py"
+  processor_patched="$TMP_ROOT/installer-processor.patched.py"
+  processor_diff="$TMP_ROOT/installer-processor.diff"
+  progress_original="$TMP_ROOT/installer-progress.original.py"
+  progress_patched="$TMP_ROOT/installer-progress.patched.py"
+  progress_diff="$TMP_ROOT/installer-progress.diff"
+
+  cp -a "$processor" "$processor_original"
+  cp -a "$progress" "$progress_original"
+
+  python3 - "$processor" "$progress" <<'PATCH_INSTALLER_COMPONENTS'
 from pathlib import Path
 import sys
 
-path = Path(sys.argv[1])
-data = path.read_text(encoding="utf-8")
+processor_path = Path(sys.argv[1])
+progress_path = Path(sys.argv[2])
+
+data = processor_path.read_text(encoding="utf-8")
 marker = "CONCEPTION_V8_PROFILE_INSTALLER_PATCH"
 if marker in data:
     raise SystemExit("processor already contains the v8 patch marker")
@@ -4710,15 +4822,48 @@ if abimage_anchor not in data:
     raise SystemExit("unable to locate abimage image-name anchor")
 data = data.replace(abimage_anchor, abimage_replacement, 1)
 
+adapt_anchor = '''            # Adapt root A filesystem structure
+'''
+migration_step = r'''            # Preserve OCI payload before converting selected paths to
+            # /var-backed symlinks.
+            recipe.add_postinstall_step(
+                "shell",
+                [
+                    *[f"mkdir -p /mnt/a/var/{path}" for path in _REL_VAR_LINKS],
+                    *[
+                        f"if [ -d /mnt/a/{path} ] && [ ! -L /mnt/a/{path} ]; "
+                        f"then cp -a /mnt/a/{path}/. /mnt/a/var/{path}/; fi"
+                        for path in _REL_VAR_LINKS
+                    ],
+                    "mkdir -p /mnt/a/usr/lib/conception",
+                    "printf '%s\\n' 'complete' > /mnt/a/usr/lib/conception/relocated-var-payload.status",
+                ],
+            )
+
+'''
+if adapt_anchor not in data:
+    raise SystemExit("unable to locate root-layout adaptation anchor")
+data = data.replace(adapt_anchor, migration_step + adapt_anchor, 1)
+
+generic_kernel_anchor = (
+    "KERNEL_VERSION=$(ls -1 /mnt/a/usr/lib/modules | sed '1p;d')"
+)
+generic_kernel_replacement = (
+    "KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release)"
+)
+if generic_kernel_anchor not in data:
+    raise SystemExit("unable to locate generic ABRoot kernel selection")
+data = data.replace(generic_kernel_anchor, generic_kernel_replacement, 1)
+
 overlay_anchor = '''            # Mount `/etc` as overlay
 '''
-profile_boot_step = r"""            # Replace the generic ABRoot entry with the deterministic
+profile_boot_step = r'''            # Replace the generic ABRoot entry with the deterministic
             # hardware-profile kernel and DTB binding.
             recipe.add_postinstall_step(
                 "shell",
                 [
                     " ".join(
-                        f'''KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release) && \
+                        f"""KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release) && \
                         DTB_NAME=$(cat /mnt/a/usr/lib/conception-dtb) && \
                         PROFILE_NAME=$(cat /mnt/a/usr/lib/conception-profile) && \
                         KERNEL_CMDLINE=$(tr '\\n' ' ' < /mnt/a/usr/lib/conception-kernel-command-line) && \
@@ -4739,12 +4884,12 @@ profile_boot_step = r"""            # Replace the generic ABRoot entry with the 
                           "linux (lvm/vos--root-init)/vos-a/vmlinuz-$KERNEL_VERSION root=UUID=$ROOTA_UUID quiet splash bgrt_disable \\$vt_handoff lsm=integrity $KERNEL_CMDLINE" \
                           "devicetree (lvm/vos--root-init)/vos-a/dtbs/$DTB_NAME" \
                           "initrd (lvm/vos--root-init)/vos-a/initrd.img-$KERNEL_VERSION" \
-                          > /mnt/a/boot/init/vos-a/abroot.cfg'''.split()
+                          > /mnt/a/boot/init/vos-a/abroot.cfg""".split()
                     )
                 ],
             )
 
-"""
+'''
 if overlay_anchor not in data:
     raise SystemExit("unable to locate installer boot-step insertion anchor")
 data = data.replace(overlay_anchor, profile_boot_step + overlay_anchor, 1)
@@ -4774,25 +4919,130 @@ if move_anchor not in data:
     raise SystemExit("unable to locate installed-initramfs validation anchor")
 data = data.replace(move_anchor, move_replacement, 1)
 
-path.write_text(data, encoding="utf-8")
-PATCH_INSTALLER_PROCESSOR
+recipe_anchor = '''        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(json.dumps(recipe, default=vars))
+            f.flush()
+            f.close()
 
-  python3 -m py_compile "$processor"
-  cp -a "$processor" "$patched"
-  diff -u "$original" "$patched" > "$diff_file" || true
+            # setting the file executable
+            os.chmod(f.name, 0o755)
+
+            return f.name
+'''
+recipe_replacement = '''        serialized_recipe = json.dumps(recipe, default=vars)
+        persistent_recipe = "/tmp/conception-albius-install-recipe.json"
+        with open(persistent_recipe, "w", encoding="utf-8") as evidence:
+            evidence.write(serialized_recipe)
+            evidence.write("\\n")
+            evidence.flush()
+        os.chmod(persistent_recipe, 0o600)
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(serialized_recipe)
+            f.flush()
+            f.close()
+
+            # setting the file executable
+            os.chmod(f.name, 0o755)
+
+            return f.name
+'''
+if recipe_anchor not in data:
+    raise SystemExit("unable to locate temporary Albius recipe anchor")
+data = data.replace(recipe_anchor, recipe_replacement, 1)
+
+processor_path.write_text(data, encoding="utf-8")
+
+progress = progress_path.read_text(encoding="utf-8")
+progress_marker = "CONCEPTION_V8_ALBIUS_LOG_CAPTURE"
+if progress_marker in progress:
+    raise SystemExit("progress view already contains log capture patch")
+
+spawn_anchor = '''        self.__terminal.spawn_async(
+            Vte.PtyFlags.DEFAULT,
+            ".",
+            ["sh", "-c", f"sudo albius {recipe}"],
+            [],
+            GLib.SpawnFlags.DO_NOT_REAP_CHILD,
+            None,
+            None,
+            -1,
+            None,
+            None,
+        )
+'''
+spawn_replacement = '''        # CONCEPTION_V8_ALBIUS_LOG_CAPTURE
+        log_path = self.__window.recipe.get(
+            "log_file", "/tmp/vanilla_installer.log"
+        )
+        command = (
+            'log_path="$2"; '
+            'install -d -m 0755 "$(dirname "$log_path")"; '
+            'printf "%s\\\\n" "# Vanilla Installer Log" '
+            '"Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$log_path"; '
+            'albius "$1" 2>&1 | tee -a "$log_path"'
+        )
+        self.__terminal.spawn_async(
+            Vte.PtyFlags.DEFAULT,
+            ".",
+            [
+                "sudo",
+                "bash",
+                "-o",
+                "pipefail",
+                "-c",
+                command,
+                "conception-albius",
+                recipe,
+                log_path,
+            ],
+            [],
+            GLib.SpawnFlags.DO_NOT_REAP_CHILD,
+            None,
+            None,
+            -1,
+            None,
+            None,
+        )
+'''
+if spawn_anchor not in progress:
+    raise SystemExit("unable to locate installer VTE Albius spawn anchor")
+progress = progress.replace(spawn_anchor, spawn_replacement, 1)
+progress_path.write_text(progress, encoding="utf-8")
+PATCH_INSTALLER_COMPONENTS
+
+  python3 -m py_compile "$processor" "$progress"
+
+  cp -a "$processor" "$processor_patched"
+  cp -a "$progress" "$progress_patched"
+  diff -u "$processor_original" "$processor_patched" \
+    > "$processor_diff" || true
+  diff -u "$progress_original" "$progress_patched" \
+    > "$progress_diff" || true
 
   {
     printf 'component\tpath\tbefore_sha256\tafter_sha256\tdiff\n'
     printf 'vanilla-installer-processor\t%s\t%s\t%s\t%s\n' \
       "${processor#"$root"}" \
-      "$(sha256sum "$original" | awk '{print $1}')" \
-      "$(sha256sum "$patched" | awk '{print $1}')" \
-      "$diff_file"
+      "$(sha256sum "$processor_original" | awk '{print $1}')" \
+      "$(sha256sum "$processor_patched" | awk '{print $1}')" \
+      "$processor_diff"
+    printf 'vanilla-installer-progress-log-capture\t%s\t%s\t%s\t%s\n' \
+      "${progress#"$root"}" \
+      "$(sha256sum "$progress_original" | awk '{print $1}')" \
+      "$(sha256sum "$progress_patched" | awk '{print $1}')" \
+      "$progress_diff"
   } > "$INSTALLER_PATCH_MANIFEST"
 
-  ok "Patched Vanilla Installer for deterministic profile kernel/DTB installation."
-}
+  grep -Fq "relocated-var-payload.status" "$processor" || \
+    die "Patched installer processor lacks payload-relocation evidence."
+  grep -Fq "conception-albius-install-recipe.json" "$processor" || \
+    die "Patched installer processor lacks persistent recipe evidence."
+  grep -Fq "CONCEPTION_V8_ALBIUS_LOG_CAPTURE" "$progress" || \
+    die "Patched installer progress view lacks Albius log capture."
 
+  ok "Patched Vanilla Installer processor and VTE logging for profile installation."
+}
 install_profile_aware_installer_overlay() {
   local root="$1"
   local recipe_source="$root/etc/vanilla-installer/recipe.json"
@@ -4800,11 +5050,15 @@ install_profile_aware_installer_overlay() {
   local recipe_target="$profile_dir/recipe.json"
   local wrapper="$root/usr/local/libexec/conception-installer-$PROFILE"
   local registry_server="$root/usr/local/libexec/conception-oci-registry.py"
+  local collector="$root/usr/local/sbin/conception-collect-installer-diagnostics"
   local desktop="$root/etc/xdg/autostart/conception-installer-$PROFILE.desktop"
   local app="$root/usr/share/applications/conception-installer-$PROFILE.desktop"
 
-  [[ -s "$recipe_source" ]] || die "Live filesystem lacks Vanilla Installer recipe.json."
+  [[ -s "$recipe_source" ]] || \
+    die "Live filesystem lacks Vanilla Installer recipe.json."
+
   mkdir -p "$profile_dir" "$root/usr/local/libexec" \
+    "$root/usr/local/sbin" \
     "$root/etc/xdg/autostart" "$root/usr/share/applications" \
     "$root/etc/containers/registries.conf.d" \
     "$root/usr/share/conception/profiles/$PROFILE"
@@ -4834,9 +5088,6 @@ install_profile_aware_installer_overlay() {
 
   write_local_oci_registry_server "$registry_server"
 
-  # Write only resolved constants through an expanding heredoc. All dynamic
-  # runtime code is appended through a single-quoted heredoc below, preventing
-  # the builder's set -u environment from expanding wrapper-local variables.
   cat > "$wrapper" <<EOF_INSTALLER_WRAPPER_HEADER
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -4851,9 +5102,16 @@ host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
 port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
 recipe=$(printf '%q' "/etc/vanilla-installer/profiles/$PROFILE/recipe.json")
 server_pid=""
+wrapper_log=/tmp/conception-installer-wrapper.log
 EOF_INSTALLER_WRAPPER_HEADER
 
   cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_RUNTIME'
+
+exec > >(tee -a "$wrapper_log") 2>&1
+printf '\n=== Conception profile installer started: %s ===\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'Profile: %s\n' "$profile"
+printf 'Delivery: %s\n' "$delivery"
 
 cleanup_registry() {
   if [[ -n "$server_pid" ]]; then
@@ -4872,12 +5130,13 @@ if [[ "$delivery" == "iso-oci" ]]; then
       break
     fi
   done
+
   [[ -n "$medium" ]] || {
     echo "Unable to locate embedded target OCI layout: $layout_path" >&2
     exit 70
   }
-  layout="$medium/${layout_path#/}"
 
+  layout="$medium/${layout_path#/}"
   python3 /usr/local/libexec/conception-oci-registry.py \
     --layout "$layout" --tag "$tag" --repository "$repository" \
     --host "$host" --port "$port" \
@@ -5008,183 +5267,97 @@ fi
 
 export VANILLA_CUSTOM_RECIPE="$recipe"
 EOF_INSTALLER_WRAPPER_RUNTIME
-#!/usr/bin/env bash
-set -Eeuo pipefail
-profile=$(printf '%q' "$PROFILE")
-delivery=$(printf '%q' "$DELIVERY_MODE")
-layout_path=$(printf '%q' "$ISO_IMAGE_LAYOUT_PATH")
-tag=$(printf '%q' "$EMBEDDED_IMAGE_TAG")
-repository=$(printf '%q' "$LOCAL_REGISTRY_NAMESPACE/$PROFILE")
-logical_image=$(printf '%q' "$LOCAL_INSTALL_IMAGE_REF")
-expected_digest=$(printf '%q' "$TARGET_IMAGE_MANIFEST_DIGEST")
-host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
-port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
-recipe=/etc/vanilla-installer/profiles/$PROFILE/recipe.json
-server_pid=""
 
-cleanup_registry() {
-  if [[ -n "\$server_pid" ]]; then
-    kill "\$server_pid" >/dev/null 2>&1 || true
-    wait "\$server_pid" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup_registry EXIT INT TERM
-
-if [[ "\$delivery" == "iso-oci" ]]; then
-  medium=""
-  for candidate in /run/live/medium /cdrom /run/media/*/* /media/*/*; do
-    [[ -d "\$candidate" ]] || continue
-    if [[ -s "\$candidate/\${layout_path#/}/oci-layout" ]]; then
-      medium="\$candidate"
-      break
-    fi
-  done
-  [[ -n "\$medium" ]] || {
-    echo "Unable to locate embedded target OCI layout: \$layout_path" >&2
-    exit 70
-  }
-  layout="\$medium/\${layout_path#/}"
-  python3 /usr/local/libexec/conception-oci-registry.py \
-    --layout "\$layout" --tag "\$tag" --repository "\$repository" \
-    --host "\$host" --port "\$port" \
-    > /tmp/conception-local-registry.log 2>&1 &
-  server_pid=\$!
-
-  python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
-from __future__ import annotations
-
-import hashlib
-import json
-import sys
-import time
-import urllib.request
-
-host, port, repository, tag, expected_digest = sys.argv[1:]
-base = f"http://{host}:{port}"
-seen_manifests: set[str] = set()
-seen_blobs: set[str] = set()
-
-accept = ", ".join(
-    [
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    ]
-)
-
-def request(path: str):
-    req = urllib.request.Request(base + path, method="GET")
-    req.add_header("Accept", accept)
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return response.headers, response.read()
-
-for attempt in range(100):
-    try:
-        request("/v2/")
-        break
-    except Exception:
-        if attempt == 99:
-            raise SystemExit("local OCI registry bridge did not become ready")
-        time.sleep(0.1)
-
-def verify_digest(raw: bytes, expected: str, context: str) -> None:
-    algorithm, encoded = expected.split(":", 1)
-    if algorithm != "sha256":
-        raise SystemExit(f"{context}: unsupported digest algorithm {algorithm}")
-    actual = hashlib.sha256(raw).hexdigest()
-    if actual != encoded:
-        raise SystemExit(
-            f"{context}: expected={expected} actual=sha256:{actual}"
-        )
-
-def fetch_blob(descriptor: dict) -> None:
-    digest = descriptor["digest"]
-    if digest in seen_blobs:
-        return
-    _headers, raw = request(f"/v2/{repository}/blobs/{digest}")
-    verify_digest(raw, digest, f"blob {digest}")
-    expected_size = descriptor.get("size")
-    if expected_size is not None and len(raw) != expected_size:
-        raise SystemExit(
-            f"blob {digest}: expected size {expected_size}, received {len(raw)}"
-        )
-    seen_blobs.add(digest)
-
-def fetch_manifest(reference: str, expected: str | None = None) -> str:
-    headers, raw = request(f"/v2/{repository}/manifests/{reference}")
-    digest = headers.get("Docker-Content-Digest")
-    if not digest:
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    verify_digest(raw, digest, f"manifest {reference}")
-    if expected and digest != expected:
-        raise SystemExit(
-            f"manifest {reference}: expected {expected}, received {digest}"
-        )
-    if digest in seen_manifests:
-        return digest
-    seen_manifests.add(digest)
-
-    document = json.loads(raw)
-    media_type = document.get("mediaType", headers.get_content_type())
-    if "manifest.list" in media_type or media_type.endswith("image.index.v1+json"):
-        descriptors = document.get("manifests", [])
-        if not descriptors:
-            raise SystemExit(f"manifest index {digest} has no child manifests")
-        for descriptor in descriptors:
-            child = descriptor["digest"]
-            fetch_manifest(child, child)
-        return digest
-
-    config = document.get("config")
-    layers = document.get("layers", [])
-    if not config or not layers:
-        raise SystemExit(f"image manifest {digest} lacks config or layers")
-    fetch_blob(config)
-    for descriptor in layers:
-        fetch_blob(descriptor)
-    return digest
-
-actual_digest = fetch_manifest(tag, expected_digest)
-summary = {
-    "physical_endpoint": base,
-    "repository": repository,
-    "tag": tag,
-    "expected_digest": expected_digest,
-    "actual_digest": actual_digest,
-    "manifests_verified": len(seen_manifests),
-    "blobs_verified": len(seen_blobs),
-}
-with open(
-    "/tmp/conception-local-registry-selftest.json", "w", encoding="utf-8"
-) as handle:
-    json.dump(summary, handle, indent=2)
-    handle.write("\n")
-
-print(
-    f"Local OCI bridge verified: manifests={len(seen_manifests)} "
-    f"blobs={len(seen_blobs)} digest={actual_digest}"
-)
-PY_VERIFY_REGISTRY
-
-  printf 'Installer logical image: %s\n' "$logical_image"
-  printf 'Physical loopback endpoint: http://%s:%s/%s\n' \
-    "$host" "$port" "$repository"
-fi
-
-export VANILLA_CUSTOM_RECIPE="$recipe"
   if [[ "$INSTALLER_IGNORE_CPU" == "1" ]]; then
     printf 'export IGNORE_CPU=1\n' >> "$wrapper"
   fi
+
   cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_END'
 
 set +e
 vanilla-installer "$@"
 rc=$?
 set -e
+printf 'Vanilla Installer exited with status %s\n' "$rc"
 exit "$rc"
 EOF_INSTALLER_WRAPPER_END
   chmod 0755 "$wrapper"
+
+  cat > "$collector" <<'EOF_INSTALLER_COLLECTOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+stamp="$(date -u +%Y%m%d-%H%M%S)"
+name="conception-installer-diagnostics-$stamp"
+work="/tmp/$name"
+archive="/tmp/$name.tar.gz"
+mkdir -p "$work"
+
+copy_if_present() {
+  local source="$1" destination="${2:-}"
+  [[ -e "$source" ]] || return 0
+  if [[ -n "$destination" ]]; then
+    cp -a "$source" "$work/$destination"
+  else
+    cp -a "$source" "$work/"
+  fi
+}
+
+copy_if_present /etc/vanilla/installer.log
+copy_if_present /tmp/conception-installer-wrapper.log
+copy_if_present /tmp/conception-local-registry.log
+copy_if_present /tmp/conception-local-registry-selftest.json
+copy_if_present /tmp/conception-albius-install-recipe.json
+copy_if_present /etc/containers/registries.conf.d/90-conception-local.conf
+copy_if_present /usr/share/conception profiles
+
+find /etc/vanilla-installer/profiles -maxdepth 3 -type f \
+  -print -exec cp --parents -a '{}' "$work" ';' 2>/dev/null || true
+
+{
+  echo "=== Mount state ==="
+  findmnt /mnt/a || true
+  findmnt /mnt/a/boot || true
+  findmnt /mnt/a/boot/efi || true
+
+  echo
+  echo "=== Profile markers ==="
+  for path in \
+    /mnt/a/.oci_digest \
+    /mnt/a/usr/lib/conception-profile \
+    /mnt/a/usr/lib/conception-kernel-release \
+    /mnt/a/usr/lib/conception-dtb \
+    /mnt/a/usr/lib/conception-kernel-command-line \
+    /mnt/a/usr/lib/conception/relocated-var-payload.status \
+    /mnt/a/usr/lib/conception/installed-boot-validation.tsv
+  do
+    echo
+    echo "--- $path"
+    stat "$path" 2>&1 || true
+    if [[ -f "$path" ]]; then
+      cat "$path" 2>&1 || true
+    fi
+  done
+
+  echo
+  echo "=== Relocated root payload ==="
+  stat /mnt/a/root /mnt/a/var/root 2>&1 || true
+  find /mnt/a/var/root -maxdepth 4 \
+    -printf '%M %u:%g %s %p\n' 2>&1 | sort || true
+
+  echo
+  echo "=== Installed boot state ==="
+  find /mnt/a/boot/init -maxdepth 5 \
+    -printf '%M %u:%g %s %p\n' 2>&1 | sort || true
+} > "$work/installed-target-state.txt" 2>&1
+
+journalctl -b --no-pager > "$work/journal.txt" 2>/dev/null || true
+tar -czf "$archive" -C /tmp "$name"
+printf 'Diagnostic archive: %s\n' "$archive"
+ls -lh "$archive"
+sha256sum "$archive"
+EOF_INSTALLER_COLLECTOR
+  chmod 0755 "$collector"
 
   cat > "$root/etc/containers/registries.conf.d/90-conception-local.conf" <<EOF_REGISTRY_CONF
 # Keep the image name given to Albius port-free. containers/image remaps this
@@ -5206,6 +5379,7 @@ Icon=org.vanillaos.Installer
 Terminal=false
 Categories=System;
 EOF_INSTALLER_DESKTOP
+
   cp -a "$app" "$desktop"
   if [[ "$INSTALLER_AUTOSTART" != "1" ]]; then
     printf 'X-GNOME-Autostart-enabled=false\n' >> "$desktop"
@@ -5214,13 +5388,16 @@ EOF_INSTALLER_DESKTOP
   fi
 
   bash -n "$wrapper"
+  bash -n "$collector"
+
   grep -Fqx "prefix = \"$(local_registry_logical_prefix)\"" \
     "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
     die "Generated registry remapping lacks its logical prefix."
   grep -Fqx "location = \"$(local_registry_physical_prefix)\"" \
     "$root/etc/containers/registries.conf.d/90-conception-local.conf" || \
     die "Generated registry remapping lacks its physical endpoint."
-  validate_prometheus_storage_reference_compatibility "$INSTALLER_DEFAULT_IMAGE_REF"
+  validate_prometheus_storage_reference_compatibility \
+    "$INSTALLER_DEFAULT_IMAGE_REF"
 
   jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg profile "$PROFILE" \
@@ -5237,14 +5414,21 @@ EOF_INSTALLER_DESKTOP
     --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg cfg "/boot/init/vos-a/abroot.cfg" \
-    '{profile:$profile,kernel_release:$release,dtb:$dtb,installer_image:$image,
-      manifest_digest:$digest,abroot_a_config:$cfg,
-      required_markers:["/usr/lib/conception-profile","/usr/lib/conception-kernel-release","/usr/lib/conception-dtb"]}' \
-    > "$INSTALLED_BOOT_EXPECTED_JSON"
+    '{profile:$profile,kernel_release:$release,dtb:$dtb,
+      installer_image:$image,manifest_digest:$digest,
+      abroot_a_config:$cfg,
+      installer_log:"/etc/vanilla/installer.log",
+      persistent_recipe:"/tmp/conception-albius-install-recipe.json",
+      diagnostics_collector:"/usr/local/sbin/conception-collect-installer-diagnostics",
+      required_markers:[
+        "/usr/lib/conception-profile",
+        "/usr/lib/conception-kernel-release",
+        "/usr/lib/conception-dtb",
+        "/usr/lib/conception/relocated-var-payload.status"
+      ]}' > "$INSTALLED_BOOT_EXPECTED_JSON"
 
   ok "Installed profile-aware Vanilla Installer overlay for $PROFILE."
 }
-
 remaster_boot_hardware_only() {
   local iso_tree="$TMP_ROOT/iso-tree"
   local squash_root="$TMP_ROOT/squash-root"
@@ -5494,6 +5678,7 @@ verify_final_release() {
   cp -a "$INSTALLED_BOOT_EXPECTED_JSON" "$RELEASE_DIR/installed-boot-expected.json"
   [[ -f "$INSTALLER_PATCH_MANIFEST" ]] && cp -a "$INSTALLER_PATCH_MANIFEST" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/installer-processor.diff" ]] && cp -a "$TMP_ROOT/installer-processor.diff" "$RELEASE_DIR/"
+  [[ -f "$TMP_ROOT/installer-progress.diff" ]] && cp -a "$TMP_ROOT/installer-progress.diff" "$RELEASE_DIR/"
   [[ -n "$GRUB_PATCH_MANIFEST" && -f "$GRUB_PATCH_MANIFEST" ]] &&     cp -a "$GRUB_PATCH_MANIFEST" "$RELEASE_DIR/"
   if [[ -d "$TMP_ROOT/grub-patches" ]]; then
     mkdir -p "$RELEASE_DIR/grub-patches"
@@ -5522,6 +5707,9 @@ DTB:                      $DTB_NAME
 Installer delivery:       $DELIVERY_MODE
 Installer image source:   $INSTALLER_DEFAULT_IMAGE_REF
 Physical bridge endpoint: http://$(local_registry_physical_prefix)
+Installer transcript:     /etc/vanilla/installer.log
+Persistent Albius recipe: /tmp/conception-albius-install-recipe.json
+Root payload migration:   OCI /home,/mnt,/root,/srv -> installed /var paths
 ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
 Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
 Built:                    $(date -u --iso-8601=seconds)
