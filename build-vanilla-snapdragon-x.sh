@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r2
+# Version 8.5-r3
+#
+# v8.5-r3 live OCI bridge lifecycle and autostart race correction
+# ----------------------------------------------------------------
+# Field installation of r2 proved that the canonical Installer recipe now
+# resolves the intended ISO-local logical image, but Albius later found no
+# listener at 127.0.0.1:5000. Current live-iso:orchid copies the stock
+# org.vanillaos.Installer.desktop into /etc/skel/.config/autostart before the
+# vanilla live user is created. r1/r2 additionally installed a second global
+# profile Installer autostart. Both launchers therefore raced through the
+# profile wrapper. Each wrapper also privately owned a background registry
+# process and killed its recorded PID on EXIT. Only one server could bind the
+# port; if that server belonged to the secondary Gio.Application launcher, the
+# secondary wrapper exited and killed the sole working bridge while the primary
+# Installer GUI continued. Connector/media speed changes could alter race
+# timing but cannot by themselves explain TCP connection-refused.
+#
+# r3 removes process ownership of the bridge from the GUI wrapper entirely. A
+# systemd system service owns the loopback registry for the lifetime of the
+# live system, restarts it on failure, and discovers the ISO medium itself. The
+# Installer wrapper only performs a bounded readiness/metadata integrity probe
+# and then starts the real Installer; it never kills the bridge. r3 also
+# converges on the upstream per-user Installer autostart when present and creates
+# a project fallback autostart only when upstream does not provide one, enforcing
+# exactly one automatic Installer launch path.
+#
+# The old runtime self-test streamed and SHA-256 verified every embedded layer
+# before showing the GUI. With two racing wrappers this could read the complete
+# target OCI twice concurrently and made startup strongly media-speed dependent.
+# Build-time/export verification already binds the embedded target to its digest.
+# r3 therefore validates the runtime registry through /v2/, manifest digests, and
+# HEAD/size/digest checks for all referenced blobs without pre-reading every layer.
+# Albius still performs its normal content-verified pull during installation.
 #
 # v8.5-r2 Reunion Distrobox coherence-gate correction
 # -----------------------------------------------------
@@ -310,7 +342,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r2"
+SCRIPT_VERSION="8.5-r3"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -5075,6 +5107,9 @@ BOOT_EVIDENCE_EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+profile="$(jq -r '.vanillaos_snapdragonx_profile // empty' /etc/vanilla-installer/recipe.json 2>/dev/null || true)"
+[[ -n "$profile" ]] || profile=unknown
+
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 name="vanillaos-snapdragonx-hardware-diagnostics-$stamp"
 work="${TMPDIR:-/tmp}/$name"
@@ -6503,7 +6538,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r2.
+# Managed by VanillaOS-SnapdragonX v8.5-r3.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -6577,7 +6612,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r2-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r3-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
@@ -8541,8 +8576,14 @@ install_profile_aware_installer_overlay() {
   local installer_dispatch="$root/usr/bin/vanilla-installer"
   local installer_real="$root/usr/libexec/vanilla-installer.real"
   local registry_server="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry.py"
+  local registry_service_launcher="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE"
+  local registry_unit_name="vanillaos-snapdragonx-oci-registry.service"
+  local registry_unit="$root/etc/systemd/system/$registry_unit_name"
+  local registry_wants="$root/etc/systemd/system/multi-user.target.wants/$registry_unit_name"
   local collector="$root/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics"
-  local desktop="$root/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
+  local upstream_autostart="$root/home/vanilla/.config/autostart/org.vanillaos.Installer.desktop"
+  local fallback_autostart="$root/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
+  local autostart_evidence="$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/installer-autostart-path"
   local app="$root/usr/share/applications/vanillaos-snapdragonx-installer-$PROFILE.desktop"
 
   [[ -s "$recipe_source" ]] || \
@@ -8552,6 +8593,7 @@ install_profile_aware_installer_overlay() {
     "$root/usr/local/sbin" \
     "$root/etc/xdg/autostart" "$root/usr/share/applications" \
     "$root/etc/containers/registries.conf.d" \
+    "$root/etc/systemd/system/multi-user.target.wants" \
     "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE"
 
   jq \
@@ -8589,7 +8631,8 @@ install_profile_aware_installer_overlay() {
   # Preserve the package-provided executable behind a private real entrypoint.
   # /usr/bin/vanilla-installer is replaced below with a dispatch shim so stock
   # desktop launchers, the installer session, and manual CLI use all traverse
-  # the profile wrapper that starts/verifies the embedded OCI bridge.
+  # the profile wrapper. In r3 that wrapper verifies a systemd-owned embedded
+  # OCI bridge; it does not own or terminate the registry process itself.
   [[ -s "$installer_dispatch" ]] || \
     die "Live filesystem lacks /usr/bin/vanilla-installer before profile dispatch installation."
   cp -L --preserve=mode,ownership,timestamps "$installer_dispatch" "$installer_real"
@@ -8601,6 +8644,80 @@ install_profile_aware_installer_overlay() {
     "$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/embedded-target-image.json"
 
   write_local_oci_registry_server "$registry_server"
+
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    grep -Eq '^vanilla:' "$root/etc/passwd" || \
+      die "Live filesystem lacks the vanilla account required by the OCI bridge service."
+
+    cat > "$registry_service_launcher" <<EOF_REGISTRY_SERVICE_HEADER
+#!/usr/bin/env bash
+# VANILLAOS_SNAPDRAGONX_OCI_REGISTRY_SERVICE_V1
+set -Eeuo pipefail
+profile=$(printf '%q' "$PROFILE")
+layout_path=$(printf '%q' "$ISO_IMAGE_LAYOUT_PATH")
+tag=$(printf '%q' "$EMBEDDED_IMAGE_TAG")
+repository=$(printf '%q' "$LOCAL_REGISTRY_NAMESPACE/$PROFILE")
+host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
+port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
+registry_log=/tmp/vanillaos-snapdragonx-local-registry.log
+EOF_REGISTRY_SERVICE_HEADER
+
+    cat >> "$registry_service_launcher" <<'EOF_REGISTRY_SERVICE_RUNTIME'
+exec > >(tee -a "$registry_log") 2>&1
+printf '\n=== VanillaOS-SnapdragonX OCI registry service: %s ===\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'Profile: %s\n' "$profile"
+printf 'Endpoint: http://%s:%s/%s\n' "$host" "$port" "$repository"
+
+medium=""
+for ((attempt=1; attempt<=600; attempt++)); do
+  for candidate in /run/live/medium /cdrom /run/media/*/* /media/*/*; do
+    [[ -d "$candidate" ]] || continue
+    if [[ -s "$candidate/${layout_path#/}/oci-layout" && \
+          -s "$candidate/${layout_path#/}/index.json" ]]; then
+      medium="$candidate"
+      break 2
+    fi
+  done
+  sleep 0.1
+done
+
+[[ -n "$medium" ]] || {
+  echo "Unable to locate embedded target OCI layout: $layout_path" >&2
+  exit 70
+}
+
+layout="$medium/${layout_path#/}"
+printf 'Embedded OCI medium: %s\n' "$medium"
+printf 'Embedded OCI layout: %s\n' "$layout"
+exec /usr/bin/python3 /usr/local/libexec/vanillaos-snapdragonx-oci-registry.py \
+  --layout "$layout" --tag "$tag" --repository "$repository" \
+  --host "$host" --port "$port"
+EOF_REGISTRY_SERVICE_RUNTIME
+    chmod 0755 "$registry_service_launcher"
+
+    cat > "$registry_unit" <<EOF_REGISTRY_UNIT
+[Unit]
+Description=VanillaOS-SnapdragonX ISO-local OCI registry bridge
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=vanilla
+ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE
+Restart=always
+RestartSec=1
+KillMode=control-group
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_REGISTRY_UNIT
+    ln -sfn "../$registry_unit_name" "$registry_wants"
+  else
+    rm -f "$registry_service_launcher" "$registry_unit" "$registry_wants"
+  fi
 
   cat > "$wrapper" <<EOF_INSTALLER_WRAPPER_HEADER
 #!/usr/bin/env bash
@@ -8616,7 +8733,7 @@ host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
 port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
 recipe=$(printf '%q' "/etc/vanilla-installer/profiles/$PROFILE/recipe.json")
 storage_guard_policy=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY")
-server_pid=""
+registry_unit=vanillaos-snapdragonx-oci-registry.service
 wrapper_log=/tmp/vanillaos-snapdragonx-installer-wrapper.log
 EOF_INSTALLER_WRAPPER_HEADER
 
@@ -8629,37 +8746,12 @@ printf 'Profile: %s\n' "$profile"
 printf 'Delivery: %s\n' "$delivery"
 printf 'Storage guard policy: %s\n' "$storage_guard_policy"
 
-cleanup_registry() {
-  if [[ -n "$server_pid" ]]; then
-    kill "$server_pid" >/dev/null 2>&1 || true
-    wait "$server_pid" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup_registry EXIT INT TERM
-
+# VANILLAOS_SNAPDRAGONX_REGISTRY_SERVICE_CLIENT_V1
+# The registry is live-system infrastructure owned by systemd, not a child of
+# this GUI launcher. Secondary Gio.Application launches may exit immediately;
+# they must never tear down the bridge used by the primary Installer instance.
 if [[ "$delivery" == "iso-oci" ]]; then
-  medium=""
-  for candidate in /run/live/medium /cdrom /run/media/*/* /media/*/*; do
-    [[ -d "$candidate" ]] || continue
-    if [[ -s "$candidate/${layout_path#/}/oci-layout" ]]; then
-      medium="$candidate"
-      break
-    fi
-  done
-
-  [[ -n "$medium" ]] || {
-    echo "Unable to locate embedded target OCI layout: $layout_path" >&2
-    exit 70
-  }
-
-  layout="$medium/${layout_path#/}"
-  python3 /usr/local/libexec/vanillaos-snapdragonx-oci-registry.py \
-    --layout "$layout" --tag "$tag" --repository "$repository" \
-    --host "$host" --port "$port" \
-    > /tmp/vanillaos-snapdragonx-local-registry.log 2>&1 &
-  server_pid=$!
-
-  python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
+  if ! python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
 from __future__ import annotations
 
 import hashlib
@@ -8671,7 +8763,7 @@ import urllib.request
 host, port, repository, tag, expected_digest = sys.argv[1:]
 base = f"http://{host}:{port}"
 seen_manifests: set[str] = set()
-seen_blobs: set[str] = set()
+seen_blob_headers: set[str] = set()
 
 accept = ", ".join(
     [
@@ -8682,18 +8774,18 @@ accept = ", ".join(
     ]
 )
 
-def request(path: str):
-    req = urllib.request.Request(base + path, method="GET")
+def request(path: str, method: str = "GET"):
+    req = urllib.request.Request(base + path, method=method)
     req.add_header("Accept", accept)
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=10) as response:
         return response.headers, response.read()
 
-for attempt in range(100):
+for attempt in range(600):
     try:
         request("/v2/")
         break
     except Exception:
-        if attempt == 99:
+        if attempt == 599:
             raise SystemExit("local OCI registry bridge did not become ready")
         time.sleep(0.1)
 
@@ -8707,20 +8799,27 @@ def verify_digest(raw: bytes, expected: str, context: str) -> None:
             f"{context}: expected={expected} actual=sha256:{actual}"
         )
 
-def fetch_blob(descriptor: dict) -> None:
+def verify_blob_header(descriptor: dict) -> None:
     digest = descriptor["digest"]
-    if digest in seen_blobs:
+    if digest in seen_blob_headers:
         return
-    _headers, raw = request(f"/v2/{repository}/blobs/{digest}")
-    verify_digest(raw, digest, f"blob {digest}")
-    expected_size = descriptor.get("size")
-    if expected_size is not None and len(raw) != expected_size:
+    headers, _raw = request(f"/v2/{repository}/blobs/{digest}", "HEAD")
+    reported_digest = headers.get("Docker-Content-Digest")
+    if reported_digest and reported_digest != digest:
         raise SystemExit(
-            f"blob {digest}: expected size {expected_size}, received {len(raw)}"
+            f"blob {digest}: registry reported digest {reported_digest}"
         )
-    seen_blobs.add(digest)
+    expected_size = descriptor.get("size")
+    if expected_size is not None:
+        reported_size = headers.get("Content-Length")
+        if reported_size is None or int(reported_size) != int(expected_size):
+            raise SystemExit(
+                f"blob {digest}: expected size {expected_size}, "
+                f"registry reported {reported_size}"
+            )
+    seen_blob_headers.add(digest)
 
-def fetch_manifest(reference: str, expected: str | None = None) -> str:
+def verify_manifest(reference: str, expected: str | None = None) -> str:
     headers, raw = request(f"/v2/{repository}/manifests/{reference}")
     digest = headers.get("Docker-Content-Digest")
     if not digest:
@@ -8742,19 +8841,19 @@ def fetch_manifest(reference: str, expected: str | None = None) -> str:
             raise SystemExit(f"manifest index {digest} has no child manifests")
         for descriptor in descriptors:
             child = descriptor["digest"]
-            fetch_manifest(child, child)
+            verify_manifest(child, child)
         return digest
 
     config = document.get("config")
     layers = document.get("layers", [])
     if not config or not layers:
         raise SystemExit(f"image manifest {digest} lacks config or layers")
-    fetch_blob(config)
+    verify_blob_header(config)
     for descriptor in layers:
-        fetch_blob(descriptor)
+        verify_blob_header(descriptor)
     return digest
 
-actual_digest = fetch_manifest(tag, expected_digest)
+actual_digest = verify_manifest(tag, expected_digest)
 summary = {
     "physical_endpoint": base,
     "repository": repository,
@@ -8762,7 +8861,8 @@ summary = {
     "expected_digest": expected_digest,
     "actual_digest": actual_digest,
     "manifests_verified": len(seen_manifests),
-    "blobs_verified": len(seen_blobs),
+    "blob_headers_verified": len(seen_blob_headers),
+    "verification_mode": "metadata-head",
 }
 with open(
     "/tmp/vanillaos-snapdragonx-local-registry-selftest.json", "w", encoding="utf-8"
@@ -8771,10 +8871,16 @@ with open(
     handle.write("\n")
 
 print(
-    f"Local OCI bridge verified: manifests={len(seen_manifests)} "
-    f"blobs={len(seen_blobs)} digest={actual_digest}"
+    f"Local OCI bridge ready: manifests={len(seen_manifests)} "
+    f"blob_headers={len(seen_blob_headers)} digest={actual_digest}"
 )
 PY_VERIFY_REGISTRY
+  then
+    echo "ISO-local OCI bridge readiness verification failed." >&2
+    systemctl --no-pager --full status "$registry_unit" >&2 2>&1 || true
+    journalctl -b -u "$registry_unit" -n 120 --no-pager >&2 2>&1 || true
+    exit 70
+  fi
 
   printf 'Installer logical image: %s\n' "$logical_image"
   printf 'Physical loopback endpoint: http://%s:%s/%s\n' \
@@ -8801,7 +8907,7 @@ EOF_INSTALLER_WRAPPER_END
 
   cat > "$installer_dispatch" <<EOF_INSTALLER_DISPATCH
 #!/bin/sh
-# VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1
+# VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V2
 # All live installer entrypoints must traverse the profile wrapper so the
 # embedded OCI registry bridge is active before Vanilla Installer resolves its
 # canonical ISO-local recipe.
@@ -8895,6 +9001,20 @@ find /etc/vanilla-installer/profiles -maxdepth 3 -type f \
     -printf '%M %u:%g %s %p\n' 2>&1 | sort || true
 } > "$work/installed-target-state.txt" 2>&1
 
+{
+  echo "=== OCI registry service ==="
+  systemctl --no-pager --full status vanillaos-snapdragonx-oci-registry.service 2>&1 || true
+  echo
+  ss -ltnp 'sport = :5000' 2>&1 || true
+  echo
+  pgrep -a -f 'vanillaos-snapdragonx-oci-registry|vanilla-installer' 2>&1 || true
+  echo
+  grep -RHE '^Exec=.*vanilla-installer' \
+    /home/vanilla/.config/autostart /etc/xdg/autostart 2>/dev/null || true
+} > "$work/registry-service-state.txt" 2>&1
+
+journalctl -b -u vanillaos-snapdragonx-oci-registry.service --no-pager \
+  > "$work/registry-service-journal.txt" 2>/dev/null || true
 journalctl -b --no-pager > "$work/journal.txt" 2>/dev/null || true
 tar -czf "$archive" -C /tmp "$name"
 printf 'Diagnostic archive: %s\n' "$archive"
@@ -8918,21 +9038,64 @@ EOF_REGISTRY_CONF
 Type=Application
 Name=Install $PROFILE_DISPLAY_NAME
 Comment=Install the profile-specific offline VanillaOS target image
-Exec=/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE
+Exec=/usr/bin/vanilla-installer
 Icon=org.vanillaos.Installer
 Terminal=false
 Categories=System;
 EOF_INSTALLER_DESKTOP
 
-  cp -a "$app" "$desktop"
-  if [[ "$INSTALLER_AUTOSTART" != "1" ]]; then
-    printf 'X-GNOME-Autostart-enabled=false\n' >> "$desktop"
+  # Current live-iso:orchid copies org.vanillaos.Installer.desktop into
+  # /etc/skel/.config/autostart before creating the vanilla live user. r1/r2
+  # added a second global autostart with a different filename, so both launchers
+  # ran. Converge on the upstream per-user autostart when present. Only create a
+  # project fallback when an older/non-current live source does not provide it.
+  rm -f "$fallback_autostart"
+  if [[ "$INSTALLER_AUTOSTART" == "1" ]]; then
+    if [[ -s "$upstream_autostart" ]]; then
+      grep -Eq '^Exec=(/usr/bin/)?vanilla-installer([[:space:]]|$)' "$upstream_autostart" || \
+        die "Upstream Installer autostart has an unexpected Exec contract."
+      sed -i '/^Hidden=/d; /^X-GNOME-Autostart-enabled=/d' "$upstream_autostart"
+      printf 'X-GNOME-Autostart-enabled=true\n' >> "$upstream_autostart"
+      printf '%s\n' '/home/vanilla/.config/autostart/org.vanillaos.Installer.desktop' > "$autostart_evidence"
+    else
+      cp -a "$app" "$fallback_autostart"
+      printf 'X-GNOME-Autostart-enabled=true\n' >> "$fallback_autostart"
+      printf '%s\n' "/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop" > "$autostart_evidence"
+    fi
   else
-    printf 'X-GNOME-Autostart-enabled=true\n' >> "$desktop"
+    if [[ -s "$upstream_autostart" ]]; then
+      sed -i '/^Hidden=/d; /^X-GNOME-Autostart-enabled=/d' "$upstream_autostart"
+      printf 'Hidden=true\nX-GNOME-Autostart-enabled=false\n' >> "$upstream_autostart"
+    fi
+    printf '%s\n' 'disabled' > "$autostart_evidence"
+  fi
+
+  # Enforce a single automatic Installer launch path. Different XDG desktop
+  # filenames are cumulative, so leaving both the upstream per-user entry and
+  # the historical project-wide entry enabled recreates the r1/r2 race.
+  local active_installer_autostarts=0 autostart_candidate
+  for autostart_candidate in "$upstream_autostart" "$fallback_autostart"; do
+    [[ -s "$autostart_candidate" ]] || continue
+    grep -Eq '^Exec=.*vanilla-installer' "$autostart_candidate" || continue
+    if grep -Eqi '^Hidden=(true|1|yes)$' "$autostart_candidate" || \
+       grep -Eqi '^X-GNOME-Autostart-enabled=(false|0|no)$' "$autostart_candidate"; then
+      continue
+    fi
+    ((active_installer_autostarts+=1))
+  done
+  if [[ "$INSTALLER_AUTOSTART" == "1" ]]; then
+    (( active_installer_autostarts == 1 )) || \
+      die "Expected exactly one enabled Installer autostart; found $active_installer_autostarts."
+  else
+    (( active_installer_autostarts == 0 )) || \
+      die "Installer autostart is disabled by profile but an enabled launcher remains."
   fi
 
   bash -n "$wrapper"
   bash -n "$collector"
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    bash -n "$registry_service_launcher"
+  fi
 
   grep -Fqx "prefix = \"$(local_registry_logical_prefix)\"" \
     "$root/etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf" || \
@@ -8955,10 +9118,22 @@ EOF_INSTALLER_DESKTOP
     die "Canonical Vanilla Installer recipe is not bound to the profile image."
   cmp -s "$recipe_source" "$recipe_target" || \
     die "Canonical and profile Vanilla Installer recipes differ after binding."
-  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1' "$installer_dispatch" || \
+  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V2' "$installer_dispatch" || \
     die "Stock Vanilla Installer executable was not routed through the profile wrapper."
   [[ -x "$installer_real" && -s "$installer_real" ]] || \
     die "Private real Vanilla Installer executable is absent or non-executable."
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    [[ -x "$registry_service_launcher" && -s "$registry_unit" && -L "$registry_wants" ]] || \
+      die "ISO-local OCI registry systemd service was not installed/enabled."
+    grep -Fq 'VANILLAOS_SNAPDRAGONX_OCI_REGISTRY_SERVICE_V1' "$registry_service_launcher" || \
+      die "OCI registry service launcher lacks its ownership marker."
+    grep -Fq "ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" "$registry_unit" || \
+      die "OCI registry systemd service targets the wrong profile launcher."
+    grep -Fq 'VANILLAOS_SNAPDRAGONX_REGISTRY_SERVICE_CLIENT_V1' "$wrapper" || \
+      die "Installer wrapper does not consume the systemd-owned OCI bridge."
+    ! grep -Fq 'cleanup_registry' "$wrapper" || \
+      die "Installer wrapper still owns/terminates the OCI registry lifecycle."
+  fi
 
   write_installer_storage_guard "$root"
   patch_vanilla_installer_processor "$root"
@@ -8976,6 +9151,17 @@ EOF_INSTALLER_DESKTOP
     printf 'installer-real-entrypoint\t%s\tnot-applicable\t%s\tupstream-preserved\n' \
       "/usr/libexec/vanilla-installer.real" \
       "$(sha256sum "$installer_real" | awk '{print $1}')"
+    if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+      printf 'local-oci-registry-service-launcher\t%s\tnot-applicable\t%s\tgenerated-supervised-bridge\n' \
+        "/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+        "$(sha256sum "$registry_service_launcher" | awk '{print $1}')"
+      printf 'local-oci-registry-systemd-unit\t%s\tnot-applicable\t%s\tgenerated-supervised-bridge\n' \
+        "/etc/systemd/system/$registry_unit_name" \
+        "$(sha256sum "$registry_unit" | awk '{print $1}')"
+    fi
+    printf 'installer-autostart-contract\t%s\tnot-applicable\t%s\tsingle-launch-path\n' \
+      "/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/installer-autostart-path" \
+      "$(sha256sum "$autostart_evidence" | awk '{print $1}')"
     printf 'external-storage-guard\t%s\tnot-applicable\t%s\tgenerated\n' \
       "/usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
       "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard" | awk '{print $1}')"
@@ -8995,6 +9181,7 @@ EOF_INSTALLER_DESKTOP
     --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
     --arg cfg "/boot/init/vos-a/abroot.cfg" \
     --arg storage_guard_policy "$INSTALLER_STORAGE_GUARD_POLICY" \
+    --arg registry_endpoint "$LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT" \
     --argjson cmdline "$(cat "$LIVE_KERNEL_CMDLINE_JSON")" \
     '{profile:$profile,kernel_release:$release,dtb:$dtb,
       installer_image:$image,manifest_digest:$digest,
@@ -9006,6 +9193,8 @@ EOF_INSTALLER_DESKTOP
       storage_guard_report:"/tmp/vanillaos-snapdragonx-storage-guard.json",
       storage_validation_report:"/tmp/vanillaos-snapdragonx-installed-storage-validation.txt",
       storage_guard_policy:$storage_guard_policy,
+      local_oci_registry_service:"vanillaos-snapdragonx-oci-registry.service",
+      local_oci_registry_endpoint:$registry_endpoint,
       diagnostics_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics",
       installed_hardware_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics",
       installed_boot_evidence:"/var/log/vanillaos-snapdragonx/current",
@@ -9296,7 +9485,7 @@ verify_final_release() {
     "usr/bin/vanilla-installer" \
     "$verify_dir/installer-dispatch" \
     "canonical Vanilla Installer dispatch"
-  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V1' "$verify_dir/installer-dispatch" || \
+  grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V2' "$verify_dir/installer-dispatch" || \
     die "Final ISO /usr/bin/vanilla-installer does not dispatch through the profile wrapper."
   grep -Fq "/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" "$verify_dir/installer-dispatch" || \
     die "Final ISO installer dispatch targets the wrong profile wrapper."
@@ -9310,6 +9499,70 @@ verify_final_release() {
     "usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" \
     "$verify_dir/installer-wrapper" \
     "profile installer wrapper"
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    extract_required_squashfs_file "$final_squash" \
+      "usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+      "$verify_dir/registry-service-launcher" \
+      "OCI registry service launcher"
+    extract_required_squashfs_file "$final_squash" \
+      "etc/systemd/system/vanillaos-snapdragonx-oci-registry.service" \
+      "$verify_dir/registry-service.unit" \
+      "OCI registry systemd unit"
+    grep -Fq 'VANILLAOS_SNAPDRAGONX_OCI_REGISTRY_SERVICE_V1' \
+      "$verify_dir/registry-service-launcher" || \
+      die "Final ISO OCI registry service launcher lacks its ownership marker."
+    grep -Fq "ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+      "$verify_dir/registry-service.unit" || \
+      die "Final ISO OCI registry unit targets the wrong profile launcher."
+    grep -Fq 'Restart=always' "$verify_dir/registry-service.unit" || \
+      die "Final ISO OCI registry unit is not configured for supervised restart."
+    unsquashfs -ll "$final_squash" 2>/dev/null | \
+      grep -Fq "etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-oci-registry.service" || \
+      die "Final ISO OCI registry service is not enabled in multi-user.target."
+    grep -Fq 'VANILLAOS_SNAPDRAGONX_REGISTRY_SERVICE_CLIENT_V1' \
+      "$verify_dir/installer-wrapper" || \
+      die "Final ISO Installer wrapper does not consume the supervised registry service."
+    ! grep -Fq 'cleanup_registry' "$verify_dir/installer-wrapper" || \
+      die "Final ISO Installer wrapper still owns the OCI registry process lifecycle."
+    bash -n "$verify_dir/registry-service-launcher"
+  fi
+
+  extract_required_squashfs_file "$final_squash" \
+    "usr/share/vanillaos-snapdragonx/profiles/$PROFILE/installer-autostart-path" \
+    "$verify_dir/installer-autostart-path" \
+    "Installer autostart contract marker"
+  local final_autostart_path final_active_autostarts=0 final_autostart_candidate
+  final_autostart_path="$(tr -d '\r\n' < "$verify_dir/installer-autostart-path")"
+  for final_autostart_candidate in \
+    "home/vanilla/.config/autostart/org.vanillaos.Installer.desktop" \
+    "etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
+  do
+    local final_candidate_file="$verify_dir/autostart-$(basename "$final_autostart_candidate")"
+    rm -f "$final_candidate_file"
+    if unsquashfs -cat "$final_squash" "$final_autostart_candidate" \
+        > "$final_candidate_file" 2>/dev/null; then
+      if grep -Eq '^Exec=.*vanilla-installer' "$final_candidate_file" && \
+         ! grep -Eqi '^Hidden=(true|1|yes)$' "$final_candidate_file" && \
+         ! grep -Eqi '^X-GNOME-Autostart-enabled=(false|0|no)$' "$final_candidate_file"; then
+        ((final_active_autostarts+=1))
+      fi
+    fi
+  done
+  if [[ "$INSTALLER_AUTOSTART" == "1" ]]; then
+    (( final_active_autostarts == 1 )) || \
+      die "Final ISO does not contain exactly one enabled Installer autostart."
+    case "$final_autostart_path" in
+      /home/vanilla/.config/autostart/org.vanillaos.Installer.desktop|\
+      /etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop) : ;;
+      *) die "Final ISO autostart marker names an unexpected path: $final_autostart_path" ;;
+    esac
+  else
+    (( final_active_autostarts == 0 )) || \
+      die "Final ISO contains an enabled Installer autostart despite profile policy."
+    [[ "$final_autostart_path" == "disabled" ]] || \
+      die "Final ISO autostart marker does not report disabled."
+  fi
+
   extract_required_squashfs_file "$final_squash" \
     "usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
     "$verify_dir/storage-guard" \
@@ -9326,6 +9579,12 @@ verify_final_release() {
     die "Final ISO lacks the profile installer wrapper."
   grep -Fq "/usr/libexec/vanilla-installer.real" "$verify_dir/installer-wrapper" || \
     die "Final ISO profile wrapper does not invoke the private real Installer entrypoint."
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    grep -Fq '"verification_mode": "metadata-head"' "$verify_dir/installer-wrapper" || \
+      die "Final ISO profile wrapper lacks the bounded registry metadata probe."
+    ! grep -Fq 'server_pid=' "$verify_dir/installer-wrapper" || \
+      die "Final ISO profile wrapper still tracks a private registry PID."
+  fi
   grep -Fq "VANILLAOS_SNAPDRAGONX_STORAGE_GUARD_V1" "$verify_dir/storage-guard" || \
     die "Final ISO lacks the external storage guard."
   grep -Fq "manual-partition-luks" "$verify_dir/storage-validator" || \
@@ -9447,7 +9706,7 @@ ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
 Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
 Built:                    $(date -u --iso-8601=seconds)
 
-In iso-oci mode the installer wrapper starts a loopback-only registry bridge
+In iso-oci mode a supervised live-system service owns the loopback registry bridge
 serving the embedded OCI image layout. No external image registry is required.
 EOF_TARGET
 
