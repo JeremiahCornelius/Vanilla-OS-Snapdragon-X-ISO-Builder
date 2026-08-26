@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.6
+# Version 7.0.7
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,24 +11,27 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.6 corrections after the v7.0.5 source-layout field test:
-#   - Fixes an errexit control-flow defect in report_preserved_source_layout.
-#     After a successful live-iso-v7 -> live-iso migration, the final false
-#     legacy-path test became the function return status and aborted Stage 3.
-#   - Reporting and source-layout helper functions now return success
-#     explicitly after normal optional/absent conditions.
-#   - Menu headings now render embedded \n sequences as actual line breaks.
-#   - Removes the stale v7.0.2 banner text and derives it from SCRIPT_VERSION.
-#   - Adds a regression test for a clean legacy migration with absent optional
-#     core-image, desktop-image, and qcom-firmware-updater directories.
-#   - Preserves the v7.0.5 canonical source layout, GitHub FsGuard asset
-#     resolver, normalized Vib execution, interactive firmware choices,
-#     custom-image architecture, and live graphical package-closure controls.
+# v7.0.7 corrections after the v7.0.6 target-OCI package field test:
+#   - Restores the package-classification rule already proven in the v6 builder:
+#     only boot-critical image/module packages are installed into the immutable
+#     target OCI by default.
+#   - Headers, build metadata, development packages, and optional kernel tool
+#     packages are excluded from the target APT transaction. In particular,
+#     linux-qcom-*-tools-* is not installed because it can require
+#     linux-tools-common, which is unavailable in the VanillaOS snapshot.
+#   - Every supplied kernel-related .deb remains preserved inside the target
+#     image under /root/custom-kernel-packages with a selection manifest.
+#   - Target OCI verification checks every selected package with dpkg-query and
+#     verifies that the complete supplied package archive is present.
+#   - Plan and diagnostic output now distinguish supplied, target-installed,
+#     target-archived, target-excluded, and live-boot package counts.
+#   - Preserves all v7.0.6 Git, source-layout, Vib/FsGuard, firmware, DTB,
+#     /root-overlay, OCI, and live graphical package-closure safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.6"
+SCRIPT_VERSION="7.0.7"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -117,6 +120,8 @@ BUILD_COUNTER_FILE=""
 
 # Discovered inputs.
 declare -a KERNEL_DEBS=()
+declare -a TARGET_KERNEL_DEBS=()
+declare -a TARGET_EXCLUDED_KERNEL_DEBS=()
 declare -a LIVE_KERNEL_DEBS=()
 declare -a DTB_CANDIDATES=()
 KERNEL_RELEASE=""
@@ -412,7 +417,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.6-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.7-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -872,8 +877,89 @@ select_kernel_release_from_candidates() {
   printf '%s' "${releases[$((choice-1))]}"
 }
 
+classify_kernel_deb_for_target() {
+  # Print one stable class for reporting and target-install policy.
+  local deb="$1"
+  local pkg
+  pkg="$(package_field "$deb" Package)"
+
+  case "$pkg" in
+    linux-image-*|linux-modules-*|linux-modules-extra-*)
+      printf '%s\n' boot
+      ;;
+    linux-headers-*|linux-*-headers-*)
+      printf '%s\n' headers
+      ;;
+    linux-qcom-*-tools-*|linux-tools-*|linux-*-tools-*)
+      printf '%s\n' tools
+      ;;
+    linux-libc-dev|*-dev|*-dbgsym|*-dbg)
+      printf '%s\n' development
+      ;;
+    linux-buildinfo-*|*.buildinfo|*.changes)
+      printf '%s\n' metadata
+      ;;
+    *)
+      printf '%s\n' other
+      ;;
+  esac
+}
+
+array_contains_exact() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+write_kernel_package_selection_manifest() {
+  local manifest="$TMP_ROOT/kernel-package-selection.tsv"
+  local deb pkg version arch class target live reason
+
+  {
+    printf 'package\tversion\tarchitecture\tclass\ttarget_install\tlive_boot\tarchive_path\tsource_deb\treason\n'
+    for deb in "${KERNEL_DEBS[@]}"; do
+      pkg="$(package_field "$deb" Package)"
+      version="$(package_field "$deb" Version)"
+      arch="$(package_field "$deb" Architecture)"
+      class="$(classify_kernel_deb_for_target "$deb")"
+      target=no
+      live=no
+      reason="reference-only"
+
+      if array_contains_exact "$deb" "${TARGET_KERNEL_DEBS[@]}"; then
+        target=yes
+        reason="boot-critical target package"
+      elif [[ "$class" == tools ]]; then
+        reason="optional tools excluded; may require unavailable linux-tools-common"
+      elif [[ "$class" == headers ]]; then
+        reason="headers excluded from immutable runtime image"
+      elif [[ "$class" == development ]]; then
+        reason="development package excluded from immutable runtime image"
+      elif [[ "$class" == metadata ]]; then
+        reason="build metadata excluded from runtime installation"
+      else
+        reason="not selected as boot-critical for $KERNEL_RELEASE"
+      fi
+
+      if array_contains_exact "$deb" "${LIVE_KERNEL_DEBS[@]}"; then
+        live=yes
+      fi
+
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$pkg" "$version" "$arch" "$class" "$target" "$live" \
+        "/root/custom-kernel-packages/$(basename "$deb")" "$deb" "$reason"
+    done
+  } > "$manifest"
+}
+
 discover_kernel_and_dtb_inputs() {
   KERNEL_DEBS=()
+  TARGET_KERNEL_DEBS=()
+  TARGET_EXCLUDED_KERNEL_DEBS=()
   LIVE_KERNEL_DEBS=()
   DTB_CANDIDATES=()
   mkdir -p "$TMP_ROOT/deb-listings"
@@ -945,6 +1031,23 @@ discover_kernel_and_dtb_inputs() {
   done
   mapfile -t LIVE_KERNEL_DEBS < <(printf '%s\n' "${LIVE_KERNEL_DEBS[@]}" | sort -u)
 
+  # Install the same boot-critical image/module closure into the target OCI.
+  # Optional headers, tools, development packages, and metadata remain archived
+  # under /root/custom-kernel-packages and do not enter APT dependency solving.
+  TARGET_KERNEL_DEBS=("${LIVE_KERNEL_DEBS[@]}")
+  local candidate
+  for candidate in "${KERNEL_DEBS[@]}"; do
+    if ! array_contains_exact "$candidate" "${TARGET_KERNEL_DEBS[@]}"; then
+      TARGET_EXCLUDED_KERNEL_DEBS+=("$candidate")
+    fi
+  done
+  mapfile -t TARGET_KERNEL_DEBS < <(printf '%s\n' "${TARGET_KERNEL_DEBS[@]}" | sort -u)
+  if ((${#TARGET_EXCLUDED_KERNEL_DEBS[@]} > 0)); then
+    mapfile -t TARGET_EXCLUDED_KERNEL_DEBS < <(
+      printf '%s\n' "${TARGET_EXCLUDED_KERNEL_DEBS[@]}" | sort -u
+    )
+  fi
+
   (( image_pkg_count > 0 )) || warn "No package named linux-image-$KERNEL_RELEASE was found; the release came from archive contents."
   ((${#LIVE_KERNEL_DEBS[@]} > 0)) || die "No boot-critical image/module packages selected for $KERNEL_RELEASE."
   (( module_pkg_count > 0 )) || {
@@ -980,10 +1083,22 @@ discover_kernel_and_dtb_inputs() {
   fi
 
   DTB_NAME="$(basename "$DTB_FILE")"
+  write_kernel_package_selection_manifest
+
   ok "Custom kernel release: $KERNEL_RELEASE"
-  ok "All target OCI local packages: ${#KERNEL_DEBS[@]}"
+  ok "Supplied kernel-related packages: ${#KERNEL_DEBS[@]}"
+  ok "Boot-critical target OCI packages selected for installation: ${#TARGET_KERNEL_DEBS[@]}"
+  ok "Reference-only target OCI packages excluded from APT: ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}"
   ok "Boot-critical live ISO packages: ${#LIVE_KERNEL_DEBS[@]}"
+  ok "All supplied packages will be archived in target /root/custom-kernel-packages."
   ok "Selected DTB: $DTB_FILE"
+
+  local excluded class pkg
+  for excluded in "${TARGET_EXCLUDED_KERNEL_DEBS[@]}"; do
+    pkg="$(package_field "$excluded" Package)"
+    class="$(classify_kernel_deb_for_target "$excluded")"
+    warn "Target APT exclusion: $pkg ($class); archived for reference only."
+  done
 }
 
 # ------------------------- repository handling --------------------------
@@ -1486,7 +1601,10 @@ Work directory:             $WORKDIR
 Profile:                    $PROFILE
 Artifact directory:         $ARTIFACT_DIR
 Kernel release:             $KERNEL_RELEASE
-Target OCI local .debs:     ${#KERNEL_DEBS[@]}
+Supplied local .debs:       ${#KERNEL_DEBS[@]}
+Target OCI install .debs:   ${#TARGET_KERNEL_DEBS[@]}
+Target OCI excluded .debs:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
+Target OCI archived .debs:  ${#KERNEL_DEBS[@]}
 Live boot .debs:            ${#LIVE_KERNEL_DEBS[@]}
 DTB:                        $DTB_FILE
 Firmware mode:              $FIRMWARE_MODE
@@ -1514,6 +1632,8 @@ Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 Safety invariants:
   - No host initramfs implementation is installed or replaced.
   - dpkg-deb archive listings complete before any grep validation.
+  - Only boot-critical image/module .debs enter target or live APT transactions.
+  - Optional tools, headers, development, and metadata .debs are reference-only.
   - Official live package lists are never edited.
   - The pristine upstream graphical manifest is accepted before remastering.
   - Final filesystem.packages and filesystem.packages-remove are byte-identical
@@ -1976,6 +2096,7 @@ prepare_custom_image_project() {
 
   rm -rf \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
+    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages" \
     "$CUSTOM_PROJECT/includes.container/usr/lib/firmware" \
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
     "$CUSTOM_PROJECT/includes.container/root" \
@@ -1983,6 +2104,7 @@ prepare_custom_image_project() {
 
   mkdir -p \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
+    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages" \
     "$CUSTOM_PROJECT/includes.container/usr/lib/firmware" \
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
     "$CUSTOM_PROJECT/includes.container/root" \
@@ -1991,7 +2113,7 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/modules"
 
   local deb
-  for deb in "${KERNEL_DEBS[@]}"; do
+  for deb in "${TARGET_KERNEL_DEBS[@]}"; do
     cp -a "$deb" "$CUSTOM_PROJECT/includes.container/deb-pkgs/"
   done
 
@@ -2007,6 +2129,23 @@ prepare_custom_image_project() {
     ROOT_PROBE_REL=""
   fi
 
+  # Preserve every supplied package without forcing optional build artifacts
+  # into the immutable runtime package transaction.
+  mkdir -p "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages"
+  for deb in "${KERNEL_DEBS[@]}"; do
+    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/"
+  done
+  cp -a "$TMP_ROOT/kernel-package-selection.tsv" \
+    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/PACKAGE-SELECTION.tsv"
+  cat > "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/README.txt" <<'PACKAGE_ARCHIVE_README'
+These Debian packages are retained as build and diagnostic artifacts.
+
+Only packages marked target_install=yes in PACKAGE-SELECTION.tsv were installed
+into the immutable target image. Headers, development packages, build metadata,
+and optional tools remain archived here so they cannot introduce unavailable
+runtime dependencies such as linux-tools-common.
+PACKAGE_ARCHIVE_README
+
   printf '%s' "$CUSTOM_IMAGE_BASE" > "$CUSTOM_PROJECT/includes.container/image-info/base-image-name"
   printf '%s' "$ABROOT_IMAGE_NAME" > "$CUSTOM_PROJECT/includes.container/image-info/image-name"
 
@@ -2017,9 +2156,11 @@ shopt -s nullglob
 packages=(/deb-pkgs/*.deb)
 ((${#packages[@]} > 0)) || { echo "No local hardware .deb packages were included" >&2; exit 1; }
 apt-get update
-# Install all interdependent local packages in one APT transaction. This lets
-# APT solve relationships between the image, modules, headers, and helper
-# packages without one-package-at-a-time transient breakage.
+# Only the boot-critical image/module closure is staged here. Optional headers,
+# tools, development packages, and metadata are archived under
+# /root/custom-kernel-packages and never enter this APT transaction.
+printf 'Installing selected boot-critical local packages:\n'
+printf '  %s\n' "${packages[@]}"
 apt-get install -y "${packages[@]}"
 INSTALL_DEBS_EOF
   chmod 0755 "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
@@ -2131,9 +2272,16 @@ stages:
 EOF_RECIPE
 
   cat > "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" <<EOF_INPUTS
-Kernel packages copied from:
+Kernel packages discovered from:
   $ARTIFACT_DIR/kernel-debs/
   Compatibility fallback: $ARTIFACT_DIR/*.deb
+
+Package handling:
+  Supplied:          ${#KERNEL_DEBS[@]}
+  Target installed: ${#TARGET_KERNEL_DEBS[@]} boot-critical image/module packages
+  Target excluded:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]} optional/reference packages
+  Target archived:  all supplied packages under /root/custom-kernel-packages
+  Selection record: /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
 
 Selected release:
   $KERNEL_RELEASE
@@ -2185,6 +2333,15 @@ build_target_oci() {
 
 verify_target_oci() {
   local verify_script="$TMP_ROOT/verify-target-oci.sh"
+  local expected_packages="$TMP_ROOT/target-installed-package-names.txt"
+  local deb pkg
+  : > "$expected_packages"
+  for deb in "${TARGET_KERNEL_DEBS[@]}"; do
+    pkg="$(package_field "$deb" Package)"
+    printf '%s\n' "$pkg" >> "$expected_packages"
+  done
+  LC_ALL=C sort -u -o "$expected_packages" "$expected_packages"
+
   cat > "$verify_script" <<'VERIFY_OCI_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -2193,6 +2350,8 @@ dtb="$2"
 abroot_name="$3"
 firmware_probe="$4"
 root_probe="$5"
+expected_archive_count="$6"
+expected_package_file="$7"
 
 test -s "/boot/vmlinuz-$release"
 test -d "/usr/lib/modules/$release" || test -d "/lib/modules/$release"
@@ -2207,6 +2366,17 @@ grep -Fq "$abroot_name" /usr/share/abroot/abroot.json
 dpkg-query -W gnome-shell mutter gdm3 network-manager >/dev/null
 command -v gnome-shell >/dev/null
 command -v NetworkManager >/dev/null
+
+while IFS= read -r package; do
+  [[ -n "$package" ]] || continue
+  dpkg-query -W -f='${Status}\n' "$package" | grep -Fxq 'install ok installed'
+done < "$expected_package_file"
+
+test -s /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
+test -s /root/custom-kernel-packages/README.txt
+actual_archive_count="$(find /root/custom-kernel-packages -maxdepth 1 -type f -name '*.deb' | wc -l)"
+test "$actual_archive_count" -eq "$expected_archive_count"
+
 if [[ -n "$firmware_probe" ]]; then
   test -s "/usr/lib/firmware/$firmware_probe" || test -s "/lib/firmware/$firmware_probe"
 fi
@@ -2218,9 +2388,11 @@ VERIFY_OCI_EOF
 
   run_logged "verify-target-oci" "$OCI_RUNTIME" run --rm \
     -v "$verify_script:/verify-target-oci.sh:ro" \
+    -v "$expected_packages:/expected-target-packages.txt:ro" \
     --entrypoint /bin/bash "$TARGET_IMAGE_REF" \
     /verify-target-oci.sh "$KERNEL_RELEASE" "$DTB_NAME" "$ABROOT_IMAGE_NAME" \
-    "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL"
+    "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL" "${#KERNEL_DEBS[@]}" \
+    /expected-target-packages.txt
   ok "Target OCI verification passed."
 }
 
@@ -2502,6 +2674,7 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/kernel-package-selection.tsv" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-checksums.sha256" ]] && cp -a "$TMP_ROOT/vib-plugin-checksums.sha256" "$RELEASE_DIR/"
   [[ -n "$FSGUARD_PLUGIN_RELEASE_METADATA" && -f "$FSGUARD_PLUGIN_RELEASE_METADATA" ]] && \
@@ -2534,6 +2707,11 @@ Version:                     $SCRIPT_VERSION
 Release ID:                  $RELEASE_ID
 Profile:                     $PROFILE
 Kernel release:              $KERNEL_RELEASE
+Supplied kernel .debs:       ${#KERNEL_DEBS[@]}
+Target-installed .debs:      ${#TARGET_KERNEL_DEBS[@]}
+Target-excluded .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
+Target archive location:     /root/custom-kernel-packages
+Live boot .debs:             ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
 Firmware source:             ${FIRMWARE_SOURCE:-none}
 Target /root source:         ${ROOT_SOURCE:-none}
