@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.0.3"
+SCRIPT_VERSION="6.0.4"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -5203,6 +5203,54 @@ prepare_live_iso_v4_tree() {
     sed -i 's#\$BASE_DIR/tmp/amd64/live-image-amd64\.hybrid\.iso#\$BASE_DIR/tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso#g' "$build"
   fi
 
+  # v6.0.4: deterministically stage the graphical package list into the
+  # exact tmp/$BUILD_ARCH config tree consumed by live-build. This prevents a
+  # source-side list from being silently ignored.
+  if ! grep -Fq 'CONCEPTION_GRAPHICAL_LIST_STAGING_V604' "$build"; then
+    cp -a "$build" "$build.builder-backup.graphical-list.$(date -u +%Y%m%d%H%M%S)"
+    python3 - "$build" <<'PY_PATCH_BUILD'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+data = path.read_text()
+anchor = '  ln -s "package-lists.$PACKAGE_LISTS_SUFFIX" "config/package-lists"\n'
+if anchor not in data:
+    raise SystemExit("Unable to locate package-list symlink creation in live-iso build.sh")
+
+block = '''  # CONCEPTION_GRAPHICAL_LIST_STAGING_V604
+  CONCEPTION_SOURCE_LIST="$BASE_DIR/etc/config/package-lists.vanilla-installer/zz-conception-installer-runtime.list.chroot"
+  CONCEPTION_ACTIVE_LIST="config/package-lists/zz-conception-installer-runtime.list.chroot"
+
+  test -s "$CONCEPTION_SOURCE_LIST" || {
+    echo "E: Missing Conception graphical runtime source list: $CONCEPTION_SOURCE_LIST" >&2
+    exit 81
+  }
+
+  cp -f "$CONCEPTION_SOURCE_LIST" "$CONCEPTION_ACTIVE_LIST"
+
+  for pkg in vanilla-installer gnome-shell gnome-session mutter gdm3 xwayland network-manager gnome-control-center gnome-settings-daemon nautilus pipewire wireplumber xdg-desktop-portal-gnome
+  do
+    grep -Fxq "$pkg" "$CONCEPTION_ACTIVE_LIST" || {
+      echo "E: Required graphical installer package is absent from active list: $pkg" >&2
+      exit 82
+    }
+  done
+
+  echo "I: Active graphical package list target: $(readlink -f config/package-lists)"
+  sed -n '1,200p' "$CONCEPTION_ACTIVE_LIST"
+'''
+
+data = data.replace(anchor, anchor + "\n" + block + "\n", 1)
+path.write_text(data)
+PY_PATCH_BUILD
+  fi
+
+  grep -Fq 'CONCEPTION_GRAPHICAL_LIST_STAGING_V604' "$build" || {
+    fail "Unable to install deterministic graphical package-list staging into live-iso build.sh."
+    return 1
+  }
+
   grep -Fq '$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build" || {
     fail "Unable to establish architecture-aware live-iso output handling."
     fail "Expected build.sh to move from: \$BASE_DIR/tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso"
@@ -5229,11 +5277,23 @@ vanilla-installer
 gnome-shell
 gnome-session
 gnome-session-bin
+gnome-session-common
 mutter
 mutter-common
 gdm3
 xwayland
 network-manager
+network-manager-gnome
+gnome-control-center
+gnome-settings-daemon
+gnome-keyring
+nautilus
+pipewire
+pipewire-pulse
+wireplumber
+xdg-desktop-portal
+xdg-desktop-portal-gnome
+xdg-desktop-portal-gtk
 sudo
 dbus-x11
 EOF_RUNTIME
@@ -5287,6 +5347,10 @@ EOF_MOTD
   grep -q '^ARCH="arm64"' "$conf" || die "Unable to set ARM64 in terraform.conf"
   grep -q '^PACKAGE_LISTS_SUFFIX="vanilla-installer"' "$conf" || die "Unable to select installer-only package lists"
   [[ -s "$runtime_list" ]] || die "Installer runtime package list was not created"
+  for required_pkg in vanilla-installer gnome-shell gnome-session mutter gdm3 xwayland network-manager gnome-control-center gnome-settings-daemon nautilus pipewire wireplumber xdg-desktop-portal-gnome
+  do
+    grep -Fxq "$required_pkg" "$runtime_list" || die "Installer runtime source list is missing required package: $required_pkg"
+  done
   grep -q '^Environment=IGNORE_CPU=' "$override" || die "Installer system-service CPU override was not created"
   grep -q '^Environment=IGNORE_CPU=' "$user_override" || die "Installer user-service CPU override was not created"
   grep -Fq "$VANILLA_ARM_DESKTOP_IMAGE" "$defaults" || die "ARM desktop image default was not recorded"
@@ -5315,6 +5379,63 @@ clean_live_iso_build_outputs() {
       \( -name '*.iso' -o -name '*.md5.txt' -o -name '*.sha256.txt' \) -delete
   fi
 }
+
+
+verify_built_iso_graphical_runtime() {
+  # Inspect the newly built ISO's package manifest and fail closed if the
+  # graphical VanillaOS installer runtime is absent.
+  local live="$1"
+  local iso
+  local manifest="$TMP_DIR/v604-filesystem.packages.$$"
+  local failed=0
+  local pkg
+  local count
+
+  iso="$(find "$live/builds/arm64" -maxdepth 1 -type f -name '*.iso' -print 2>/dev/null | sort | tail -n1 || true)"
+  [[ -n "$iso" && -s "$iso" ]] || {
+    fail "Graphical-runtime verification could not locate the newly built ARM64 ISO."
+    return 1
+  }
+
+  rm -f "$manifest"
+  command -v xorriso >/dev/null 2>&1 || {
+    fail "xorriso is required for post-build graphical package verification."
+    return 1
+  }
+
+  xorriso -osirrox on -indev "$iso" -extract /live/filesystem.packages "$manifest" >/dev/null 2>&1 || {
+    fail "Unable to extract /live/filesystem.packages from built ISO: $iso"
+    return 1
+  }
+
+  for pkg in vanilla-installer gnome-shell gnome-session mutter gdm3 xwayland network-manager gnome-control-center gnome-settings-daemon nautilus pipewire wireplumber xdg-desktop-portal-gnome
+  do
+    if grep -Eq "^${pkg}([[:space:]]|$)" "$manifest"; then
+      ok "ISO graphical verification: $pkg present"
+    else
+      fail "ISO graphical verification predicate failed: $pkg absent"
+      failed=$((failed + 1))
+    fi
+  done
+
+  if (( failed > 0 )); then
+    fail "Built ISO is missing $failed required graphical installer package(s)."
+    fail "Package manifest retained for inspection: $manifest"
+    return 1
+  fi
+
+  count="$(wc -l <"$manifest" | tr -d '[:space:]')"
+  info "Built ISO package manifest contains $count package entries."
+  if [[ "$count" =~ ^[0-9]+$ ]] && (( count < 1000 )); then
+    fail "Built ISO contains only $count packages; expected a full graphical VanillaOS installer closure."
+    fail "Package manifest retained for inspection: $manifest"
+    return 1
+  fi
+
+  rm -f "$manifest"
+  ok "Built ISO contains the required graphical VanillaOS installer runtime."
+}
+
 
 build_iso() {
   require_free_space_gb "$WORKDIR" "$MIN_FREE_GB_BEFORE_ISO_BUILD" "Pico-based live ISO build"
@@ -5371,8 +5492,9 @@ build_iso() {
     expected_kver="$(resolve_custom_kernel_release || true)"
     dtb_name="$(basename "${PRIMARY_DTB:-}")"
     [[ -n "$expected_kver" && -n "$dtb_name" ]] || die "Missing expected kernel/DTB metadata for ISO verification."
-        verify_built_iso_custom_boot_artifacts "$live" "$expected_kver" "$dtb_name"
-    ok "Build live ISO completed successfully with verified custom kernel and DTB."
+    verify_built_iso_custom_boot_artifacts "$live" "$expected_kver" "$dtb_name"
+    verify_built_iso_graphical_runtime "$live"
+    ok "Build live ISO completed successfully with verified custom kernel, DTB, and graphical installer runtime."
     return 0
   fi
 
