@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.8.3.sh
+# build-vanilla-arm64-release-v2.8.4.sh
 #
 # Conception Vanilla ARM64 Release Builder
-# Version: 2.8.3
+# Version: 2.8.4
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.8.3"
+SCRIPT_VERSION="2.8.4"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -2742,8 +2742,7 @@ test -s "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" || {
 for candidate in /boot/vmlinuz-* /boot/initrd.img-*; do
   [ -e "\$candidate" ] || continue
   case "\$candidate" in
-    "/boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL"|
-    "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL") ;;
+    "/boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL"|"/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL") ;;
     *) rm -f -- "\$candidate" ;;
   esac
 done
