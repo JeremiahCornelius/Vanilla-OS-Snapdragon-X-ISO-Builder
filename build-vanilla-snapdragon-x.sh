@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.3.sh
+# build-vanilla-arm64-release-v2.5.4.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.3
+# Version: 2.5.4
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.3"
+SCRIPT_VERSION="2.5.4"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -119,7 +119,7 @@ command_failure_menu() {
 The previous command failed. If the command produced no useful output, the builder may already have generated a deep diagnostic log. You can inspect the working directory and logs before deciding whether to abort or retry." "1" \
     "1|Open an interactive shell in the failing working directory [RECOMMENDED]|Inspect recipe files, generated hooks, container state, and logs. Type 'exit' to return." \
     "2|Retry the failed command|Run the same command again after any manual corrections." \
-    "3|Run deep Vib diagnostics, then return to this menu|Use this when Vib exits with little or no output. Captures binary, plugin, recipe, runtime, and strace diagnostics." \
+    "3|Run deep Vib diagnostics, then return to this menu|Use this when Vib exits with little or no output. Captures binary, plugin ABI, recipe YAML, runtime, and strace diagnostics." \
     "4|Abort build|Stop immediately and preserve logs/workspace for diagnosis.")"
 
   case "$choice" in
@@ -882,7 +882,7 @@ check_dependencies() {
   fail "Missing required tools: ${missing[*]}"
   printf '\nSuggested Debian 13 packages for common tools:\n' >&2
   printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 podman docker.io xorriso genisoimage file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
+  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
   printf 'Additional builder requirement:\n' >&2
   printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
 
@@ -1672,6 +1672,18 @@ vib_deep_diagnostics() {
     find plugins -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null | sort || true
     printf '\n'
 
+    if [[ -f plugins/fsguard.so ]]; then
+      printf '## fsguard plugin binary diagnostics\n'
+      file plugins/fsguard.so 2>/dev/null || true
+      ldd plugins/fsguard.so 2>/dev/null || true
+      if command -v nm >/dev/null 2>&1; then
+        nm -D plugins/fsguard.so 2>/dev/null | grep -E 'PlugInfo|BuildModule' || true
+      elif command -v readelf >/dev/null 2>&1; then
+        readelf -Ws plugins/fsguard.so 2>/dev/null | grep -E 'PlugInfo|BuildModule' || true
+      fi
+      printf '\n'
+    fi
+
     printf '## Container runtimes\n'
     command -v podman && podman --version || true
     command -v docker && docker --version || true
@@ -1692,7 +1704,7 @@ vib_deep_diagnostics() {
       tail -n 160 /tmp/vib-build.strace || true
       printf '\n'
     else
-      printf 'strace not installed; skipping syscall trace.\n'
+      printf 'strace not installed; skipping syscall trace. Install package 'strace' for syscall-level Vib diagnostics.\n'
     fi
 
     printf '## Files generated/changed in repo root after Vib attempts\n'
@@ -1706,6 +1718,120 @@ vib_deep_diagnostics() {
   print_failure_tail "$log"
   warn "Deep Vib diagnostics complete. Review: $log"
 }
+
+validate_recipe_yaml_parse() {
+  # Parse recipe.yml with PyYAML before invoking Vib. Vib can exit 1 without
+  # explaining YAML parser failures, so this preflight reports line/column
+  # directly. python3-yaml is installed by the dependency resolver.
+  local workdir="$1"
+  local log="$2"
+
+  if ! python3 - "$workdir/recipe.yml" >>"$log" 2>&1 <<'PY'
+import sys
+path = sys.argv[1]
+try:
+    import yaml
+except Exception as exc:
+    print(f"PYTHON_YAML_IMPORT_ERROR: {exc}")
+    sys.exit(22)
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+except Exception as exc:
+    print(f"YAML_PARSE_ERROR: {exc}")
+    sys.exit(23)
+
+if not isinstance(data, dict):
+    print("YAML_STRUCTURE_ERROR: top-level recipe document is not a mapping")
+    sys.exit(24)
+
+required = ["name", "id", "vibversion", "stages"]
+missing = [k for k in required if k not in data]
+if missing:
+    print("YAML_STRUCTURE_ERROR: missing required top-level keys:", ", ".join(missing))
+    sys.exit(25)
+
+if not isinstance(data.get("stages"), list) or not data["stages"]:
+    print("YAML_STRUCTURE_ERROR: stages must be a non-empty list")
+    sys.exit(26)
+
+print("YAML_PARSE_OK")
+PY
+  then
+    return 1
+  fi
+
+  return 0
+}
+
+validate_fsguard_plugin_abi() {
+  # If recipe.yml uses `type: fsguard`, confirm that plugins/fsguard.so is:
+  #   - present and non-empty
+  #   - the correct machine architecture
+  #   - dynamically loadable according to ldd
+  #   - exports the Vib plugin entry points PlugInfo and BuildModule
+  local workdir="$1"
+  local log="$2"
+  local plugin="$workdir/plugins/fsguard.so"
+  local status=0
+
+  if ! grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$workdir/recipe.yml"; then
+    return 0
+  fi
+
+  {
+    printf '\n## fsguard plugin ABI validation\n'
+    printf 'plugin: %s\n' "$plugin"
+
+    if [[ ! -s "$plugin" ]]; then
+      printf 'FSGUARD_PLUGIN_ERROR: missing or empty fsguard plugin\n'
+      exit 31
+    fi
+
+    if command -v file >/dev/null 2>&1; then
+      file "$plugin" || true
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+      printf '\nldd plugins/fsguard.so:\n'
+      ldd "$plugin" || exit 32
+    fi
+
+    if command -v nm >/dev/null 2>&1; then
+      printf '\nExported Vib plugin symbols:\n'
+      nm -D "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
+    elif command -v readelf >/dev/null 2>&1; then
+      printf '\nExported Vib plugin symbols:\n'
+      readelf -Ws "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
+    else
+      printf 'WARN: neither nm nor readelf is available for symbol validation.\n'
+    fi
+
+    printf 'FSGUARD_PLUGIN_ABI_OK\n'
+  } >>"$log" 2>&1 || status=$?
+
+  return "$status"
+}
+
+validate_required_recipe_plugins() {
+  local workdir="$1"
+  local log="$2"
+
+  {
+    printf '\n## Required recipe plugin validation\n'
+    awk '
+      /^[[:space:]]*type:[[:space:]]*/ {
+        gsub(/^[[:space:]]*type:[[:space:]]*/, "", $0)
+        gsub(/[[:space:]]*$/, "", $0)
+        print $0
+      }
+    ' "$workdir/recipe.yml" | sort -u
+  } >>"$log" 2>&1 || true
+
+  validate_fsguard_plugin_abi "$workdir" "$log"
+}
+
 
 vib_preflight() {
   # Emit a detailed, command-log-friendly Vib diagnostic before invoking
@@ -1794,6 +1920,20 @@ vib_preflight() {
 
   if [[ ! -f "$workdir/recipe.yml" ]]; then
     fail "recipe.yml is missing in $workdir"
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  if ! validate_recipe_yaml_parse "$workdir" "$log"; then
+    fail "recipe.yml failed YAML parse/structure validation before Vib execution."
+    warn "This explains a silent 'vib build recipe.yml' exit."
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  if ! validate_required_recipe_plugins "$workdir" "$log"; then
+    fail "A recipe-specific Vib plugin failed validation before Vib execution."
+    warn "Most likely causes: wrong plugin architecture, missing symbols, or unresolved shared-library dependency."
     print_failure_tail "$log"
     return 1
   fi
