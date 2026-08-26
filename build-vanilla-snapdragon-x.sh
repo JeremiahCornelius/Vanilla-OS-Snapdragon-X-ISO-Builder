@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v4.0.0.sh
+# build-vanilla-arm64-release-v5.0.0.sh
 #
 # Conception Vanilla ARM64 Installer ISO Builder
 # Version: 4.0.0
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="5.0.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -59,7 +59,13 @@ BOOT_NORMAL_ARGS="${BOOT_NORMAL_ARGS:-quiet splash bgrt_disable}"
 BOOT_FIRMWARE_FB_ARGS="${BOOT_FIRMWARE_FB_ARGS:-console=tty0 keep_bootcon ignore_loglevel loglevel=7 systemd.show_status=1 rd.systemd.show_status=1 plymouth.enable=0 rd.plymouth=0 nomodeset}"
 INITRAMFS_MODULES_POLICY="${INITRAMFS_MODULES_POLICY:-most}"
 EXPECTED_CUSTOM_KERNEL_RELEASE="${EXPECTED_CUSTOM_KERNEL_RELEASE:-}"  # optional exact-release safety constraint; artifacts are authoritative by default
-VANILLA_ARM_DESKTOP_IMAGE="${VANILLA_ARM_DESKTOP_IMAGE:-ghcr.io/vanilla-arm/desktop:test}"
+CORE_IMAGE_TAG="${CORE_IMAGE_TAG:-}"
+TARGET_OCI_IMAGE="${TARGET_OCI_IMAGE:-}"
+VANILLA_ARM_DESKTOP_IMAGE="${VANILLA_ARM_DESKTOP_IMAGE:-}"
+PUSH_TARGET_OCI_IMAGE="${PUSH_TARGET_OCI_IMAGE:-0}"
+OCI_ARCHIVE_PATH="${OCI_ARCHIVE_PATH:-}"
+OCI_IMAGE_DIGEST=""
+OCI_ARCHIVE_SHA256=""
 INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 FORCE_CLEAN_LIVE_BUILD="${FORCE_CLEAN_LIVE_BUILD:-1}"
 VERIFY_INSTALLER_RUNTIME_IN_ISO="${VERIFY_INSTALLER_RUNTIME_IN_ISO:-1}"
@@ -639,6 +645,9 @@ REPO_POLICY="${REPO_POLICY:-ask-once}"
 
 BUILD_DATE="$(date -u +%Y%m%d)"
 BUILD_COUNTER_FILE="$WORKDIR/.build-number"
+CORE_IMAGE_TAG="${CORE_IMAGE_TAG:-localhost/conception-vanilla-arm-core:${PROFILE}-${BUILD_DATE}}"
+TARGET_OCI_IMAGE="${TARGET_OCI_IMAGE:-localhost/conception-vanilla-arm-desktop:${PROFILE}-${BUILD_DATE}}"
+VANILLA_ARM_DESKTOP_IMAGE="${VANILLA_ARM_DESKTOP_IMAGE:-$TARGET_OCI_IMAGE}"
 
 # ------------------------------ logging --------------------------------
 
@@ -2649,7 +2658,7 @@ stage_customizations() {
 
   info "Staging local artifacts and overlays into source trees."
 
-  for repo in "$core" "$desktop"; do
+  for repo in "$desktop"; do
     [[ -d "$repo" ]] || continue
     mkdir -p "$repo/includes.container/opt/vendor-kernel" "$repo/includes.container/boot/dtbs" "$repo/includes.container/root"
     for f in "${KERNEL_DEBS[@]:-}"; do cp -a "$f" "$repo/includes.container/opt/vendor-kernel/"; done
@@ -4767,6 +4776,164 @@ build_images() {
   fi
 }
 
+
+prepare_oci_v5_tree() {
+  # Prepare the hardware-specific immutable desktop image before the ISO.
+  # Artifact packages are authoritative; no kernel release is hard-coded.
+  local core="$SOURCES_DIR/core-image"
+  local desktop="$SOURCES_DIR/desktop-image"
+  local recipe="$desktop/recipe.yml"
+  local kver dtb_name module
+
+  [[ -d "$core/.git" ]] || die "core-image Git checkout is missing: $core"
+  [[ -d "$desktop/.git" ]] || die "desktop-image Git checkout is missing: $desktop"
+  [[ -f "$recipe" ]] || die "desktop-image recipe is missing: $recipe"
+
+  kver="$(resolve_custom_kernel_release)"
+  dtb_name="$(basename "$PRIMARY_DTB")"
+  module="$desktop/modules/zz-conception-hardware.yml"
+
+  # Remove only builder-managed content from previous runs.
+  rm -rf "$desktop/includes.container/opt/vendor-kernel"
+  rm -rf "$desktop/includes.container/boot/dtbs"
+  rm -rf "$desktop/includes.container/usr/lib/firmware/qcom"
+  rm -rf "$desktop/includes.container/lib/firmware/qcom"
+  mkdir -p "$desktop/includes.container/opt/vendor-kernel" \
+           "$desktop/includes.container/boot/dtbs" \
+           "$desktop/includes.container/usr/lib/firmware" \
+           "$desktop/modules"
+
+  for f in "${KERNEL_DEBS[@]}"; do
+    cp -a "$f" "$desktop/includes.container/opt/vendor-kernel/"
+  done
+  for f in "${DTB_FILES[@]}"; do
+    cp -a "$f" "$desktop/includes.container/boot/dtbs/"
+  done
+  if [[ -d "$STAGED_QCOM_DIR" ]] && find "$STAGED_QCOM_DIR" -type f | grep -q .; then
+    rsync -a "$STAGED_QCOM_DIR"/ "$desktop/includes.container/usr/lib/firmware"/
+  fi
+  if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
+    mkdir -p "$desktop/includes.container/root"
+    rsync -a "$ROOT_OVERLAY_DIR"/ "$desktop/includes.container/root"/
+  fi
+
+  cat >"$module" <<EOF_OCI_MODULE
+name: zz-conception-hardware
+type: shell
+commands:
+  - |
+    set -eu
+    EXPECTED_KERNEL='$kver'
+    EXPECTED_DTB='$dtb_name'
+    export DEBIAN_FRONTEND=noninteractive
+    dpkg -i /opt/vendor-kernel/*.deb || apt-get -f install -y
+    test -d "/lib/modules/\$EXPECTED_KERNEL"
+    test -e "/boot/vmlinuz-\$EXPECTED_KERNEL"
+    test -f "/boot/dtbs/\$EXPECTED_DTB"
+    mkdir -p /etc/initramfs-tools/conf.d
+    printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-target-modules
+    rm -f "/boot/initrd.img-\$EXPECTED_KERNEL"
+    update-initramfs -c -k "\$EXPECTED_KERNEL"
+    test -s "/boot/initrd.img-\$EXPECTED_KERNEL"
+    printf '%s\n' "\$EXPECTED_KERNEL" > /etc/conception-custom-kernel-release
+    printf '%s\n' "\$EXPECTED_DTB" > /etc/conception-custom-dtb
+EOF_OCI_MODULE
+
+
+  # Insert the hardware module into the desktop recipe's package-module list,
+  # before cleanup, sysconf capture, and FsGuard finalization.
+  python3 - "$recipe" "$CORE_IMAGE_TAG" <<'PY_RECIPE'
+from pathlib import Path
+import re
+import sys
+p=Path(sys.argv[1]); core=sys.argv[2]
+s=p.read_text()
+# Use the locally built core image as the actual desktop base.
+s=re.sub(r'(?m)^\s*base:\s*\S+\s*$', f'  base: {core}', s, count=1)
+inc='      - modules/zz-conception-hardware.yml'
+if inc not in s:
+    marker='      - modules/999-cleanup.yml'
+    if marker not in s:
+        raise SystemExit('desktop recipe lacks expected modules/999-cleanup.yml anchor')
+    s=s.replace(marker, inc+'\n'+marker, 1)
+p.write_text(s)
+PY_RECIPE
+
+  grep -Fq "base: $CORE_IMAGE_TAG" "$recipe" || die "Desktop recipe does not use local core image $CORE_IMAGE_TAG"
+  grep -Fq 'modules/zz-conception-hardware.yml' "$recipe" || die "Desktop recipe does not include hardware module"
+  grep -Fq "EXPECTED_KERNEL='$kver'" "$module" || die "Hardware module does not contain derived kernel release"
+  ok "Prepared hardware-specific desktop OCI recipe for kernel $kver and DTB $dtb_name."
+}
+
+build_oci_images_v5() {
+  local core="$SOURCES_DIR/core-image"
+  local desktop="$SOURCES_DIR/desktop-image"
+
+  ensure_vib_run_user
+  ensure_vib_plugins_for_image_repos
+  ensure_required_recipe_specific_plugins
+  repair_known_vib_recipes
+
+  run_vib_build_with_diagnostics "core image" "$core"
+  build_container_image_with_context_workarounds \
+    "Build hardware release core OCI image" "$core" "$CORE_IMAGE_TAG"
+  podman image exists "$CORE_IMAGE_TAG" || die "Core OCI image was not created: $CORE_IMAGE_TAG"
+
+  run_vib_build_with_diagnostics "desktop image" "$desktop"
+  build_container_image_with_context_workarounds \
+    "Build hardware-specific desktop OCI image" "$desktop" "$TARGET_OCI_IMAGE"
+  podman image exists "$TARGET_OCI_IMAGE" || die "Desktop OCI image was not created: $TARGET_OCI_IMAGE"
+}
+
+verify_and_export_target_oci_v5() {
+  local kver dtb_name archive inspect_log
+  kver="$(resolve_custom_kernel_release)"
+  dtb_name="$(basename "$PRIMARY_DTB")"
+  archive="${OCI_ARCHIVE_PATH:-$OUTPUT_DIR/${PROFILE}-${BUILD_DATE}-desktop.oci.tar}"
+  inspect_log="$OUTPUT_DIR/logs/${BUILD_DATE}-target-oci-verification-$(date -u +%H%M%S).log"
+  mkdir -p "$(dirname "$archive")" "$OUTPUT_DIR/logs"
+
+  info "Verifying target OCI image contents."
+  podman run --rm --entrypoint /bin/sh "$TARGET_OCI_IMAGE" -c "
+    set -eu
+    test -d '/lib/modules/$kver'
+    test -e '/boot/vmlinuz-$kver'
+    test -s '/boot/initrd.img-$kver'
+    test -f '/boot/dtbs/$dtb_name'
+    test -f '/etc/conception-custom-kernel-release'
+    grep -Fx '$kver' '/etc/conception-custom-kernel-release'
+    test -x /usr/bin/gnome-shell
+    test -x /usr/bin/vanilla-installer || true
+  " >"$inspect_log" 2>&1 || {
+    fail "Target OCI verification failed."
+    print_failure_tail "$inspect_log"
+    return 1
+  }
+
+  rm -f "$archive"
+  podman save --format oci-archive -o "$archive" "$TARGET_OCI_IMAGE"
+  test -s "$archive" || die "OCI archive was not created: $archive"
+  OCI_ARCHIVE_PATH="$archive"
+  OCI_ARCHIVE_SHA256="$(sha256sum "$archive" | awk '{print $1}')"
+  OCI_IMAGE_DIGEST="$(podman image inspect "$TARGET_OCI_IMAGE" --format '{{.Digest}}' 2>/dev/null | head -n1 || true)"
+  [[ -n "$OCI_IMAGE_DIGEST" && "$OCI_IMAGE_DIGEST" != '<no value>' ]] || OCI_IMAGE_DIGEST="$(podman image inspect "$TARGET_OCI_IMAGE" --format '{{.Id}}')"
+
+  if [[ "$PUSH_TARGET_OCI_IMAGE" == "1" ]]; then
+    case "$TARGET_OCI_IMAGE" in
+      localhost/*|local/*)
+        die "--push-target-image requires a registry-qualified TARGET_OCI_IMAGE, not $TARGET_OCI_IMAGE"
+        ;;
+    esac
+    podman push "$TARGET_OCI_IMAGE"
+    OCI_IMAGE_DIGEST="$(podman image inspect "$TARGET_OCI_IMAGE" --format '{{.Digest}}' 2>/dev/null | head -n1 || printf '%s' "$OCI_IMAGE_DIGEST")"
+  else
+    warn "Target OCI was built and exported but not pushed. The installer target must be able to pull $TARGET_OCI_IMAGE."
+  fi
+
+  VANILLA_ARM_DESKTOP_IMAGE="$TARGET_OCI_IMAGE"
+  ok "Verified and exported target OCI: $OCI_ARCHIVE_PATH"
+}
+
 live_iso_runtime_cmd() {
   case "${LIVE_ISO_CONTAINER_RUNTIME,,}" in
     docker) printf '%s\n' "docker" ;;
@@ -5180,8 +5347,12 @@ write_manifest() {
     printf '  "primary_dtb": "%s",\n' "${PRIMARY_DTB:-}"
     printf '  "qcom_mode": "%s",\n' "${QCOM_MODE:-skip}"
     printf '  "qcom_device_path": "%s",\n' "${QCOM_DEVICE_PATH:-}"
-    printf '  "vanilla_arm_desktop_image": "%s",\n' "$VANILLA_ARM_DESKTOP_IMAGE"
+    printf '  "vanilla_arm_desktop_image": "%s",\n' "$TARGET_OCI_IMAGE"
+    printf '  "target_oci_identity": "%s",\n' "$OCI_IMAGE_DIGEST"
+    printf '  "target_oci_archive_sha256": "%s",\n' "$OCI_ARCHIVE_SHA256"
     printf '  "repositories": {\n'
+    printf '    "core_image": "%s",\n' "$(git_commit_or_unknown "$SOURCES_DIR/core-image")"
+    printf '    "desktop_image": "%s",\n' "$(git_commit_or_unknown "$SOURCES_DIR/desktop-image")"
     printf '    "live_iso": "%s"\n' "$(git_commit_or_unknown "$SOURCES_DIR/live-iso")"
     printf '  }\n'
     printf '}\n'
@@ -5265,6 +5436,9 @@ Options:
   --artifacts PATH                Custom kernel/DTB artifact directory.
   --root-overlay PATH             Directory to copy into /root of target image.
   --repo-policy POLICY            ask-once, prompt, pull, continue, reclone.
+  --target-image IMAGE            Registry-qualified or local target desktop OCI tag.
+  --push-target-image             Push the built target OCI image after verification.
+  --oci-archive PATH              Output path for the exported OCI archive.
   --cleanup-bad-prompt-dirs       Remove known accidental prompt-text dirs.
   -h, --help                      Show help.
 EOF
@@ -5288,6 +5462,9 @@ while [[ $# -gt 0 ]]; do
     --artifacts) ARTIFACT_DIR="$(normalize_path_input "$2")"; shift 2 ;;
     --root-overlay) ROOT_OVERLAY_DIR="$(normalize_path_input "$2")"; shift 2 ;;
     --repo-policy) REPO_POLICY="$2"; shift 2 ;;
+    --target-image) TARGET_OCI_IMAGE="$2"; VANILLA_ARM_DESKTOP_IMAGE="$2"; shift 2 ;;
+    --push-target-image) PUSH_TARGET_OCI_IMAGE=1; shift ;;
+    --oci-archive) OCI_ARCHIVE_PATH="$(normalize_path_input "$2")"; shift 2 ;;
     --cleanup-bad-prompt-dirs) CLEANUP_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
@@ -5314,7 +5491,7 @@ fi
 
 cat >&2 <<EOF
 
-Conception Vanilla ARM64 Custom-Image Installer ISO Builder
+Conception Vanilla ARM64 OCI-First Release Builder
 Version: $SCRIPT_VERSION
 
 Primary host assumption:
@@ -5331,67 +5508,86 @@ Default directories:
   Downloads:     $DOWNLOADS_DIR
   Releases:      $RELEASES_DIR
   Repo policy:   $REPO_POLICY
-  Desktop image: $VANILLA_ARM_DESKTOP_IMAGE
+  Target OCI:     $TARGET_OCI_IMAGE
+  Push target OCI: $PUSH_TARGET_OCI_IMAGE
 
 EOF
 
-stage 1 9 "Checking host dependencies."
+stage 1 12 "Checking host dependencies."
 check_dependencies
 
-stage 2 9 "Refreshing the VanillaOS installer-only live-iso repository."
+stage 2 12 "Refreshing Vanilla ARM core, desktop, and live-ISO repositories."
 choose_repo_policy_once
 repair_source_tree_ownership_for_git
+sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
+sync_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_BRANCH" "$SOURCES_DIR/desktop-image"
 sync_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_BRANCH" "$SOURCES_DIR/live-iso"
 
-stage 3 9 "Validating local kernel and DTB artifacts."
+stage 3 12 "Validating artifact-driven custom kernel and DTB inputs."
 validate_artifacts
 
-stage 4 9 "Configuring Qualcomm firmware staging."
+stage 4 12 "Configuring Qualcomm firmware staging."
 configure_qcom_firmware
 
-stage 5 9 "Staging Qualcomm firmware without modifying the build host."
+stage 5 12 "Staging Qualcomm firmware without modifying the build host."
 stage_qcom_firmware
 
-stage 6 9 "Preparing proven vanilla-arm ARM64 installer source tree."
+stage 6 12 "Preparing the OCI-first hardware-specific desktop recipe."
+prepare_oci_v5_tree
+
+stage 7 12 "Building hardware-specific Vanilla ARM core and desktop OCI images."
+build_oci_images_v5
+
+stage 8 12 "Verifying and exporting the target desktop OCI image."
+verify_and_export_target_oci_v5
+
+stage 9 12 "Preparing the proven Vanilla ARM installer ISO source tree."
 prepare_live_iso_v4_tree
 release_id="$(next_release_id)"
 release_dir_preview="$RELEASES_DIR/${BUILD_DATE}-${release_id}-${PROFILE}"
 mkdir -p "$release_dir_preview/logs"
 cat >"$release_dir_preview/BUILD-PLAN.md" <<EOF
-# Conception Vanilla ARM64 Installer ISO Build Plan
+# Conception Vanilla ARM64 OCI-First Build Plan
 
 Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 Builder version: $SCRIPT_VERSION
 Profile: $PROFILE
 Architecture: $ARCH
+Core OCI image: $CORE_IMAGE_TAG
+Target desktop OCI image: $TARGET_OCI_IMAGE
+Target OCI identity: $OCI_IMAGE_DIGEST
+Target OCI archive: $OCI_ARCHIVE_PATH
+Target OCI archive SHA-256: $OCI_ARCHIVE_SHA256
 Live ISO repository: $LIVE_REPO_URL ($LIVE_BRANCH)
-Live package-list mode: vanilla-installer
-ARM desktop OCI image: $VANILLA_ARM_DESKTOP_IMAGE
-Installer CPU override: IGNORE_CPU=$INSTALLER_IGNORE_CPU
 Primary DTB: ${PRIMARY_DTB:-none selected}
-Artifact directory: $ARTIFACT_DIR
 Derived custom kernel release: $(resolve_custom_kernel_release)
 Qualcomm firmware mode: ${QCOM_MODE:-skip}
-Container runtime: $LIVE_ISO_CONTAINER_RUNTIME
-Requested container platform: $LIVE_ISO_CONTAINER_PLATFORM
 
-The target immutable/A-B VanillaOS system is installed through Vanilla Installer
-using the ARM desktop OCI image shown above. This ISO contains the live graphical
-installer environment plus the user-supplied ARM64 kernel, initramfs, DTB, and
-optional firmware.
+The desktop OCI is built and verified first. The live installer ISO is then built
+with the same custom kernel, initramfs, DTB, and firmware, and records the exact
+target OCI image reference for Vanilla Installer's custom-image workflow.
 EOF
-ok "Prepared stamped release directory: $release_dir_preview"
 
-stage 7 9 "Staging custom kernel, DTB, firmware, graphical installer runtime, and GRUB configuration."
+stage 10 12 "Staging the same kernel, DTB, firmware, installer guidance, and GRUB configuration into the ISO."
 stage_customizations
 
-stage 8 9 "Building the vanilla-arm ARM64 custom-image installer ISO."
+stage 11 12 "Building the Vanilla ARM64 installer ISO."
 build_iso
 
-stage 9 9 "Archiving and verifying the ISO release artifact."
+stage 12 12 "Archiving and verifying the paired OCI and ISO release artifacts."
 release_dir="$(archive_release "$release_id")"
+cp -a "$OCI_ARCHIVE_PATH" "$release_dir/"
+printf '%s  %s\n' "$OCI_ARCHIVE_SHA256" "$(basename "$OCI_ARCHIVE_PATH")" >"$release_dir/$(basename "$OCI_ARCHIVE_PATH").sha256"
+cat >"$release_dir/TARGET-OCI.txt" <<EOF
+image=$TARGET_OCI_IMAGE
+identity=$OCI_IMAGE_DIGEST
+archive=$(basename "$OCI_ARCHIVE_PATH")
+archive_sha256=$OCI_ARCHIVE_SHA256
+kernel=$(resolve_custom_kernel_release)
+dtb=$(basename "$PRIMARY_DTB")
+EOF
 verify_iso "$release_dir"
 
-ok "Build completed."
+ok "OCI-first paired build completed."
 printf '\nRelease output:\n  %s\n\n' "$release_dir" >&2
