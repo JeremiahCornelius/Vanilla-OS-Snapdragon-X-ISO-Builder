@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.2.sh
+# build-vanilla-arm64-release-v2.6.3.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.2
+# Version: 2.6.3
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.2"
+SCRIPT_VERSION="2.6.3"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -270,11 +270,27 @@ ensure_vib_run_user() {
       || die "Unable to create Vib build user: $VIB_RUN_USER"
   fi
 
-  info "Ensuring build workspace is writable by $VIB_RUN_USER for Vib stages."
-  chown -R "$VIB_RUN_USER:$VIB_RUN_USER" "$WORKDIR" \
-    || die "Unable to chown build workspace to $VIB_RUN_USER: $WORKDIR"
-
+  info "Ensuring Vib user can traverse the build workspace path."
   ensure_user_can_traverse_path "$VIB_RUN_USER" "$WORKDIR"
+
+  # Keep Git source trees owned by the main builder/root until the moment Vib
+  # needs to write inside a specific recipe tree. This avoids Git "dubious
+  # ownership" failures during source refresh.
+  mkdir -p "$OUTPUT_DIR/logs" "$TMP_DIR"
+  chown -R "$VIB_RUN_USER:$VIB_RUN_USER" "$OUTPUT_DIR" "$TMP_DIR" 2>/dev/null || true
+}
+
+
+prepare_repo_for_vib_user() {
+  # Vib writes build outputs in the recipe repository. Chown only the specific
+  # image recipe tree immediately before running Vib, not the entire WORKDIR and
+  # not before Git refresh.
+  local repo="$1"
+  if [[ "$(id -u)" -eq 0 && "$VIB_ALLOW_ROOT" != "1" ]]; then
+    info "Granting Vib build user ownership of recipe tree: $repo"
+    chown -R "$VIB_RUN_USER:$VIB_RUN_USER" "$repo" \
+      || die "Unable to chown recipe tree for Vib user: $repo"
+  fi
 }
 
 run_as_vib_user() {
@@ -1167,9 +1183,36 @@ repo_current_state() {
   printf 'branch=%s expected=%s commit=%s state=%s origin=%s' "${current:-detached}" "$branch" "${commit:-unknown}" "$dirty" "${remote_url:-unknown}"
 }
 
+
+mark_git_safe_directory_if_needed() {
+  # If an earlier build run changed source ownership to the Vib build user,
+  # root-owned Git commands may reject the repository as "dubious ownership".
+  # Mark only the explicit repository path safe for this build user/root context.
+  local path="$1"
+  [[ -d "$path/.git" ]] || return 0
+  git config --global --add safe.directory "$path" 2>/dev/null || true
+}
+
+repair_source_tree_ownership_for_git() {
+  # Previous revisions chowned the entire WORKDIR to the non-root Vib user.
+  # That broke subsequent Git operations as root. Before refreshing sources,
+  # take ownership of source checkouts back to the current user when running as
+  # root, and mark each checkout as safe to avoid Git's dubious ownership guard.
+  local repo
+  [[ "$(id -u)" -eq 0 ]] || return 0
+
+  for repo in "$SOURCES_DIR"/*; do
+    [[ -d "$repo/.git" ]] || continue
+    info "Preparing Git checkout for root-owned refresh: $repo"
+    chown -R root:root "$repo" 2>/dev/null || true
+    mark_git_safe_directory_if_needed "$repo"
+  done
+}
+
 sync_repo() {
   local name="$1" url="$2" branch="$3" path="$4"
   mkdir -p "$(dirname "$path")"
+  mark_git_safe_directory_if_needed "$path"
 
   if [[ -d "$path" && ! -d "$path/.git" ]]; then
     warn "$name path exists but is not a Git repository: $path"
@@ -2363,6 +2406,7 @@ run_vib_build_with_diagnostics() {
   local action
 
   while true; do
+    prepare_repo_for_vib_user "$workdir"
     if ! vib_preflight "$workdir" "$label"; then
       action="$(command_failure_menu "Vib preflight for $label" "$workdir" "$LAST_COMMAND_LOG" "1")"
       case "$action" in
@@ -2608,6 +2652,7 @@ check_dependencies
 
 stage 2 11 "Refreshing source repositories."
 choose_repo_policy_once
+repair_source_tree_ownership_for_git
 sync_repo "pico-image" "$PICO_REPO_URL" "$PICO_BRANCH" "$SOURCES_DIR/pico-image"
 sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
 sync_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_BRANCH" "$SOURCES_DIR/desktop-image"
