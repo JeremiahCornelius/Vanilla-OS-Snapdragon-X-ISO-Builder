@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v5.0.0.sh
+# build-vanilla-arm64-release-v5.0.1.sh
 #
 # Conception Vanilla ARM64 Installer ISO Builder
 # Version: 4.0.0
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="5.0.0"
+SCRIPT_VERSION="5.0.1"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -4817,25 +4817,30 @@ prepare_oci_v5_tree() {
     rsync -a "$ROOT_OVERLAY_DIR"/ "$desktop/includes.container/root"/
   fi
 
+  # Vib's shell module emits each command scalar as a Containerfile RUN.
+  # Use a folded YAML scalar so this entire hardware transaction becomes one
+  # POSIX shell command. A literal block (|) is unsafe here because current Vib
+  # splits its physical lines, causing assignments such as EXPECTED_KERNEL=...
+  # to be parsed as invalid top-level Containerfile instructions.
   cat >"$module" <<EOF_OCI_MODULE
 name: zz-conception-hardware
 type: shell
 commands:
-  - |
-    set -eu
-    EXPECTED_KERNEL='$kver'
-    EXPECTED_DTB='$dtb_name'
-    export DEBIAN_FRONTEND=noninteractive
-    dpkg -i /opt/vendor-kernel/*.deb || apt-get -f install -y
-    test -d "/lib/modules/\$EXPECTED_KERNEL"
-    test -e "/boot/vmlinuz-\$EXPECTED_KERNEL"
-    test -f "/boot/dtbs/\$EXPECTED_DTB"
-    mkdir -p /etc/initramfs-tools/conf.d
-    printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-target-modules
-    rm -f "/boot/initrd.img-\$EXPECTED_KERNEL"
-    update-initramfs -c -k "\$EXPECTED_KERNEL"
-    test -s "/boot/initrd.img-\$EXPECTED_KERNEL"
-    printf '%s\n' "\$EXPECTED_KERNEL" > /etc/conception-custom-kernel-release
+  - >-
+    set -eu;
+    EXPECTED_KERNEL='$kver';
+    EXPECTED_DTB='$dtb_name';
+    export DEBIAN_FRONTEND=noninteractive;
+    dpkg -i /opt/vendor-kernel/*.deb || apt-get -f install -y;
+    test -d "/lib/modules/\$EXPECTED_KERNEL";
+    test -e "/boot/vmlinuz-\$EXPECTED_KERNEL";
+    test -f "/boot/dtbs/\$EXPECTED_DTB";
+    mkdir -p /etc/initramfs-tools/conf.d;
+    printf '%s\n' 'MODULES=$INITRAMFS_MODULES_POLICY' > /etc/initramfs-tools/conf.d/conception-target-modules;
+    rm -f "/boot/initrd.img-\$EXPECTED_KERNEL";
+    update-initramfs -c -k "\$EXPECTED_KERNEL";
+    test -s "/boot/initrd.img-\$EXPECTED_KERNEL";
+    printf '%s\n' "\$EXPECTED_KERNEL" > /etc/conception-custom-kernel-release;
     printf '%s\n' "\$EXPECTED_DTB" > /etc/conception-custom-dtb
 EOF_OCI_MODULE
 
