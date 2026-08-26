@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.8.sh
+# build-vanilla-arm64-release-v2.6.9.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.8
+# Version: 2.6.9
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.8"
+SCRIPT_VERSION="2.6.9"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -40,6 +40,7 @@ RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINE
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
+PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -2432,6 +2433,97 @@ run_vib_build_with_diagnostics() {
 }
 
 
+
+patch_known_debian_changelog_dates() {
+  # Repair known Debian packaging timestamp defects before container build.
+  #
+  # Observed failure:
+  #   dh_installchangelogs: Could not parse timestamp
+  #   'Wed, 24 July 2024 22:01:00 +0000'
+  #
+  # Debian changelog trailer dates must use abbreviated English month names,
+  # e.g. "Wed, 24 Jul 2024 22:01:00 +0000".
+  local repo="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-debian-changelog-date-repair-$(date -u +%H%M%S).log"
+  local file backup tmp changed_any=0
+
+  [[ "$PATCH_KNOWN_DEBIAN_CHANGELOG_DATES" == "1" ]] || {
+    info "Debian changelog date repair disabled: PATCH_KNOWN_DEBIAN_CHANGELOG_DATES=$PATCH_KNOWN_DEBIAN_CHANGELOG_DATES"
+    return 0
+  }
+
+  [[ -d "$repo/sources" ]] || return 0
+  mkdir -p "$OUTPUT_DIR/logs"
+  : > "$log"
+
+  printf 'Debian changelog date repair log\n' >>"$log"
+  printf 'Repository: %s\n\n' "$repo" >>"$log"
+
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    tmp="$file.builder-datefix.$$"
+
+    if python3 - "$file" "$tmp" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+months = {
+    "January": "Jan", "February": "Feb", "March": "Mar", "April": "Apr",
+    "May": "May", "June": "Jun", "July": "Jul", "August": "Aug",
+    "September": "Sep", "October": "Oct", "November": "Nov", "December": "Dec",
+}
+
+changed = False
+out = []
+trailer_re = re.compile(r"^(\s*--\s+.+?\s{2,}[A-Z][a-z]{2},\s+\d{1,2}\s+)([A-Za-z]+)(\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+-]\d{4}\s*)$")
+
+for line in src.read_text(encoding="utf-8").splitlines(keepends=True):
+    newline = ""
+    body = line
+    if line.endswith("\n"):
+        newline = "\n"
+        body = line[:-1]
+
+    m = trailer_re.match(body)
+    if m and m.group(2) in months:
+        body = m.group(1) + months[m.group(2)] + m.group(3)
+        changed = True
+
+    out.append(body + newline)
+
+dst.write_text("".join(out), encoding="utf-8")
+sys.exit(0 if changed else 2)
+PY
+    then
+      backup="$file.builder-backup-datefix.$(date -u +%Y%m%d%H%M%S)"
+      cp -a "$file" "$backup"
+      mv "$tmp" "$file"
+      changed_any=1
+      {
+        printf 'PATCHED changelog: %s\n' "$file"
+        printf 'Backup: %s\n' "$backup"
+        printf 'Diff:\n'
+        diff -u "$backup" "$file" || true
+        printf '\n'
+      } >>"$log"
+      warn "Repaired Debian changelog date format in $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+    else
+      rm -f "$tmp"
+    fi
+  done < <(find "$repo/sources" -path '*/debian/changelog' -type f | sort)
+
+  if [[ "$changed_any" -eq 1 ]]; then
+    warn "Debian changelog date repair applied. Log: $log"
+  else
+    ok "No Debian changelog date repairs needed for $label."
+  fi
+}
+
 patch_known_unavailable_packages() {
   # Patch known unavailable or transiently removed packages out of Vib-generated
   # module files before the generated Containerfile is built.
@@ -2529,6 +2621,10 @@ classify_container_build_failure() {
     fail "Container build failed because DNS resolution failed inside the build container."
     grep -n "Temporary failure resolving" "$log" >&2 || true
     warn "Current PODMAN_BUILD_NETWORK=$PODMAN_BUILD_NETWORK"
+  elif grep -q "Could not parse timestamp" "$log"; then
+    fail "Container build failed because a Debian changelog has a non-policy timestamp."
+    grep -nE "Could not parse timestamp|uses full .* instead of abbreviated month name|debian/changelog" "$log" >&2 || true
+    warn "The builder can patch known changelog date issues when PATCH_KNOWN_DEBIAN_CHANGELOG_DATES=1."
   fi
 }
 
@@ -3024,6 +3120,7 @@ build_container_image_with_context_workarounds() {
 
   safe_label="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
 
+  patch_known_debian_changelog_dates "$repo" "$safe_label"
   patch_known_unavailable_packages "$repo" "$safe_label"
   diagnose_generated_container_context "$repo" "$safe_label"
   maybe_disable_ld_so_preload_for_container_build "$repo"
