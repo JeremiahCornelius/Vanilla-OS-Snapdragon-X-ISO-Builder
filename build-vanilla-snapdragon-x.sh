@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 8.0.4
+# Version 8.0.4-r1
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,18 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.4-r1 checksum-bootstrap correction:
+#   - Keeps non-interactive execution fail-closed when the pinned Qualcomm
+#     firmware package lacks an expected SHA-256.
+#   - Allows read-only plan mode to observe the package SHA-256 and carry that
+#     exact value into the printed non-interactive execute command without
+#     modifying the artifact tree.
+#   - In interactive execute mode, presents an explicit trust decision: write
+#     an atomic package-specific .sha256 sidecar, enter an independently
+#     obtained SHA-256, or abort. No checksum is silently accepted.
+#   - Corrects checksum-source evidence assignment that was previously lost
+#     when the sidecar reader was invoked through command substitution.
 #
 # v8.0.4 closing milestone — Portable Build Root and Snapdragon X1-45 GPU
 # Enablement:
@@ -104,7 +116,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4"
+SCRIPT_VERSION="8.0.4-r1"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -181,6 +193,7 @@ FIRMWARE_QCOM_SOC_EXPECTED_VERSION="${FIRMWARE_QCOM_SOC_EXPECTED_VERSION:-}"
 FIRMWARE_QCOM_SOC_ACTUAL_VERSION=""
 FIRMWARE_QCOM_SOC_ACTUAL_SHA256=""
 FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
+FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
 
 # Known-good HP WCN6855 board-data pair previously acceptance-tested for the
 # QCNFA765 subsystem 103c:8d9a. These remain overridable only for deliberate
@@ -575,6 +588,13 @@ Options:
   --qcom-soc-firmware-sha256 HEX  Expected SHA-256 for that exact package.
   --qcom-soc-firmware-version VER Optional exact Debian package version.
   --qcom-soc-firmware-policy P    require, auto, or skip. Default: require.
+
+Checksum pin behavior:
+  Plan mode never writes an input artifact. When no pin exists, it reports the
+  observed package SHA-256 and includes that exact digest in the printed execute
+  command. Interactive execute can atomically create the package-specific
+  sidecar after explicit operator approval. Non-interactive execute requires a
+  sidecar, profile/environment value, or --qcom-soc-firmware-sha256.
   --repo-policy POLICY            ask-once, prompt, refresh, continue, reclone.
   --target-image REF              Full target OCI build/push reference.
   --abroot-image NAME             ABRoot image name, normally owner/image.
@@ -2392,11 +2412,15 @@ sha256_is_valid() {
 }
 
 read_package_checksum_sidecar() {
-  # Return the expected checksum for one package from a package-specific
-  # sidecar or a directory SHA256SUMS file. The basename is matched when a
-  # conventional sha256sum record is present; a one-hash sidecar is accepted.
+  # Resolve a previously pinned checksum from one of the accepted sidecar
+  # layouts. This function deliberately communicates through globals rather
+  # than stdout because command substitution would run it in a subshell and
+  # discard FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE evidence.
   local deb="$1" sidecar base hash
   base="$(basename "$deb")"
+  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
+  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
+
   local -a sidecars=(
     "$deb.sha256"
     "${deb%.deb}.sha256"
@@ -2421,12 +2445,75 @@ read_package_checksum_sidecar() {
       END { if (!found && fallback != "") print fallback }
     ' "$sidecar" | sed -n '1p')"
     if sha256_is_valid "$hash"; then
+      FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="${hash,,}"
       FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="$sidecar"
-      printf '%s' "${hash,,}"
       return 0
     fi
   done
   return 1
+}
+
+write_qcom_soc_checksum_sidecar() {
+  # Atomically pin the exact package selected by the operator. The sidecar is
+  # placed beside the package so subsequent plan and non-interactive execute
+  # runs resolve the same immutable expectation without another prompt.
+  local deb="$1" actual="$2" sidecar tmp base
+  base="$(basename "$deb")"
+  sidecar="$deb.sha256"
+  tmp="$(mktemp "$(dirname "$sidecar")/.${base}.sha256.tmp.XXXXXX")"
+  printf '%s  %s\n' "$actual" "$base" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$sidecar"
+
+  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="$actual"
+  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="$sidecar (created interactively)"
+  ok "Pinned firmware-qcom-soc checksum sidecar: $sidecar"
+}
+
+resolve_missing_qcom_soc_checksum() {
+  # Missing checksum policy is intentionally mode-sensitive:
+  #   * plan mode is read-only and carries the observed hash into the exact
+  #     printed execute command;
+  #   * interactive execute requires an explicit trust decision;
+  #   * non-interactive execute remains strictly fail-closed.
+  local deb="$1" actual="$2" version="$3" choice entered
+  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
+  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
+
+  if (( PLAN_ONLY == 1 )); then
+    warn "No persistent SHA-256 pin exists for $(basename "$deb"). Plan mode will remain read-only and place the observed hash in the exact execute command."
+    FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="$actual"
+    FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="plan-observed SHA-256; not persisted"
+    return 0
+  fi
+
+  is_interactive || return 1
+
+  printf '\nQualcomm SoC firmware package requires an explicit SHA-256 pin.\n' >&2
+  printf 'Package:      %s\n' "$deb" >&2
+  printf 'Version:      %s\n' "$version" >&2
+  printf 'Observed SHA: %s\n' "$actual" >&2
+  printf '%s\n' 'Compare this value with a trusted Debian package or snapshot record when available.' >&2
+
+  choice="$(menu "Pin Qualcomm SoC Firmware Package\n\nNo accepted checksum sidecar or command-line pin was found. The builder will not silently trust the package." "1" \
+    "1|Trust this local artifact and write its package-specific sidecar [RECOMMENDED FOR VERIFIED LOCAL INPUT]|Atomically create $(basename "$deb").sha256 beside the package, then continue." \
+    "2|Enter an independently obtained SHA-256|Continue only when the entered hash matches the local package." \
+    "3|Abort before firmware extraction|Leave the package and build outputs unchanged.")"
+
+  case "$choice" in
+    1)
+      write_qcom_soc_checksum_sidecar "$deb" "$actual"
+      ;;
+    2)
+      entered="$(prompt_text "Expected firmware-qcom-soc SHA-256" "")"
+      sha256_is_valid "$entered" || die "Entered firmware-qcom-soc SHA-256 is not a 64-character hexadecimal digest."
+      FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="${entered,,}"
+      FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="interactive operator entry"
+      ;;
+    3)
+      die "Build aborted: firmware-qcom-soc package remains unpinned."
+      ;;
+  esac
 }
 
 resolve_qcom_soc_firmware_package() {
@@ -2488,13 +2575,19 @@ resolve_qcom_soc_firmware_package() {
 
   actual="$(sha256sum "$FIRMWARE_QCOM_SOC_DEB" | awk '{print tolower($1)}')"
   expected="${FIRMWARE_QCOM_SOC_SHA256,,}"
-  if [[ -z "$expected" ]]; then
-    expected="$(read_package_checksum_sidecar "$FIRMWARE_QCOM_SOC_DEB" || true)"
-  else
+  if [[ -n "$expected" ]]; then
     FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="environment/profile/CLI"
+  elif read_package_checksum_sidecar "$FIRMWARE_QCOM_SOC_DEB"; then
+    expected="$FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE"
+  elif resolve_missing_qcom_soc_checksum \
+      "$FIRMWARE_QCOM_SOC_DEB" "$actual" "$version"; then
+    expected="$FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE"
+  else
+    die "A valid pinned SHA-256 is required for $FIRMWARE_QCOM_SOC_DEB. Observed SHA-256: $actual. Create $FIRMWARE_QCOM_SOC_DEB.sha256 or pass --qcom-soc-firmware-sha256."
   fi
+
   sha256_is_valid "$expected" || \
-    die "A valid pinned SHA-256 is required for $FIRMWARE_QCOM_SOC_DEB. Create $(basename "$FIRMWARE_QCOM_SOC_DEB").sha256 or pass --qcom-soc-firmware-sha256."
+    die "Resolved firmware-qcom-soc SHA-256 is invalid: ${expected:-empty}"
   [[ "$actual" == "$expected" ]] || \
     die "firmware-qcom-soc checksum mismatch: expected=$expected actual=$actual"
 
