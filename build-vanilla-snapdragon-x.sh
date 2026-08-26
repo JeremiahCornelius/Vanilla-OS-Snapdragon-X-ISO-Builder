@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.3
+# Version 7.0.4
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,25 +11,24 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.3 corrections after the v7.0.2 Vib field test:
-#   - Normalizes Vib execution when the builder is run from a direct root shell.
-#     Current Vib requires SUDO_UID, SUDO_GID, and SUDO_USER whenever uid 0 is
-#     detected; without them Vib returns status 1 before Cobra can run.
-#   - Runs Vib through a dedicated wrapper that supplies a deterministic root
-#     identity and cache/home context without changing the host user database.
-#   - Validates the selected Vib binary before recipe generation and refuses a
-#     silent or incompatible executable.
-#   - Captures recipe, modules, plugin inventory, executable metadata, and Vib
-#     version into a diagnostic directory when recipe generation fails.
-#   - Corrects the stale "Resolved v7.0.1 plan" heading to use SCRIPT_VERSION.
-#   - Preserves all v7.0.2 source synchronization, interactive questions,
-#     firmware alternatives, dependency safeguards, custom-image architecture,
-#     and live graphical package-closure protections.
+# v7.0.4 corrections after the v7.0.3 Vib plugin field test:
+#   - Mirrors the official vib-gh-action plugin setup instead of assuming the
+#     core Vib plugin archive contains the external FsGuard plugin.
+#   - Extracts the core archive from its documented build/plugins directory.
+#   - Downloads the architecture-specific vib-fsguard release asset separately
+#     and renames fsguard-<arch>.so to the exact loader name fsguard.so.
+#   - Pins the default Vib toolchain to the versions used by the official
+#     custom-image workflow: Vib 1.1.0 and vib-fsguard 1.5.3.
+#   - Validates plugin presence, ELF type, architecture, nonzero size, and
+#     checksums before recipe generation.
+#   - Preserves normalized root Vib execution, source validation, interactive
+#     firmware alternatives, host safeguards, custom-image architecture, and
+#     live graphical package-closure protections.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.3"
+SCRIPT_VERSION="7.0.4"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -62,9 +61,12 @@ TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-}"
 ABROOT_IMAGE_NAME="${ABROOT_IMAGE_NAME:-}"
 PUSH_TARGET_IMAGE="${PUSH_TARGET_IMAGE:-0}"
 
-VIB_VERSION="${VIB_VERSION:-latest}"
+VIB_VERSION="${VIB_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
 VIB_DETECTED_VERSION=""
+FSGUARD_PLUGIN_REPO="${FSGUARD_PLUGIN_REPO:-Vanilla-OS/vib-fsguard}"
+FSGUARD_PLUGIN_VERSION="${FSGUARD_PLUGIN_VERSION:-1.5.3}"
+FSGUARD_PLUGIN_FILE=""
 
 REPO_POLICY="${REPO_POLICY:-ask-once}"
 FIRMWARE_MODE="${FIRMWARE_MODE:-ask}"
@@ -339,6 +341,11 @@ Options:
   --push-target-image             Push target OCI after local verification.
   -h, --help                      Show this help.
 
+Vib toolchain defaults:
+  VIB_VERSION=1.1.0
+  FSGUARD_PLUGIN_REPO=Vanilla-OS/vib-fsguard
+  FSGUARD_PLUGIN_VERSION=1.5.3
+
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
   ├── kernel-debs/
@@ -397,7 +404,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.3-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.4-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -1392,6 +1399,8 @@ Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
 Push target OCI:            $PUSH_TARGET_IMAGE
 Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
+Requested Vib version:      $VIB_VERSION
+FsGuard plugin:             $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")
 Expected release ID:        $preview_id
 Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 
@@ -1431,22 +1440,34 @@ host_arch() {
   esac
 }
 
+normalize_version_tag() {
+  local version="$1"
+  [[ "$version" == v* ]] && printf '%s' "$version" || printf 'v%s' "$version"
+}
+
 version_ge() {
   local actual="$1" required="$2"
   [[ -n "$actual" && -n "$required" ]] || return 1
   [[ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | sed -n '1p')" == "$required" ]]
 }
 
+download_atomic() {
+  local url="$1" destination="$2"
+  local partial="${destination}.partial"
+  mkdir -p "$(dirname "$destination")"
+  rm -f "$partial"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 \
+    "$url" -o "$partial"
+  [[ -s "$partial" ]] || die "Downloaded file is empty: $url"
+  mv -f "$partial" "$destination"
+}
+
 vib_exec() {
-  # Vib currently expects sudo identity variables whenever it detects uid 0.
-  # Direct root shells do not provide them, which causes Vib to return status 1
-  # before executing its Cobra command. Normalize the execution environment to
-  # a deterministic root identity so Vib can write the root-owned worktree.
+  # Vib requires sudo identity variables whenever it detects uid 0. Direct root
+  # shells do not provide them, so use a deterministic build-only root context.
   local vib_home="/home/root"
   local vib_cache="$CACHE_DIR/vib-root"
-  if [[ "$(id -u)" -eq 0 ]]; then
-    mkdir -p "$vib_home"
-  fi
+  [[ "$(id -u)" -eq 0 ]] && mkdir -p "$vib_home"
   mkdir -p "$vib_cache"
 
   env \
@@ -1488,12 +1509,121 @@ probe_vib_binary() {
 }
 
 download_builder_local_vib() {
-  local arch="$1" release_base="$2"
+  local arch="$1" tag
+  tag="$(normalize_version_tag "$VIB_VERSION")"
   VIB_BIN="$WORKDIR/tools/vib"
   mkdir -p "$(dirname "$VIB_BIN")"
-  info "Downloading Vib $VIB_VERSION for $arch to $VIB_BIN"
-  curl -fL "$release_base/vib-$arch" -o "$VIB_BIN"
+  info "Downloading Vib $tag for $arch to $VIB_BIN"
+  download_atomic \
+    "https://github.com/Vanilla-OS/Vib/releases/download/$tag/vib-$arch" \
+    "$VIB_BIN"
   chmod 0755 "$VIB_BIN"
+}
+
+verify_plugin_elf_architecture() {
+  local plugin="$1" arch="$2" description
+  [[ -s "$plugin" ]] || die "Required Vib plugin is absent or empty: $plugin"
+
+  description="$(file -b "$plugin")"
+  printf '%s\n' "$description" | grep -Fq 'ELF 64-bit' || \
+    die "Vib plugin is not a 64-bit ELF object: $plugin ($description)"
+  printf '%s\n' "$description" | grep -Fq 'shared object' || \
+    die "Vib plugin is not an ELF shared object: $plugin ($description)"
+
+  case "$arch" in
+    arm64)
+      printf '%s\n' "$description" | grep -Eq 'ARM aarch64|ARM64|AArch64' || \
+        die "Vib plugin architecture mismatch; expected arm64: $plugin ($description)"
+      ;;
+    amd64)
+      printf '%s\n' "$description" | grep -Eq 'x86-64|x86_64|AMD x86-64' || \
+        die "Vib plugin architecture mismatch; expected amd64: $plugin ($description)"
+      ;;
+    *) die "Unsupported Vib plugin architecture: $arch" ;;
+  esac
+}
+
+install_core_vib_plugins() {
+  # Official Vib release archives contain build/plugins. Official vib-gh-action
+  # extracts the archive and moves build/plugins to project-local plugins.
+  local arch="$1" tag archive extract_root source_dir plugin_dir
+  tag="$(normalize_version_tag "$VIB_DETECTED_VERSION")"
+  archive="$CACHE_DIR/vib-$tag-plugins-$arch.tar.gz"
+  extract_root="$TMP_ROOT/vib-core-plugins-extract"
+  source_dir="$extract_root/build/plugins"
+  plugin_dir="$CUSTOM_PROJECT/plugins"
+
+  if [[ ! -s "$archive" ]]; then
+    info "Downloading Vib core plugin bundle $tag for $arch."
+    download_atomic \
+      "https://github.com/Vanilla-OS/Vib/releases/download/$tag/plugins-$arch.tar.gz" \
+      "$archive"
+  else
+    info "Using cached Vib core plugin bundle: $archive"
+  fi
+
+  tar -tzf "$archive" > "$TMP_ROOT/vib-core-plugin-archive.inventory"
+  grep -Eq '^build/plugins/' "$TMP_ROOT/vib-core-plugin-archive.inventory" || \
+    die "Unexpected Vib core plugin archive layout: $archive"
+
+  rm -rf "$extract_root" "$plugin_dir"
+  mkdir -p "$extract_root" "$plugin_dir"
+  tar -xzf "$archive" -C "$extract_root"
+
+  [[ -d "$source_dir" ]] || die "Core plugin extraction did not produce $source_dir"
+  find "$source_dir" -maxdepth 1 -type f -name '*.so' -print -quit | grep -q . || \
+    die "Core Vib plugin bundle contains no shared objects."
+
+  rsync -a "$source_dir/" "$plugin_dir/"
+  ok "Installed Vib core plugins from $tag."
+}
+
+install_fsguard_vib_plugin() {
+  # FsGuard is an external plugin declared separately by the official
+  # custom-image workflow. Its release asset is fsguard-<arch>.so, while Vib's
+  # loader searches for the module type as plugins/fsguard.so.
+  local arch="$1" tag asset_name cached_asset plugin_dir final_plugin
+  tag="$(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")"
+  asset_name="fsguard-$arch.so"
+  cached_asset="$CACHE_DIR/vib-fsguard-$tag-$arch.so"
+  plugin_dir="$CUSTOM_PROJECT/plugins"
+  final_plugin="$plugin_dir/fsguard.so"
+
+  if [[ ! -s "$cached_asset" ]]; then
+    info "Downloading external FsGuard plugin $FSGUARD_PLUGIN_REPO $tag for $arch."
+    download_atomic \
+      "https://github.com/$FSGUARD_PLUGIN_REPO/releases/download/$tag/$asset_name" \
+      "$cached_asset"
+  else
+    info "Using cached external FsGuard plugin: $cached_asset"
+  fi
+
+  verify_plugin_elf_architecture "$cached_asset" "$arch"
+  install -m 0644 "$cached_asset" "$final_plugin"
+  verify_plugin_elf_architecture "$final_plugin" "$arch"
+
+  FSGUARD_PLUGIN_FILE="$final_plugin"
+  ok "Installed FsGuard plugin with exact Vib loader name: $final_plugin"
+}
+
+verify_vib_plugin_set() {
+  local arch="$1" plugin_dir="$CUSTOM_PROJECT/plugins"
+  local inventory="$TMP_ROOT/vib-plugin-inventory.txt"
+  local count
+
+  [[ -s "$plugin_dir/fsguard.so" ]] || \
+    die "Required external Vib plugin is absent: $plugin_dir/fsguard.so"
+  verify_plugin_elf_architecture "$plugin_dir/fsguard.so" "$arch"
+
+  find "$plugin_dir" -maxdepth 1 -type f -name '*.so' \
+    -printf '%f\t%s bytes\n' | LC_ALL=C sort > "$inventory"
+  count="$(wc -l < "$inventory" | tr -d '[:space:]')"
+  [[ "$count" =~ ^[0-9]+$ ]] || die "Unable to count installed Vib plugins."
+  (( count > 0 )) || die "No Vib plugins were installed."
+
+  sha256sum "$plugin_dir"/*.so > "$TMP_ROOT/vib-plugin-checksums.sha256"
+  ok "Validated $count project-local Vib plugin shared object(s)."
+  info "Required plugin present: $plugin_dir/fsguard.so"
 }
 
 capture_vib_diagnostics() {
@@ -1511,18 +1641,26 @@ capture_vib_diagnostics() {
   printf '%s\n' "$?" > "$diag/vib-version.exit-status"
   set -e
 
-  [[ -f "$CUSTOM_PROJECT/recipe.yml" ]] && cp -a "$CUSTOM_PROJECT/recipe.yml" "$diag/"
-  [[ -f "$CUSTOM_PROJECT/Containerfile" ]] && cp -a "$CUSTOM_PROJECT/Containerfile" "$diag/"
-  [[ -f "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" ]] && cp -a "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" "$diag/"
+  for f in \
+    "$CUSTOM_PROJECT/recipe.yml" \
+    "$CUSTOM_PROJECT/Containerfile" \
+    "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" \
+    "$TMP_ROOT/vib-core-plugin-archive.inventory" \
+    "$TMP_ROOT/vib-plugin-inventory.txt" \
+    "$TMP_ROOT/vib-plugin-checksums.sha256"
+  do
+    [[ -f "$f" ]] && cp -a "$f" "$diag/"
+  done
 
   if [[ -d "$CUSTOM_PROJECT/modules" ]]; then
     mkdir -p "$diag/modules"
     cp -a "$CUSTOM_PROJECT/modules/." "$diag/modules/"
   fi
-
   if [[ -d "$CUSTOM_PROJECT/plugins" ]]; then
+    mkdir -p "$diag/plugins"
+    cp -a "$CUSTOM_PROJECT/plugins/." "$diag/plugins/"
     find "$CUSTOM_PROJECT/plugins" -printf '%M %u:%g %s %p\n' \
-      > "$diag/plugin-inventory.txt" 2>&1 || true
+      > "$diag/plugin-filesystem-inventory.txt" 2>&1 || true
   fi
 
   (
@@ -1533,6 +1671,10 @@ capture_vib_diagnostics() {
     printf 'PWD=%q\n' "$PWD"
     printf 'CUSTOM_PROJECT=%q\n' "$CUSTOM_PROJECT"
     printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
+    printf 'VIB_DETECTED_VERSION=%q\n' "$VIB_DETECTED_VERSION"
+    printf 'FSGUARD_PLUGIN_REPO=%q\n' "$FSGUARD_PLUGIN_REPO"
+    printf 'FSGUARD_PLUGIN_VERSION=%q\n' "$FSGUARD_PLUGIN_VERSION"
+    printf 'FSGUARD_PLUGIN_FILE=%q\n' "$FSGUARD_PLUGIN_FILE"
   ) > "$diag/execution-context.txt"
 
   warn "Vib diagnostic bundle retained at: $diag"
@@ -1551,30 +1693,25 @@ run_logged_vib() {
   set -e
 
   if (( rc != 0 )); then
-    if [[ ! -s "$CURRENT_LOG" ]]; then
+    [[ -s "$CURRENT_LOG" ]] || {
       fail "Vib exited with status $rc and produced no output."
       fail "This is consistent with failure before Cobra command execution."
-    fi
+    }
     capture_vib_diagnostics "Vib command failed: $*; exit status: $rc"
     return "$rc"
   fi
 }
 
 install_vib_and_plugins() {
-  local arch release_base choice selected_system=0
+  local arch choice selected_system=0
   arch="$(host_arch)"
-  if [[ "$VIB_VERSION" == "latest" ]]; then
-    release_base="https://github.com/Vanilla-OS/Vib/releases/latest/download"
-  else
-    release_base="https://github.com/Vanilla-OS/Vib/releases/download/$VIB_VERSION"
-  fi
 
   if command_exists vib && [[ ! -x "$VIB_BIN" ]]; then
     if is_interactive; then
-      choice="$(menu "Vib Executable Selection\n\nSystem Vib detected:\n  $(command -v vib)\nBuilder-local default:\n  $WORKDIR/tools/vib\n\nThe selected binary is validated using the same normalized execution context used for recipe generation." "1" \
-        "1|Use and validate the existing system Vib|Do not download another binary unless validation fails." \
-        "2|Download a builder-local Vib binary|Pin execution to WORKDIR/tools/vib." \
-        "3|Open a shell|Inspect Vib versions manually." \
+      choice="$(menu "Vib Executable Selection\n\nSystem Vib detected:\n  $(command -v vib)\nBuilder-local default:\n  $WORKDIR/tools/vib\n\nThe selected binary and exact plugin set are validated before recipe generation." "1" \
+        "1|Use and validate the existing system Vib|Use its exact detected version for the matching core plugin bundle." \
+        "2|Download the official pinned builder-local Vib|Use version $(normalize_version_tag "$VIB_VERSION")." \
+        "3|Open a shell|Inspect Vib and plugin versions manually." \
         "4|Abort|Stop.")"
       case "$choice" in
         1) VIB_BIN="$(command -v vib)"; selected_system=1 ;;
@@ -1589,26 +1726,23 @@ install_vib_and_plugins() {
   fi
 
   [[ -n "$VIB_BIN" ]] || VIB_BIN="$WORKDIR/tools/vib"
-
-  if [[ ! -x "$VIB_BIN" ]]; then
-    download_builder_local_vib "$arch" "$release_base"
-  fi
+  [[ -x "$VIB_BIN" ]] || download_builder_local_vib "$arch"
 
   if ! probe_vib_binary; then
     if (( selected_system == 1 )); then
       if is_interactive; then
         choice="$(menu "System Vib Validation Failed\n\nThe existing system Vib could not pass the normalized version preflight." "1" \
-          "1|Download and use builder-local Vib [RECOMMENDED]|Continue with a freshly downloaded official binary." \
+          "1|Download pinned builder-local Vib [RECOMMENDED]|Use official Vib $(normalize_version_tag "$VIB_VERSION")." \
           "2|Open a shell|Inspect the system Vib manually." \
           "3|Abort|Stop.")"
         case "$choice" in
-          1) download_builder_local_vib "$arch" "$release_base" ;;
+          1) download_builder_local_vib "$arch" ;;
           2) open_shell "$WORKDIR"; install_vib_and_plugins; return ;;
           3) die "Vib validation failed." ;;
         esac
       else
-        warn "System Vib validation failed; switching to builder-local official Vib."
-        download_builder_local_vib "$arch" "$release_base"
+        warn "System Vib validation failed; switching to pinned builder-local Vib."
+        download_builder_local_vib "$arch"
       fi
       probe_vib_binary || die "Builder-local Vib failed validation."
     else
@@ -1616,22 +1750,15 @@ install_vib_and_plugins() {
     fi
   fi
 
-  local plugin_dir="$CUSTOM_PROJECT/plugins"
-  if [[ ! -d "$plugin_dir" || -z "$(find "$plugin_dir" -type f -print -quit 2>/dev/null)" ]]; then
-    local archive="$CACHE_DIR/plugins-$arch-${VIB_VERSION}.tar.gz"
-    info "Downloading official Vib plugin bundle for $arch."
-    curl -fL "$release_base/plugins-$arch.tar.gz" -o "$archive"
-    rm -rf "$plugin_dir"
-    mkdir -p "$plugin_dir"
-    tar -xzf "$archive" -C "$plugin_dir" --strip-components=2
-  fi
-  find "$plugin_dir" -type f -print -quit | grep -q . || \
-    die "Vib plugin bundle extraction produced no project-local plugins."
+  install_core_vib_plugins "$arch"
+  install_fsguard_vib_plugin "$arch"
+  verify_vib_plugin_set "$arch"
 
   ok "Vib executable: $VIB_BIN"
   ok "Vib detected version: $VIB_DETECTED_VERSION"
   ok "Vib execution identity: uid=0 gid=0 user=root through normalized SUDO_* context"
-  ok "Project-local Vib plugins: $plugin_dir"
+  ok "Project-local Vib plugins: $CUSTOM_PROJECT/plugins"
+  ok "FsGuard plugin: $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")"
 }
 
 # ------------------------ custom target OCI ------------------------------
@@ -2169,6 +2296,8 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
+  [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
+  [[ -f "$TMP_ROOT/vib-plugin-checksums.sha256" ]] && cp -a "$TMP_ROOT/vib-plugin-checksums.sha256" "$RELEASE_DIR/"
   printf '%s\n' "$CUSTOM_SOURCE_COMMIT" > "$RELEASE_DIR/custom-image-source.commit"
   printf '%s\n' "$LIVE_SOURCE_COMMIT" > "$RELEASE_DIR/live-iso-source.commit"
 
@@ -2203,6 +2332,8 @@ Target /root source:         ${ROOT_SOURCE:-none}
 Target OCI:                  $TARGET_IMAGE_REF
 ABRoot image name:           $ABROOT_IMAGE_NAME
 Target OCI base:             $CUSTOM_IMAGE_BASE
+Vib version:                 $VIB_DETECTED_VERSION
+FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $(normalize_version_tag "$FSGUARD_PLUGIN_VERSION")
 custom-image source commit:  $CUSTOM_SOURCE_COMMIT
 live-iso source commit:      $LIVE_SOURCE_COMMIT
 Pristine ISO:                $UPSTREAM_ISO
