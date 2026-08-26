@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.0.sh
+# build-vanilla-arm64-release-v2.4.1.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.0
+# Version: 2.4.1
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.4.1"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -242,6 +242,14 @@ CORE_BRANCH="${CORE_BRANCH:-dev}"
 DESKTOP_BRANCH="${DESKTOP_BRANCH:-dev}"
 LIVE_BRANCH="${LIVE_BRANCH:-orchid}"
 PICO_BRANCH="${PICO_BRANCH:-main}"
+
+# Repository handling policy.
+# ask-once: ask for one policy and apply it to all existing repositories.
+# prompt:   prompt separately for each existing repository.
+# pull:     automatically fetch/checkout/pull existing repositories.
+# continue: use existing repositories without network activity.
+# reclone:  delete and freshly clone existing repositories.
+REPO_POLICY="${REPO_POLICY:-ask-once}"
 
 BUILD_DATE="$(date -u +%Y%m%d)"
 BUILD_COUNTER_FILE="$WORKDIR/.build-number"
@@ -469,42 +477,147 @@ Repository:
   $name
 
 Location:
-  $path" "2" \
-    "1|Continue using the existing checkout|No network activity." \
-    "2|Refresh from Git (git pull)|Retrieve the latest commits from the configured branch." \
-    "3|Re-clone repository|Delete the local checkout and perform a fresh clone." \
-    "4|Open an interactive shell here|Make manual changes, then exit the shell to resume." \
-    "5|Skip this repository|Continue with remaining repositories." \
+  $path
+
+This directory is already a Git checkout. Choose how to handle it." "2" \
+    "1|Continue using the existing checkout|No network activity. The local checkout is left exactly as-is." \
+    "2|Refresh from Git (git pull)|Fetch/prune, checkout the configured branch, and fast-forward only. Recommended for repeatable current builds." \
+    "3|Re-clone repository|Delete the local checkout and perform a fresh clone. Use this for corrupted or uncertain checkouts." \
+    "4|Open an interactive shell here|Make manual changes, inspect branches, then exit the shell to resume." \
+    "5|Skip this repository|Continue with remaining repositories. Build may fail if the repo is required." \
     "6|Quit the builder|Exit immediately."
+}
+
+repo_policy_menu() {
+  # Ask once for the repository handling policy so an existing sources/ tree does
+  # not trigger repetitive per-repository prompts. This is the default path for
+  # deterministic repeat builds.
+  menu "Repository Refresh Policy
+
+The builder found or may find existing Git repositories under:
+  $SOURCES_DIR
+
+Select one policy to apply to existing checkouts during this run." "1" \
+    "1|Refresh existing repositories automatically [RECOMMENDED]|For each existing checkout, run fetch/prune, checkout configured branch, and git pull --ff-only. Missing repos are cloned." \
+    "2|Use existing repositories without network access|Do not fetch or pull existing checkouts. Missing repos are cloned only if absent." \
+    "3|Prompt separately for each repository|Show the full repository action menu for every existing checkout." \
+    "4|Re-clone all existing repositories|Delete and freshly clone each configured repository." \
+    "5|Open an interactive shell before repository handling|Inspect or repair the sources directory, then return to choose again." \
+    "6|Abort build|Stop immediately."
+}
+
+normalize_repo_policy() {
+  case "${REPO_POLICY,,}" in
+    ask-once|ask|once) REPO_POLICY="ask-once" ;;
+    prompt|interactive) REPO_POLICY="prompt" ;;
+    pull|refresh|update) REPO_POLICY="pull" ;;
+    continue|keep|existing|offline) REPO_POLICY="continue" ;;
+    reclone|clone|fresh) REPO_POLICY="reclone" ;;
+    *) die "Invalid repository policy: $REPO_POLICY. Use ask-once, prompt, pull, continue, or reclone." ;;
+  esac
+}
+
+choose_repo_policy_once() {
+  normalize_repo_policy
+  if [[ "$REPO_POLICY" != "ask-once" ]]; then
+    info "Repository policy supplied: $REPO_POLICY"
+    return 0
+  fi
+
+  while true; do
+    local choice
+    choice="$(repo_policy_menu)"
+    case "$choice" in
+      1) REPO_POLICY="pull"; break ;;
+      2) REPO_POLICY="continue"; break ;;
+      3) REPO_POLICY="prompt"; break ;;
+      4) REPO_POLICY="reclone"; break ;;
+      5) open_shell "$SOURCES_DIR" ;;
+      6) die "Build aborted before repository refresh." ;;
+    esac
+  done
+  ok "Repository policy for this run: $REPO_POLICY"
+}
+
+repo_current_state() {
+  local path="$1" branch="$2"
+  if [[ ! -d "$path/.git" ]]; then
+    printf 'missing'
+    return
+  fi
+  local current commit dirty remote_url
+  current="$(git -C "$path" branch --show-current 2>/dev/null || true)"
+  commit="$(git -C "$path" rev-parse --short HEAD 2>/dev/null || true)"
+  remote_url="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null || true)" ]]; then dirty="dirty"; else dirty="clean"; fi
+  printf 'branch=%s expected=%s commit=%s state=%s origin=%s' "${current:-detached}" "$branch" "${commit:-unknown}" "$dirty" "${remote_url:-unknown}"
 }
 
 sync_repo() {
   local name="$1" url="$2" branch="$3" path="$4"
   mkdir -p "$(dirname "$path")"
 
-  if [[ -d "$path/.git" ]]; then
+  if [[ -d "$path" && ! -d "$path/.git" ]]; then
+    warn "$name path exists but is not a Git repository: $path"
     local choice
-    choice="$(repo_action "$name" "$path")"
+    choice="$(menu "Non-Git Directory Found
+
+Repository:
+  $name
+
+Location:
+  $path
+
+The path exists but does not contain .git. The builder cannot safely pull it as a repository." "2" \
+      "1|Open an interactive shell here|Inspect or move the directory manually, then resume." \
+      "2|Move it aside and clone fresh [DEFAULT]|Rename the directory with a .non-git timestamp suffix, then clone." \
+      "3|Abort build|Stop immediately.")"
     case "$choice" in
-      1) ok "Using existing checkout for $name." ;;
-      2)
+      1) open_shell "$path"; sync_repo "$name" "$url" "$branch" "$path"; return ;;
+      2) mv "$path" "${path}.non-git.$(date -u +%Y%m%d%H%M%S)" ;;
+      3) die "Non-Git repository path encountered for $name." ;;
+    esac
+  fi
+
+  if [[ -d "$path/.git" ]]; then
+    info "$name existing checkout detected: $(repo_current_state "$path" "$branch")"
+
+    local policy="$REPO_POLICY" choice
+    if [[ "$policy" == "prompt" ]]; then
+      choice="$(repo_action "$name" "$path")"
+      case "$choice" in
+        1) policy="continue" ;;
+        2) policy="pull" ;;
+        3) policy="reclone" ;;
+        4) open_shell "$path"; sync_repo "$name" "$url" "$branch" "$path"; return ;;
+        5) warn "Skipping $name."; return 0 ;;
+        6) exit 0 ;;
+      esac
+    fi
+
+    case "$policy" in
+      continue)
+        ok "Using existing checkout for $name."
+        ;;
+      pull)
         info "Refreshing $name."
         git -C "$path" fetch --all --prune
         git -C "$path" checkout "$branch"
         git -C "$path" pull --ff-only
+        ok "$name refreshed: $(repo_current_state "$path" "$branch")"
         ;;
-      3)
+      reclone)
         warn "Re-cloning $name."
         rm -rf "$path"
         git clone -b "$branch" "$url" "$path"
+        ok "$name cloned: $(repo_current_state "$path" "$branch")"
         ;;
-      4) open_shell "$path"; sync_repo "$name" "$url" "$branch" "$path" ;;
-      5) warn "Skipping $name."; return 0 ;;
-      6) exit 0 ;;
+      *) die "Internal error: unsupported repository policy '$policy'" ;;
     esac
   else
-    info "Cloning $name from $url branch $branch."
+    info "Cloning missing repository $name from $url branch $branch."
     git clone -b "$branch" "$url" "$path"
+    ok "$name cloned: $(repo_current_state "$path" "$branch")"
   fi
 }
 
@@ -1086,6 +1199,7 @@ Options:
   --profile NAME                  Board profile name. Default: $PROFILE
   --artifacts PATH                Custom kernel/DTB artifact directory.
   --root-overlay PATH             Directory to copy into /root of target image.
+  --repo-policy POLICY            ask-once, prompt, pull, continue, reclone.
   --cleanup-bad-prompt-dirs       Remove known accidental prompt-text dirs.
   -h, --help                      Show help.
 EOF
@@ -1108,6 +1222,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --artifacts) ARTIFACT_DIR="$(normalize_path_input "$2")"; shift 2 ;;
     --root-overlay) ROOT_OVERLAY_DIR="$(normalize_path_input "$2")"; shift 2 ;;
+    --repo-policy) REPO_POLICY="$2"; shift 2 ;;
     --cleanup-bad-prompt-dirs) CLEANUP_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
@@ -1150,6 +1265,7 @@ Default directories:
   Root overlay:  $ROOT_OVERLAY_DIR
   Downloads:     $DOWNLOADS_DIR
   Releases:      $RELEASES_DIR
+  Repo policy:   $REPO_POLICY
 
 EOF
 
@@ -1157,6 +1273,7 @@ stage 1 11 "Checking host dependencies."
 check_dependencies
 
 stage 2 11 "Refreshing source repositories."
+choose_repo_policy_once
 sync_repo "pico-image" "$PICO_REPO_URL" "$PICO_BRANCH" "$SOURCES_DIR/pico-image"
 sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
 sync_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_BRANCH" "$SOURCES_DIR/desktop-image"
