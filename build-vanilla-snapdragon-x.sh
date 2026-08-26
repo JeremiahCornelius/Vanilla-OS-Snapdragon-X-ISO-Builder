@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.11
+# Version 7.0.12
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,25 +13,27 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.11 corrections after the v7.0.10 ARM64 projection field test:
-#   - Adds the three AMD64-only GRUB EFI packages present in the upstream
-#     pool.list.binary to the explicit ARM64 exclusion set:
-#       grub-efi-amd64, grub-efi-amd64-bin, grub-efi-amd64-signed.
-#   - Keeps the architecture-neutral shim-signed and efibootmgr entries.
-#   - Assigns package-specific exclusion reasons in the audit manifest instead
-#     of one generic reason for every omitted line.
-#   - Clears stale command-log state at every stage boundary so a pre-build
-#     projection failure no longer prints the previous target-OCI log.
-#   - Adds a regression fixture matching the upstream pool.list.binary content
-#     and verifies that all eight approved incompatible package lines are
-#     removed while ARM-neutral EFI and graphical packages remain.
-#   - Preserves all v7.0.10 source, Vib/FsGuard, firmware, DTB, target OCI,
-#     package receipt, package archive, ARM64 projection, and remaster guards.
+# v7.0.12 corrections after the v7.0.11 ARM64 live-package field test:
+#   - Adds iucode-tool to the explicit ARM64 exclusion set. It is an Intel/x86
+#     microcode helper and has no candidate in the configured ARM64 snapshot.
+#   - Makes the actual source strategy explicit: custom-image uses main,
+#     live-iso uses orchid, and the published target/base containers use dev
+#     tags. The script does not claim that every Git source has a dev branch.
+#   - Records commit date, age, exact tags, and requested-ref kind for the
+#     custom-image and live-iso checkouts; an old live-iso date is reported as
+#     upstream repository state rather than a failed refresh.
+#   - Generates a complete derived ARM64 package inventory and runs an isolated
+#     candidate preflight against the configured mirror before live-build.
+#     Every remaining unavailable direct package is reported in one result.
+#   - Candidate preflight is diagnostic and fail-closed. It never silently
+#     removes packages beyond the explicit reviewed exclusion set.
+#   - Preserves all v7.0.11 source, Vib/FsGuard, firmware, DTB, target OCI,
+#     package receipt, package archive, graphical closure, and remaster guards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.11"
+SCRIPT_VERSION="7.0.12"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -50,6 +52,7 @@ CUSTOM_IMAGE_BASE="${CUSTOM_IMAGE_BASE:-ghcr.io/vanilla-os/desktop:dev}"
 
 LIVE_ISO_REPO_URL="${LIVE_ISO_REPO_URL:-https://github.com/Vanilla-OS/live-iso.git}"
 LIVE_ISO_REF="${LIVE_ISO_REF:-orchid}"
+SOURCE_STALE_WARN_DAYS="${SOURCE_STALE_WARN_DAYS:-180}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 
@@ -59,7 +62,7 @@ LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 # explicit and environment-overridable; broad "remove every unavailable
 # package" behavior is prohibited.
 LIVE_ARM64_PACKAGE_LIST_SUFFIX="${LIVE_ARM64_PACKAGE_LIST_SUFFIX:-vanilla-installer-arm64}"
-LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-grub-efi-amd64,grub-efi-amd64-bin,grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11}"
+LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-grub-efi-amd64,grub-efi-amd64-bin,grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11}"
 
 QCOM_UPDATER_REPO_URL="${QCOM_UPDATER_REPO_URL:-https://github.com/alejandroqh/qcom-firmware-updater.git}"
 QCOM_UPDATER_REF="${QCOM_UPDATER_REF:-main}"
@@ -145,6 +148,9 @@ LIVE_PACKAGE_LIST_SOURCE_SUFFIX=""
 LIVE_PACKAGE_LIST_SOURCE_DIR=""
 LIVE_PACKAGE_LIST_DERIVED_DIR=""
 LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST=""
+LIVE_PACKAGE_LIST_PACKAGE_INVENTORY=""
+LIVE_PACKAGE_CANDIDATE_REPORT=""
+SOURCE_PROVENANCE_MANIFEST=""
 LIVE_SOURCE_COMMIT=""
 CUSTOM_SOURCE_COMMIT=""
 SOURCES_SYNCHRONIZED=0
@@ -372,6 +378,17 @@ Options:
   --push-target-image             Push target OCI after local verification.
   -h, --help                      Show this help.
 
+Source-reference strategy:
+  custom-image Git checkout: main branch
+  live-iso Git checkout:     orchid branch
+  target OCI base:           ghcr.io/vanilla-os/desktop:dev
+  live build container:      ghcr.io/vanilla-os/pico:dev
+
+  These repositories do not share one universal dev branch. Git branches are
+  refreshed and exact commit SHAs are recorded. Vib and plugins use release
+  tags. core-image and desktop-image source trees are not build inputs in this
+  v7 container-base architecture.
+
 Vib toolchain defaults:
   VIB_VERSION=1.1.0
   FSGUARD_PLUGIN_REPO=Vanilla-OS/vib-fsguard
@@ -383,10 +400,12 @@ ARM64 live-ISO package projection:
   LIVE_ARM64_PACKAGE_LIST_SUFFIX=vanilla-installer-arm64
   LIVE_ARM64_EXCLUDE_PACKAGES=grub-efi-amd64,grub-efi-amd64-bin,
       grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,
-      amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11
+      amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11
 
   The canonical upstream package-lists.vanilla-installer tree is never edited.
   Only exact package lines named above are omitted from the derived ARM64 tree.
+  Every remaining direct package name is candidate-checked against the selected
+  ARM64 snapshot before the expensive live-build starts.
 
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
@@ -446,7 +465,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.11-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.12-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -1233,6 +1252,81 @@ repo_state() {
   printf 'branch=%s commit=%s state=%s origin=%s' "${branch:-detached}" "${commit:-unknown}" "$dirty" "${origin:-unknown}"
 }
 
+repo_ref_kind() {
+  local path="$1" ref="$2"
+  if git -C "$path" show-ref --verify --quiet "refs/heads/$ref" ||
+     git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
+    printf 'branch'
+  elif git -C "$path" show-ref --verify --quiet "refs/tags/$ref"; then
+    printf 'tag'
+  elif git -C "$path" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+    printf 'commit'
+  else
+    printf 'unresolved'
+  fi
+}
+
+repo_commit_iso_date() {
+  local path="$1"
+  git -C "$path" show -s --format=%cI HEAD 2>/dev/null || printf 'unknown'
+}
+
+repo_commit_age_days() {
+  local path="$1"
+  local commit_epoch now_epoch
+  commit_epoch="$(git -C "$path" show -s --format=%ct HEAD 2>/dev/null || true)"
+  [[ "$commit_epoch" =~ ^[0-9]+$ ]] || { printf 'unknown'; return 0; }
+  now_epoch="$(date -u +%s)"
+  printf '%s' "$(( (now_epoch - commit_epoch) / 86400 ))"
+}
+
+repo_exact_tags() {
+  local path="$1"
+  local tags
+  tags="$(git -C "$path" tag --points-at HEAD 2>/dev/null | LC_ALL=C sort | paste -sd, - || true)"
+  printf '%s' "${tags:-none}"
+}
+
+write_source_provenance_manifest() {
+  SOURCE_PROVENANCE_MANIFEST="$TMP_ROOT/source-provenance.tsv"
+  {
+    printf 'role\trepository\trequested_ref\tref_kind\tcommit\tcommit_date_utc\tage_days\texact_tags\tcheckout\tbuild_use\n'
+    printf 'custom-image\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" \
+      "$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF")" \
+      "$CUSTOM_SOURCE_COMMIT" "$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")" \
+      "$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")" \
+      "$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")" "$CUSTOM_IMAGE_SOURCE" \
+      "template for generated custom target recipe"
+    printf 'live-iso\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" \
+      "$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF")" \
+      "$LIVE_SOURCE_COMMIT" "$(repo_commit_iso_date "$LIVE_ISO_SOURCE")" \
+      "$(repo_commit_age_days "$LIVE_ISO_SOURCE")" \
+      "$(repo_exact_tags "$LIVE_ISO_SOURCE")" "$LIVE_ISO_SOURCE" \
+      "installer ISO source"
+  } > "$SOURCE_PROVENANCE_MANIFEST"
+}
+
+report_source_provenance() {
+  local custom_age live_age
+  custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"
+  live_age="$(repo_commit_age_days "$LIVE_ISO_SOURCE")"
+
+  info "Source-reference strategy:"
+  info "  custom-image: ref=$CUSTOM_IMAGE_REF kind=$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF") commit=$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE") age=${custom_age}d tags=$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")"
+  info "  live-iso:     ref=$LIVE_ISO_REF kind=$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF") commit=$(git -C "$LIVE_ISO_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$LIVE_ISO_SOURCE") age=${live_age}d tags=$(repo_exact_tags "$LIVE_ISO_SOURCE")"
+  info "  target base:  $CUSTOM_IMAGE_BASE"
+  info "  live builder: $LIVE_ISO_CONTAINER_IMAGE"
+
+  if [[ "$live_age" =~ ^[0-9]+$ ]] && (( live_age > SOURCE_STALE_WARN_DAYS )); then
+    warn "live-iso is older than ${SOURCE_STALE_WARN_DAYS} days. This is the refreshed upstream '$LIVE_ISO_REF' state, not a failed Git update."
+  fi
+  if [[ "$custom_age" =~ ^[0-9]+$ ]] && (( custom_age > SOURCE_STALE_WARN_DAYS )); then
+    warn "custom-image is older than ${SOURCE_STALE_WARN_DAYS} days."
+  fi
+}
+
 repo_action_menu() {
   local name="$1" path="$2" ref="$3"
   menu "Repository Validation\n\nRepository: $name\nPath:       $path\nRequested:  $ref\nState:      $(repo_state "$path")" "2" \
@@ -1486,6 +1580,8 @@ sync_required_repositories() {
   CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"
   LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"
   verify_required_source_checkouts
+  write_source_provenance_manifest
+  report_source_provenance
   return 0
 }
 
@@ -1726,10 +1822,12 @@ Repository policy:          $REPO_POLICY
 Sources synchronized:       $SOURCES_SYNCHRONIZED
 custom-image source:        $CUSTOM_IMAGE_REPO_URL @ $CUSTOM_IMAGE_REF
 custom-image checkout:      $(repo_state "$CUSTOM_IMAGE_SOURCE")
+custom-image commit date:   $(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")
 live-iso source:            $LIVE_ISO_REPO_URL @ $LIVE_ISO_REF
 live-iso checkout:          $(source_checkout_summary "$LIVE_ISO_SOURCE")
-core-image retained:        $(source_checkout_summary "$CORE_IMAGE_SOURCE")
-desktop-image retained:     $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")
+live-iso commit date:       $(repo_commit_iso_date "$LIVE_ISO_SOURCE")
+core-image source role:     not cloned; consumed through published OCI lineage
+desktop-image source role:  not cloned; target uses $CUSTOM_IMAGE_BASE
 qcom updater checkout:      $(source_checkout_summary "$QCOM_UPDATER_DIR")
 Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
@@ -1754,7 +1852,9 @@ Safety invariants:
   - Optional tools, headers, development, and metadata .debs are reference-only.
   - Official live package-list source files remain byte-identical.
   - The derived ARM64 list may omit only explicitly approved x86 support
-    packages; no GNOME or installer package may be removed.
+    packages; no GNOME, installer, shim-signed, or efibootmgr package may be removed.
+  - Every remaining direct package name is candidate-checked against the exact
+    ARM64 snapshot before the expensive live-build begins.
   - The upstream-derived ARM64 graphical manifest is accepted before remastering.
   - Final filesystem.packages and filesystem.packages-remove are byte-identical
     to the accepted ARM64 baseline ISO.
@@ -2090,6 +2190,9 @@ capture_vib_diagnostics() {
     "$CUSTOM_PROJECT/CONCEPTION-INPUTS.txt" \
     "$TMP_ROOT/target-installed-kernel-packages.actual.tsv" \
     "$TMP_ROOT/target-installed-package-expectations.tsv" \
+    "$SOURCE_PROVENANCE_MANIFEST" \
+    "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" \
+    "$LIVE_PACKAGE_CANDIDATE_REPORT" \
     "$TMP_ROOT/vib-core-plugin-archive.inventory" \
     "$TMP_ROOT/vib-plugin-inventory.txt" \
     "$TMP_ROOT/vib-plugin-checksums.sha256" \
@@ -2749,11 +2852,12 @@ prepare_arm64_package_list_projection() {
   LIVE_PACKAGE_LIST_SOURCE_DIR="$source_dir"
   LIVE_PACKAGE_LIST_DERIVED_DIR="$derived_dir"
   LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST="$TMP_ROOT/arm64-package-list-exclusions.tsv"
+  LIVE_PACKAGE_LIST_PACKAGE_INVENTORY="$TMP_ROOT/arm64-package-list-packages.tsv"
 
   hash_directory_tree "$source_dir" \
     > "$TMP_ROOT/upstream-package-lists.original.before.sha256"
 
-  protected_packages="gnome-shell,gnome-session,mutter,gdm3,xwayland,network-manager,vanilla-installer"
+  protected_packages="gnome-shell,gnome-session,mutter,gdm3,xwayland,network-manager,vanilla-installer,efibootmgr,shim-signed"
 
   python3 - \
     "$source_dir" \
@@ -2761,7 +2865,8 @@ prepare_arm64_package_list_projection() {
     "$LIVE_ARM64_EXCLUDE_PACKAGES" \
     "$protected_packages" \
     "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST" \
-    "$expected_manifest" <<'PY_ARM64_PACKAGE_PROJECTION'
+    "$expected_manifest" \
+    "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" <<'PY_ARM64_PACKAGE_PROJECTION'
 from __future__ import annotations
 
 import os
@@ -2777,6 +2882,7 @@ exclusion_text = sys.argv[3]
 protected_text = sys.argv[4]
 manifest = Path(sys.argv[5])
 expected_manifest = Path(sys.argv[6])
+package_inventory = Path(sys.argv[7])
 
 package_name_re = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*$")
 single_package_line_re = re.compile(
@@ -2816,11 +2922,12 @@ removed: list[tuple[str, int, str, str]] = []
 suspicious_unapproved: list[tuple[str, int, str]] = []
 source_counts: dict[str, int] = {}
 derived_counts: dict[str, int] = {}
+derived_locations: dict[str, list[str]] = {}
 
 def suspicious_x86_package(pkg: str) -> bool:
     return bool(
         re.search(r"(^|[-.])(amd64|i386)([-.]|$)", pkg)
-        or pkg == "intel-microcode"
+        or pkg in {"intel-microcode", "iucode-tool"}
         or pkg.startswith("virtualbox-guest-")
     )
 
@@ -2831,6 +2938,8 @@ def exclusion_reason(pkg: str) -> str:
         return "AMD64-only signed shim helper package"
     if pkg in {"intel-microcode", "amd64-microcode"}:
         return "x86 CPU microcode package unavailable for ARM64"
+    if pkg == "iucode-tool":
+        return "Intel/x86 microcode helper unavailable for ARM64"
     if pkg.startswith("virtualbox-guest-"):
         return "VirtualBox guest package unavailable in the configured ARM64 snapshot"
     return "explicitly approved ARM64 snapshot-incompatible package"
@@ -2874,6 +2983,7 @@ for source_file in sorted(p for p in source.rglob("*") if p.is_file()):
             continue
 
         count_token(derived_counts, pkg)
+        derived_locations.setdefault(pkg, []).append(f"{rel}:{lineno}")
         out_lines.append(line + newline)
 
     derived_file.write_text("".join(out_lines), encoding="utf-8")
@@ -2928,6 +3038,14 @@ with expected_manifest.open("w", encoding="utf-8") as handle:
             f"{sum(1 for row in removed if row[2] == pkg)}\n"
         )
 
+with package_inventory.open("w", encoding="utf-8") as handle:
+    handle.write("package\toccurrences\tsource_locations\n")
+    for pkg in sorted(derived_counts):
+        handle.write(
+            f"{pkg}\t{derived_counts[pkg]}\t"
+            f"{','.join(derived_locations.get(pkg, []))}\n"
+        )
+
 print(f"Created ARM64 package-list projection: {derived}")
 print(f"Approved exclusions configured: {len(exclusions)}")
 print(f"Package-list lines excluded: {len(removed)}")
@@ -2941,6 +3059,8 @@ PY_ARM64_PACKAGE_PROJECTION
   [[ -d "$derived_dir" ]] || die "ARM64 package-list projection was not created."
   [[ -s "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST" ]] || \
     die "ARM64 package-list exclusion manifest was not created."
+  [[ -s "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" ]] || \
+    die "ARM64 derived package inventory was not created."
 
   hash_directory_tree "$derived_dir" \
     > "$TMP_ROOT/arm64-package-lists.derived.before.sha256"
@@ -2962,6 +3082,136 @@ PY_ARM64_PACKAGE_PROJECTION
   ok "Approved architecture exclusions applied: $excluded_count line(s)"
   info "Architecture exclusion manifest: $LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST"
   sed -n '1,120p' "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST"
+}
+
+preflight_arm64_package_candidates() {
+  local conf="$1"
+  local mirror suite preflight_dir runner packages_file rc
+  mirror="$(read_terraform_value "$conf" MIRROR_URL)"
+  suite="$(read_terraform_value "$conf" BASECODENAME)"
+
+  [[ -n "$mirror" ]] || die "Unable to read MIRROR_URL for ARM64 package preflight."
+  [[ -n "$suite" ]] || die "Unable to read BASECODENAME for ARM64 package preflight."
+  [[ -s "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" ]] || \
+    die "Derived ARM64 package inventory is absent before candidate preflight."
+
+  preflight_dir="$TMP_ROOT/arm64-package-candidate-preflight"
+  runner="$preflight_dir/run-preflight.sh"
+  packages_file="$preflight_dir/packages.txt"
+  LIVE_PACKAGE_CANDIDATE_REPORT="$preflight_dir/package-candidates.tsv"
+
+  rm -rf "$preflight_dir"
+  mkdir -p "$preflight_dir"
+  awk -F '\t' 'NR > 1 && $1 != "" { print $1 }' \
+    "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" |
+    LC_ALL=C sort -u > "$packages_file"
+  [[ -s "$packages_file" ]] || die "No package names were extracted for ARM64 candidate preflight."
+
+  cat > "$runner" <<'ARM64_PACKAGE_PREFLIGHT_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${MIRROR_URL:?}"
+: "${BASECODENAME:?}"
+
+arch="$(dpkg --print-architecture)"
+[[ "$arch" == "arm64" ]] || {
+  echo "Candidate preflight container architecture is $arch, expected arm64" >&2
+  exit 40
+}
+
+rm -f /etc/apt/sources.list
+rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+cat > /etc/apt/sources.list <<EOF_APT_SOURCE
+deb [trusted=yes] $MIRROR_URL $BASECODENAME main contrib non-free non-free-firmware
+EOF_APT_SOURCE
+
+apt-get update \
+  -o Acquire::Check-Valid-Until=false \
+  -o Acquire::Retries=5 \
+  -o Acquire::http::Timeout=100
+
+report=/preflight/package-candidates.tsv
+unavailable=/preflight/unavailable-packages.tsv
+printf 'package\tcandidate\tkind\n' > "$report"
+printf 'package\treason\n' > "$unavailable"
+
+while IFS= read -r package; do
+  [[ -n "$package" ]] || continue
+
+  candidate="$(apt-cache madison "$package" | awk 'NR == 1 { print $3 }')"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\t%s\trepository\n' "$package" "$candidate" >> "$report"
+    continue
+  fi
+
+  if apt-cache showpkg "$package" |
+       awk '
+         /^Reverse Provides:/ { in_reverse=1; next }
+         in_reverse && NF > 0 { found=1 }
+         END { exit(found ? 0 : 1) }
+       '; then
+    printf '%s\tvirtual\tvirtual-package\n' "$package" >> "$report"
+    continue
+  fi
+
+  printf '%s\tno repository candidate or virtual provider\n' "$package" >> "$unavailable"
+done < /preflight/packages.txt
+
+if [[ "$(wc -l < "$unavailable")" -gt 1 ]]; then
+  echo "Unavailable direct ARM64 package names:" >&2
+  tail -n +2 "$unavailable" >&2
+  exit 41
+fi
+
+touch /preflight/candidate-preflight.ok
+echo "All direct package-list names have an ARM64 repository candidate or virtual provider."
+ARM64_PACKAGE_PREFLIGHT_EOF
+  chmod 0755 "$runner"
+
+  CURRENT_LOG="$LOG_DIR/${SESSION_ID}-arm64-package-candidate-preflight.log"
+  info "Log: $CURRENT_LOG"
+  info "Preflighting every derived package-list name against: $mirror $suite (arm64)"
+
+  # Place the pipeline in an if-condition. Bash suppresses the ERR trap for
+  # conditional commands, allowing us to capture the container's real status,
+  # print the complete unavailable-package report, and then fail deliberately.
+  if "$LIVE_ISO_RUNTIME" run --rm --network host \
+       -e "MIRROR_URL=$mirror" \
+       -e "BASECODENAME=$suite" \
+       -v "$preflight_dir:/preflight" \
+       "$LIVE_ISO_CONTAINER_IMAGE" \
+       /bin/bash /preflight/run-preflight.sh \
+       2>&1 | tee "$CURRENT_LOG"; then
+    rc=0
+  else
+    rc=${PIPESTATUS[0]}
+  fi
+
+  if (( rc != 0 )); then
+    if [[ -s "$preflight_dir/unavailable-packages.tsv" ]]; then
+      fail "Complete direct-package candidate failure report:"
+      while IFS=$'\t' read -r package reason; do
+        [[ "$package" == "package" || -z "$package" ]] && continue
+        local locations
+        locations="$(
+          awk -F '\t' -v pkg="$package" '
+            NR > 1 && $1 == pkg { print $3; exit }
+          ' "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY"
+        )"
+        fail "  $package — $reason — ${locations:-source location unknown}"
+      done < "$preflight_dir/unavailable-packages.tsv"
+    fi
+    die "ARM64 package candidate preflight failed before live-build."
+  fi
+
+  [[ -f "$preflight_dir/candidate-preflight.ok" ]] || \
+    die "ARM64 package candidate preflight returned success without its completion marker."
+  [[ -s "$LIVE_PACKAGE_CANDIDATE_REPORT" ]] || \
+    die "ARM64 package candidate report is missing."
+
+  ok "Every derived direct package name has an ARM64 candidate or virtual provider."
+  info "Candidate report: $LIVE_PACKAGE_CANDIDATE_REPORT"
 }
 
 verify_arm64_package_list_projection_after_build() {
@@ -3010,6 +3260,7 @@ prepare_arm64_live_worktree() {
   grep -q '^ARCH="arm64"$' "$conf" || die "Unable to select ARM64 in terraform.conf."
 
   prepare_arm64_package_list_projection "$conf"
+  preflight_arm64_package_candidates "$conf"
 
   # The official orchid build script still hard-codes the final AMD64 output
   # source path. This replacement happens after lb build and cannot alter the
@@ -3284,6 +3535,9 @@ verify_final_release() {
   cp -a "$TMP_ROOT/arm64-package-lists.derived.after.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/arm64-package-list-exclusions.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/arm64-package-list-projection.expected.tsv" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/arm64-package-list-packages.tsv" "$RELEASE_DIR/"
+  [[ -n "$LIVE_PACKAGE_CANDIDATE_REPORT" && -f "$LIVE_PACKAGE_CANDIDATE_REPORT" ]] &&     cp -a "$LIVE_PACKAGE_CANDIDATE_REPORT" "$RELEASE_DIR/"
+  [[ -n "$SOURCE_PROVENANCE_MANIFEST" && -f "$SOURCE_PROVENANCE_MANIFEST" ]] &&     cp -a "$SOURCE_PROVENANCE_MANIFEST" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
@@ -3337,11 +3591,17 @@ ABRoot image name:           $ABROOT_IMAGE_NAME
 Target OCI base:             $CUSTOM_IMAGE_BASE
 Vib version:                 $VIB_DETECTED_VERSION
 FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG
+custom-image source ref:     $CUSTOM_IMAGE_REF
 custom-image source commit:  $CUSTOM_SOURCE_COMMIT
+custom-image commit date:    $(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")
+live-iso source ref:         $LIVE_ISO_REF
 live-iso source commit:      $LIVE_SOURCE_COMMIT
+live-iso commit date:        $(repo_commit_iso_date "$LIVE_ISO_SOURCE")
+Source provenance record:    source-provenance.tsv
 Upstream package-list suffix:$LIVE_PACKAGE_LIST_SOURCE_SUFFIX
 ARM64 package-list suffix:   $LIVE_ARM64_PACKAGE_LIST_SUFFIX
 ARM64 exclusions:            $LIVE_ARM64_EXCLUDE_PACKAGES
+ARM64 candidate report:      package-candidates.tsv
 ARM64 baseline ISO:          $UPSTREAM_ISO
 Final ISO:                   $FINAL_ISO
 Live package manifests:      byte-identical to accepted ARM64 baseline
