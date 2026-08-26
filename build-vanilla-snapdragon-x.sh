@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.7.sh
+# build-vanilla-arm64-release-v2.4.8.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.6
+# Version: 2.4.8
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.7"
+SCRIPT_VERSION="2.4.8"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -546,6 +546,141 @@ PY
     esac
   done
 }
+
+resolve_vib_plugin_bundle_into_repo() {
+  # Vanilla image recipes commonly require Vib plugins, especially fsguard.
+  # The Vib GitHub release publishes separate binary assets:
+  #   - vib-arm64 / vib-amd64          => the Vib executable
+  #   - plugins-arm64.tar.gz / ...     => plugin bundle
+  #
+  # Earlier builder revisions installed only the Vib executable. That allowed
+  # Stage 8 to reach `vib build recipe.yml`, but core-image/plugins and
+  # desktop-image/plugins remained empty, causing opaque Vib failures.
+  #
+  # This function installs the matching plugins-$arch bundle into the supplied
+  # repository's plugins/ directory. It is intentionally idempotent.
+  local repo="$1"
+  local repo_name
+  local plugins_dir
+  local host_arch
+  local tmp release_json asset_url asset_name extract_dir copied_count
+
+  repo_name="$(basename "$repo")"
+  plugins_dir="$repo/plugins"
+  host_arch="$(detect_arch)"
+
+  [[ -d "$repo" ]] || return 0
+
+  mkdir -p "$plugins_dir"
+
+  if find "$plugins_dir" -type f | grep -q .; then
+    ok "Vib plugins already present for $repo_name: $plugins_dir"
+    return 0
+  fi
+
+  printf '\n' >&2
+  hr
+  printf 'Vib Plugin Bundle Required\n\n' >&2
+  printf 'Repository:\n  %s\n\n' "$repo_name" >&2
+  printf 'Plugin directory:\n  %s\n\n' "$plugins_dir" >&2
+  printf 'The directory is empty. Vanilla image recipes may require plugins such as fsguard.\n' >&2
+  printf 'The builder will download the matching Vib plugin bundle for this host architecture:\n  %s\n' "$host_arch" >&2
+  hr
+
+  tmp="$TMP_DIR/vib-plugins-${repo_name}-$$"
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  release_json="$tmp/release.json"
+  extract_dir="$tmp/extract"
+  mkdir -p "$extract_dir"
+
+  info "Querying latest Vib release metadata for plugin bundle."
+  curl -fsSL "https://api.github.com/repos/Vanilla-OS/Vib/releases/latest" -o "$release_json" \
+    || die "Unable to query latest Vib release metadata for plugin bundle."
+
+  if have jq; then
+    asset_url="$(jq -r --arg arch "$host_arch" '
+      .assets[]
+      | select(.name | test("^plugins-" + $arch + ".*\\.tar\\.gz$"))
+      | .browser_download_url
+    ' "$release_json" | head -n1)"
+    asset_name="$(jq -r --arg url "$asset_url" '.assets[] | select(.browser_download_url==$url) | .name' "$release_json" | head -n1)"
+  else
+    asset_url="$(python3 - "$release_json" "$host_arch" <<'PY'
+import json, sys, re
+data=json.load(open(sys.argv[1]))
+arch=sys.argv[2]
+pat=re.compile(rf"^plugins-{re.escape(arch)}.*\.tar\.gz$")
+for a in data.get("assets", []):
+    name=a.get("name","")
+    if pat.search(name):
+        print(a.get("browser_download_url",""))
+        break
+PY
+)"
+    asset_name="$(basename "$asset_url")"
+  fi
+
+  if [[ -z "${asset_url:-}" || "$asset_url" == "null" ]]; then
+    fail "Could not identify a Vib plugin bundle for architecture '$host_arch'."
+    warn "Expected an asset resembling: plugins-$host_arch.tar.gz"
+    open_shell "$tmp"
+    die "Vib plugin bundle could not be resolved."
+  fi
+
+  info "Downloading Vib plugin bundle: $asset_name"
+  curl -fL "$asset_url" -o "$tmp/$asset_name" \
+    || die "Failed to download Vib plugin bundle: $asset_name"
+
+  info "Extracting Vib plugin bundle."
+  tar -xzf "$tmp/$asset_name" -C "$extract_dir" \
+    || die "Failed to extract Vib plugin bundle: $asset_name"
+
+  copied_count=0
+
+  while IFS= read -r f; do
+    cp -a "$f" "$plugins_dir/$(basename "$f")"
+    copied_count=$((copied_count + 1))
+  done < <(
+    find "$extract_dir" -type f \( \
+      -name '*.so' -o \
+      -iname '*fsguard*' -o \
+      -iname '*plugin*' \
+    \) ! -name '*.tar.gz' | sort
+  )
+
+  if [[ "$copied_count" -eq 0 ]]; then
+    warn "No obvious .so/fsguard/plugin files found in plugin bundle; copying all regular files as fallback."
+    while IFS= read -r f; do
+      cp -a "$f" "$plugins_dir/$(basename "$f")"
+      copied_count=$((copied_count + 1))
+    done < <(find "$extract_dir" -type f ! -name '*.tar.gz' | sort)
+  fi
+
+  if [[ "$copied_count" -eq 0 ]] || ! find "$plugins_dir" -type f | grep -q .; then
+    fail "Plugin bundle was downloaded but no plugin files were installed into $plugins_dir."
+    warn "Extraction workspace: $tmp"
+    open_shell "$tmp"
+    die "Vib plugin installation failed for $repo_name."
+  fi
+
+  ok "Installed $copied_count Vib plugin file(s) into $plugins_dir."
+  printf 'Installed plugin files:\n' >&2
+  find "$plugins_dir" -maxdepth 1 -type f -printf '  %f\n' | sort >&2
+}
+
+ensure_vib_plugins_for_image_repos() {
+  # Install Vib plugins into every source repository that uses Vib recipes.
+  # This runs after Git sources are cloned/refreshed and before Stage 8.
+  local repo
+  for repo in "$SOURCES_DIR/core-image" "$SOURCES_DIR/desktop-image"; do
+    [[ -d "$repo" ]] || continue
+    if [[ -f "$repo/recipe.yml" ]]; then
+      resolve_vib_plugin_bundle_into_repo "$repo"
+    fi
+  done
+}
+
 
 check_dependencies() {
   local missing=()
@@ -1313,12 +1448,15 @@ vib_preflight() {
   fi
 
   # Vanilla image recipes commonly expect plugin bundles, especially fsguard.
-  # Missing plugins may be a legitimate setup issue. Warn rather than fail,
-  # because upstream recipe requirements can change.
+  # By this point the builder should already have resolved plugins from the
+  # Vib release bundle. Treat an empty plugins directory as a setup failure
+  # rather than continuing to an opaque Vib failure.
   if [[ ! -d "$workdir/plugins" ]] || ! find "$workdir/plugins" -type f | grep -q .; then
-    warn "No Vib plugin files were found under $workdir/plugins."
-    warn "If recipe.yml requires fsguard or other Vib plugins, `vib build` will fail."
+    fail "No Vib plugin files were found under $workdir/plugins."
+    warn "The builder should have installed plugins before Stage 8."
     warn "See preflight log: $log"
+    print_failure_tail "$log"
+    return 1
   fi
 
   ok "Vib preflight completed for $label."
@@ -1579,6 +1717,9 @@ sync_repo "pico-image" "$PICO_REPO_URL" "$PICO_BRANCH" "$SOURCES_DIR/pico-image"
 sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
 sync_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_BRANCH" "$SOURCES_DIR/desktop-image"
 sync_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_BRANCH" "$SOURCES_DIR/live-iso"
+
+info "Ensuring Vib plugin bundles are installed for image recipes."
+ensure_vib_plugins_for_image_repos
 
 stage 3 11 "Validating local kernel and DTB artifacts."
 validate_artifacts
