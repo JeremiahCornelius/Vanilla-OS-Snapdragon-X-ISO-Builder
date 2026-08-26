@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.0.4-r2
+# Version 8.0.4-r3
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,26 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.4-r3 package-name-independent kernel intake:
+#   - Selects the kernel by Debian payload semantics rather than Jens Glathe,
+#     Ubuntu, Debian, Armbian, flavour, ABI, or private-fork package naming.
+#   - Derives uname -r only from a regular /boot/vmlinuz-<release> member and
+#     accepts runtime modules from /lib/modules or /usr/lib/modules regardless
+#     of the binary package name that carries them.
+#   - Supports Debian's split linux-binary/linux-modules model, Ubuntu's
+#     linux-image-unsigned/linux-modules model, Armbian-style image packages,
+#     and locally named Debian packages when their payload is conventional.
+#   - Resolves a deterministic local Depends/Pre-Depends closure from supplied
+#     packages, including package-name-independent support packages, while
+#     leaving repository-resolvable dependencies to APT.
+#   - Adds an exact --kernel-image-deb selector for the rare case where more
+#     than one supplied package owns the same /boot/vmlinuz-<release>.
+#   - Canonicalizes staged .deb filenames from Package/Version/Architecture,
+#     eliminating reliance on input filenames and preventing basename clashes.
+#   - Fails closed on duplicate package identities with differing bytes,
+#     overlapping boot-critical payloads, unsupported vmlinux-only payloads,
+#     ambiguous image ownership, mixed architectures, or incomplete closures.
 #
 # v8.0.4-r2 encrypted custom-layout correction and project taxonomy:
 #   - Records the successful HP OmniBook 5 field milestone: encrypted /var now
@@ -143,7 +163,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4-r2"
+SCRIPT_VERSION="8.0.4-r3"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -175,6 +195,7 @@ unset _sudo_home
 ENV_PROFILE_SET="${PROFILE+x}"
 ENV_ARTIFACT_DIR_SET="${ARTIFACT_DIR+x}"
 ENV_KERNEL_DEB_DIR_SET="${KERNEL_DEB_DIR+x}"
+ENV_KERNEL_IMAGE_DEB_SET="${KERNEL_IMAGE_DEB_OVERRIDE+x}"
 ENV_ROOT_SOURCE_SET="${ROOT_SOURCE+x}"
 ENV_DTB_FILE_SET="${DTB_FILE_OVERRIDE+x}"
 ENV_DTB_NAME_SET="${DTB_INSTALLED_NAME_OVERRIDE+x}"
@@ -184,6 +205,7 @@ ENV_FIRMWARE_QCOM_SOC_SHA256_SET="${FIRMWARE_QCOM_SOC_SHA256+x}"
 ENV_FIRMWARE_QCOM_SOC_VERSION_SET="${FIRMWARE_QCOM_SOC_EXPECTED_VERSION+x}"
 ENV_FIRMWARE_QCOM_SOC_POLICY_SET="${FIRMWARE_QCOM_SOC_POLICY+x}"
 ENV_KERNEL_RELEASE_SET="${EXPECTED_CUSTOM_KERNEL_RELEASE+x}"
+ENV_KERNEL_RELEASE_POLICY_SET="${KERNEL_RELEASE_POLICY+x}"
 ENV_CUSTOM_IMAGE_BASE_SET="${CUSTOM_IMAGE_BASE+x}"
 ENV_TARGET_IMAGE_SET="${TARGET_IMAGE_REF+x}"
 ENV_TARGET_REPOSITORY_SET="${TARGET_IMAGE_REPOSITORY+x}"
@@ -206,6 +228,7 @@ PROFILE_DISPLAY_NAME="${PROFILE_DISPLAY_NAME:-}"
 PROFILE_ARCHITECTURE="${PROFILE_ARCHITECTURE:-arm64}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-}"
 KERNEL_DEB_DIR="${KERNEL_DEB_DIR:-}"
+KERNEL_IMAGE_DEB_OVERRIDE="${KERNEL_IMAGE_DEB_OVERRIDE:-}"
 ROOT_SOURCE="${ROOT_SOURCE:-}"
 DTB_FILE_OVERRIDE="${DTB_FILE_OVERRIDE:-}"
 DTB_INSTALLED_NAME_OVERRIDE="${DTB_INSTALLED_NAME_OVERRIDE:-}"
@@ -230,6 +253,7 @@ HP_ATH11K_BOARD_BIN_SHA256="${HP_ATH11K_BOARD_BIN_SHA256:-dd17d8aaccdc3e8a0a82d0
 HP_ATH11K_BOARD_ZST_SHA256="${HP_ATH11K_BOARD_ZST_SHA256:-756d0d3134db83182eefa7286993f924286e71eb75faab1a46d1fb80e68b0e0a}"
 
 EXPECTED_CUSTOM_KERNEL_RELEASE="${EXPECTED_CUSTOM_KERNEL_RELEASE:-}"
+KERNEL_RELEASE_POLICY="${KERNEL_RELEASE_POLICY:-prefer}"
 
 CUSTOM_IMAGE_REPO_URL="${CUSTOM_IMAGE_REPO_URL:-https://github.com/Vanilla-OS/custom-image.git}"
 CUSTOM_IMAGE_REF="${CUSTOM_IMAGE_REF:-main}"
@@ -360,6 +384,9 @@ declare -a PROFILE_INITRAMFS_PROBES=()
 declare -a PROFILE_INSTALLED_PATH_PROBES=()
 declare -a PROFILE_KERNEL_CMDLINE_APPEND=()
 KERNEL_RELEASE=""
+KERNEL_RELEASE_REQUESTED=""
+KERNEL_IMAGE_DEB=""
+KERNEL_PACKAGE_CLOSURE_JSON=""
 DTB_FILE=""
 DTB_NAME=""
 FIRMWARE_SOURCE=""
@@ -606,8 +633,11 @@ Options:
   --profile NAME                  Hardware profile identifier.
   --profile-file PATH             Hardware-profile JSON manifest.
   --artifact-dir PATH             Profile artifact directory.
-  --kernel-deb-dir PATH           Kernel Debian-package directory.
-  --kernel-release RELEASE        Expected exact custom kernel release.
+  --kernel-deb-dir PATH           Directory containing Debian kernel-related .debs.
+  --kernel-image-deb PATH          Exact package owning /boot/vmlinuz-<release>
+                                  when more than one supplied package qualifies.
+  --kernel-release RELEASE        Preferred or required exact uname -r.
+  --kernel-release-policy POLICY  prefer, require, or auto. Default: prefer.
   --dtb-file PATH                 Exact DTB source file.
   --dtb-name NAME                 Installed DTB filename.
   --root-source PATH              Directory copied into target OCI /root.
@@ -694,15 +724,19 @@ Preferred input layout:
   │   ├── firmware-qcom-soc_<version>_all.deb
   │   └── firmware-qcom-soc_<version>_all.deb.sha256
   ├── kernel-debs/
-  │   ├── linux-image-<release>_*.deb
-  │   ├── linux-modules-<release>_*.deb
-  │   └── other matching kernel .deb files
+  │   ├── <any-name>.deb          # owns regular /boot/vmlinuz-<uname-r>
+  │   ├── <any-name>.deb          # owns runtime .ko files for that uname-r
+  │   └── optional local dependency/support .debs
   ├── dtb/
   │   └── x1p42100-hp-omnibook-5.dtb
   └── firmware/                  # profile overlay relative to /usr/lib/firmware
       ├── ath11k/WCN6855/hw2.1/board-2.bin
       ├── ath11k/WCN6855/hw2.1/board-2.bin.zst
       └── qcom/x1p42100/hp/omnibook-5/...
+
+Kernel package filenames and Package fields are not selectors. The harness uses
+Debian control metadata, conventional payload paths, and local dependency
+relationships. --kernel-image-deb resolves duplicate image ownership explicitly.
 
 Generic X1-45 firmware is extracted from firmware-qcom-soc and must resolve to:
   qcom/gen71500_sqe.fw
@@ -765,7 +799,9 @@ parse_args() {
       --profile-file) [[ $# -ge 2 ]] || die "--profile-file requires a path"; PROFILE_FILE="$(normalize_path_input "$2")"; shift 2 ;;
       --artifact-dir) [[ $# -ge 2 ]] || die "--artifact-dir requires a path"; ARTIFACT_DIR="$(normalize_path_input "$2")"; shift 2 ;;
       --kernel-deb-dir) [[ $# -ge 2 ]] || die "--kernel-deb-dir requires a path"; KERNEL_DEB_DIR="$(normalize_path_input "$2")"; shift 2 ;;
+      --kernel-image-deb) [[ $# -ge 2 ]] || die "--kernel-image-deb requires a path"; KERNEL_IMAGE_DEB_OVERRIDE="$(normalize_path_input "$2")"; shift 2 ;;
       --kernel-release) [[ $# -ge 2 ]] || die "--kernel-release requires a value"; EXPECTED_CUSTOM_KERNEL_RELEASE="$2"; shift 2 ;;
+      --kernel-release-policy) [[ $# -ge 2 ]] || die "--kernel-release-policy requires prefer, require, or auto"; KERNEL_RELEASE_POLICY="${2,,}"; shift 2 ;;
       --dtb-file) [[ $# -ge 2 ]] || die "--dtb-file requires a path"; DTB_FILE_OVERRIDE="$(normalize_path_input "$2")"; shift 2 ;;
       --dtb-name) [[ $# -ge 2 ]] || die "--dtb-name requires a value"; DTB_INSTALLED_NAME_OVERRIDE="$2"; shift 2 ;;
       --root-source) [[ $# -ge 2 ]] || die "--root-source requires a path"; ROOT_SOURCE="$(normalize_path_input "$2")"; shift 2 ;;
@@ -796,6 +832,7 @@ recompute_paths() {
   WORKDIR="$(canonicalize_workdir "$WORKDIR")"
   ARTIFACT_DIR="${ARTIFACT_DIR:-$WORKDIR/artifacts/$PROFILE}"
   KERNEL_DEB_DIR="${KERNEL_DEB_DIR:-$ARTIFACT_DIR/kernel-debs}"
+  [[ -z "$KERNEL_IMAGE_DEB_OVERRIDE" ]] || KERNEL_IMAGE_DEB_OVERRIDE="$(canonicalize_workdir "$KERNEL_IMAGE_DEB_OVERRIDE")"
   TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-localhost/vanillaos-snapdragonx/vanilla-desktop-${PROFILE}}"
   TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-${TARGET_IMAGE_REPOSITORY}:${BUILD_DATE}}"
   ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-/target-images/$PROFILE}"
@@ -808,7 +845,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.4-r2-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.4-r3-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -833,6 +870,7 @@ recompute_paths() {
   FIRMWARE_STAGED_INVENTORY="$FIRMWARE_PROVENANCE_DIR/staged-firmware.sha256"
   LIVE_KERNEL_CMDLINE_JSON="$TMP_ROOT/live-kernel-command-line.json"
   LIVE_KERNEL_CMDLINE_EVIDENCE="$TMP_ROOT/live-kernel-command-line-evidence.txt"
+  KERNEL_PACKAGE_CLOSURE_JSON="$TMP_ROOT/kernel-package-closure.json"
 }
 
 
@@ -958,7 +996,9 @@ synthesize_compatibility_profile() {
     --arg display "$PROFILE" \
     --arg artifacts "$ARTIFACT_DIR" \
     --arg kernel_dir "$KERNEL_DEB_DIR" \
+    --arg kernel_image_deb "$KERNEL_IMAGE_DEB_OVERRIDE" \
     --arg kernel_release "$EXPECTED_CUSTOM_KERNEL_RELEASE" \
+    --arg kernel_release_policy "$KERNEL_RELEASE_POLICY" \
     --arg dtb "$DTB_FILE_OVERRIDE" \
     --arg dtb_name "$DTB_INSTALLED_NAME_OVERRIDE" \
     --arg root "$ROOT_SOURCE" \
@@ -988,7 +1028,9 @@ synthesize_compatibility_profile() {
       },
       kernel: {
         deb_directory: $kernel_dir,
+        image_deb: (if $kernel_image_deb == "" then null else $kernel_image_deb end),
         expected_release: (if $kernel_release == "" then null else $kernel_release end),
+        release_policy: $kernel_release_policy,
         allow_single_release_discovery: true,
         command_line_append: $cmdline
       },
@@ -1083,6 +1125,10 @@ load_hardware_profile() {
     value="$(jq -r '.kernel.deb_directory // empty' "$PROFILE_FILE_RESOLVED")"
     [[ -z "$value" ]] || KERNEL_DEB_DIR="$(resolve_profile_path "$value")"
   fi
+  if [[ -z "$ENV_KERNEL_IMAGE_DEB_SET" ]]; then
+    value="$(jq -r '.kernel.image_deb // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || KERNEL_IMAGE_DEB_OVERRIDE="$(resolve_profile_path "$value")"
+  fi
   if [[ -z "$ENV_ROOT_SOURCE_SET" ]]; then
     value="$(jq -r '.artifacts.root_overlay // empty' "$PROFILE_FILE_RESOLVED")"
     [[ -z "$value" ]] || ROOT_SOURCE="$(resolve_profile_path "$value")"
@@ -1098,6 +1144,10 @@ load_hardware_profile() {
   if [[ -z "$ENV_KERNEL_RELEASE_SET" ]]; then
     value="$(jq -r '.kernel.expected_release // empty' "$PROFILE_FILE_RESOLVED")"
     [[ -z "$value" ]] || EXPECTED_CUSTOM_KERNEL_RELEASE="$value"
+  fi
+  if [[ -z "$ENV_KERNEL_RELEASE_POLICY_SET" ]]; then
+    value="$(jq -r '.kernel.release_policy // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || KERNEL_RELEASE_POLICY="$value"
   fi
   if [[ -z "$ENV_FIRMWARE_SOURCE_SET" ]]; then
     value="$(jq -r '.firmware.source // empty' "$PROFILE_FILE_RESOLVED")"
@@ -1199,6 +1249,11 @@ load_hardware_profile() {
     *) die "Unsupported delivery mode: $DELIVERY_MODE" ;;
   esac
 
+  case "$KERNEL_RELEASE_POLICY" in
+    prefer|require|auto) : ;;
+    *) die "Unsupported kernel release policy: $KERNEL_RELEASE_POLICY" ;;
+  esac
+
   case "$INSTALLER_STORAGE_GUARD_POLICY" in
     repair|strict|off) : ;;
     *) die "Unsupported installer storage-guard policy: $INSTALLER_STORAGE_GUARD_POLICY" ;;
@@ -1223,7 +1278,10 @@ write_resolved_profile() {
     --arg source_profile "$PROFILE_FILE_RESOLVED" \
     --arg artifact_dir "$ARTIFACT_DIR" \
     --arg kernel_dir "$KERNEL_DEB_DIR" \
+    --arg kernel_image_deb "$KERNEL_IMAGE_DEB_OVERRIDE" \
     --arg kernel_release "$EXPECTED_CUSTOM_KERNEL_RELEASE" \
+    --arg kernel_release_policy "$KERNEL_RELEASE_POLICY" \
+    --arg selected_kernel_release "$KERNEL_RELEASE" \
     --arg dtb_source "$DTB_FILE_OVERRIDE" \
     --arg dtb_name "$DTB_INSTALLED_NAME_OVERRIDE" \
     --arg root_source "$ROOT_SOURCE" \
@@ -1260,7 +1318,10 @@ write_resolved_profile() {
       resolved: {
         artifact_directory: $artifact_dir,
         kernel_deb_directory: $kernel_dir,
-        expected_kernel_release: (if $kernel_release == "" then null else $kernel_release end),
+        kernel_image_deb_override: (if $kernel_image_deb == "" then null else $kernel_image_deb end),
+        requested_kernel_release: (if $kernel_release == "" then null else $kernel_release end),
+        kernel_release_policy: $kernel_release_policy,
+        selected_kernel_release: (if $selected_kernel_release == "" then null else $selected_kernel_release end),
         dtb_source: (if $dtb_source == "" then null else $dtb_source end),
         dtb_installed_name: (if $dtb_name == "" then null else $dtb_name end),
         root_overlay: (if $root_source == "" then null else $root_source end),
@@ -1300,6 +1361,10 @@ write_resolved_profile() {
     printf 'architecture\tpass\t%s\n' "$PROFILE_ARCHITECTURE"
     printf 'artifact_directory\tresolved\t%s\n' "$ARTIFACT_DIR"
     printf 'kernel_deb_directory\tresolved\t%s\n' "$KERNEL_DEB_DIR"
+    printf 'kernel_image_deb\t%s\t%s\n' "$([[ -n "$KERNEL_IMAGE_DEB_OVERRIDE" ]] && printf selected || printf discovery)" "${KERNEL_IMAGE_DEB_OVERRIDE:-payload discovery}"
+    printf 'kernel_release_policy\tresolved\t%s\n' "$KERNEL_RELEASE_POLICY"
+    printf 'kernel_release_requested\t%s\t%s\n' "$([[ -n "$EXPECTED_CUSTOM_KERNEL_RELEASE" ]] && printf configured || printf auto)" "${EXPECTED_CUSTOM_KERNEL_RELEASE:-none}"
+    printf 'kernel_release_selected\t%s\t%s\n' "$([[ -n "$KERNEL_RELEASE" ]] && printf resolved || printf pending)" "${KERNEL_RELEASE:-not-yet-discovered}"
     printf 'dtb_source\t%s\t%s\n' "$([[ -n "$DTB_FILE_OVERRIDE" ]] && printf resolved || printf discovery)" "${DTB_FILE_OVERRIDE:-deterministic discovery}"
     printf 'qcom_soc_package_policy\tresolved\t%s\n' "$FIRMWARE_QCOM_SOC_POLICY"
     printf 'qcom_soc_package\t%s\t%s\n' "$([[ -n "$FIRMWARE_QCOM_SOC_DEB" ]] && printf resolved || printf pending)" "${FIRMWARE_QCOM_SOC_DEB:-automatic discovery}"
@@ -1755,7 +1820,7 @@ write_deb_content_listing() {
 
 deb_listing_has_regular_boot_kernel() {
   # A boot kernel must be a regular archive member. Directories and symlinks do
-  # not qualify. dpkg-deb -c emits the Unix mode/type in field 1.
+  # not qualify. Package names are deliberately irrelevant.
   local listing="$1" release="$2"
   awk -v release="$release" '
     $1 ~ /^-/ {
@@ -1768,10 +1833,8 @@ deb_listing_has_regular_boot_kernel() {
 }
 
 deb_listing_has_runtime_module_object() {
-  # A headers package commonly contains:
-  #   /lib/modules/<release>/build -> /usr/src/linux-headers-<release>
-  # That symlink is not a runtime module payload. Require at least one regular
-  # kernel object, including the compressed forms used by Debian-family images.
+  # Header packages may carry /lib/modules/<release>/build symlinks. Require a
+  # regular kernel object, including Debian-family compressed module formats.
   local listing="$1" release="$2"
   awk -v release="$release" '
     $1 ~ /^-/ {
@@ -1788,29 +1851,75 @@ deb_listing_has_runtime_module_object() {
   ' "$listing"
 }
 
+deb_listing_has_kernel_auxiliary_payload() {
+  # Accept release-bound support payloads independently of package taxonomy.
+  # This covers downstream DTB/config/System.map packages without assuming
+  # Debian, Ubuntu, Armbian, or private-fork binary package names.
+  local listing="$1" release="$2"
+  awk -v release="$release" '
+    $1 ~ /^-/ {
+      path=$NF
+      sub(/^\.\//, "", path)
+      if (path == "boot/config-" release ||
+          path == "boot/System.map-" release ||
+          index(path, "usr/lib/linux-image-" release "/") == 1 ||
+          index(path, "lib/linux-image-" release "/") == 1 ||
+          index(path, "boot/dtb-" release "/") == 1 ||
+          index(path, "boot/dtb/" release "/") == 1) {
+        found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$listing"
+}
+
+kernel_deb_listing_path() {
+  local deb="$1" key
+  key="$(printf '%s' "$deb" | sha256sum | awk '{print $1}')"
+  printf '%s/deb-listings/%s.contents.txt' "$TMP_ROOT" "$key"
+}
+
+kernel_deb_canonical_name() {
+  # Input filenames are not trusted as package identity. Construct a stable
+  # collision-resistant staging name from Debian control metadata.
+  local deb="$1" pkg version arch safe_version
+  pkg="$(package_field "$deb" Package)"
+  version="$(package_field "$deb" Version)"
+  arch="$(package_field "$deb" Architecture)"
+  [[ -n "$pkg" && -n "$version" && -n "$arch" ]] || \
+    die "Unable to construct canonical package name for $deb"
+  safe_version="$(printf '%s' "$version" | sed -E 's/:/%3A/g; s/[^A-Za-z0-9.+~_=%-]/_/g')"
+  printf '%s_%s_%s.deb' "$pkg" "$safe_version" "$arch"
+}
+
 select_kernel_release_from_candidates() {
   local -a releases=("$@")
   mapfile -t releases < <(printf '%s\n' "${releases[@]}" | sed '/^$/d' | sort -u)
 
-  if [[ -n "$EXPECTED_CUSTOM_KERNEL_RELEASE" ]]; then
+  if [[ -n "$EXPECTED_CUSTOM_KERNEL_RELEASE" && "$KERNEL_RELEASE_POLICY" != "auto" ]]; then
     local r found=0
     for r in "${releases[@]}"; do [[ "$r" == "$EXPECTED_CUSTOM_KERNEL_RELEASE" ]] && found=1; done
-    (( found == 1 )) || die "Expected kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' was not found. Detected: ${releases[*]:-none}"
-    printf '%s' "$EXPECTED_CUSTOM_KERNEL_RELEASE"
-    return
+    if (( found == 1 )); then
+      printf '%s' "$EXPECTED_CUSTOM_KERNEL_RELEASE"
+      return
+    fi
+    if [[ "$KERNEL_RELEASE_POLICY" == "require" ]]; then
+      die "Required kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' was not found in a regular /boot/vmlinuz-* payload. Detected: ${releases[*]:-none}"
+    fi
+    warn "Preferred kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' is absent; selecting from detected payload releases: ${releases[*]:-none}"
   fi
 
-  ((${#releases[@]} > 0)) || die "No custom linux-image release could be derived from Debian package metadata or complete archive listings."
+  ((${#releases[@]} > 0)) || die "No kernel release could be derived from a regular /boot/vmlinuz-<release> package payload."
   if ((${#releases[@]} == 1)); then
     printf '%s' "${releases[0]}"
     return
   fi
 
   if ! is_interactive; then
-    die "Multiple custom kernel releases detected: ${releases[*]}. Set EXPECTED_CUSTOM_KERNEL_RELEASE."
+    die "Multiple kernel releases detected from package payloads: ${releases[*]}. Set EXPECTED_CUSTOM_KERNEL_RELEASE or --kernel-release."
   fi
 
-  local options=() i=1 choice
+  local options=() i=1 choice r
   for r in "${releases[@]}"; do
     options+=("$i|Use kernel release $r|Select this exact uname -r value for target OCI and live ISO boot artifacts.")
     i=$((i+1))
@@ -1820,31 +1929,25 @@ select_kernel_release_from_candidates() {
 }
 
 classify_kernel_deb_for_target() {
-  # Print one stable class for reporting and target-install policy.
-  local deb="$1"
-  local pkg
+  # Classification is descriptive only. Runtime selection is based on payload
+  # and dependency closure, never on the Package field naming convention.
+  local deb="$1" pkg listing
   pkg="$(package_field "$deb" Package)"
+  listing="$(kernel_deb_listing_path "$deb")"
 
-  case "$pkg" in
-    linux-image-*|linux-modules-*|linux-modules-extra-*)
-      printf '%s\n' boot
-      ;;
-    linux-headers-*|linux-*-headers-*)
-      printf '%s\n' headers
-      ;;
-    linux-qcom-*-tools-*|linux-tools-*|linux-*-tools-*)
-      printf '%s\n' tools
-      ;;
-    linux-libc-dev|*-dev|*-dbgsym|*-dbg)
-      printf '%s\n' development
-      ;;
-    linux-buildinfo-*|*.buildinfo|*.changes)
-      printf '%s\n' metadata
-      ;;
-    *)
-      printf '%s\n' other
-      ;;
-  esac
+  if [[ -f "$listing" ]] && awk '$1 ~ /^-/ {p=$NF; sub(/^\.\//,"",p); if (p ~ /^boot\/vmlinuz-/) f=1} END{exit(f?0:1)}' "$listing"; then
+    printf '%s\n' kernel-image
+  elif [[ -f "$listing" ]] && awk '$1 ~ /^-/ {p=$NF; sub(/^\.\//,"",p); if (p ~ /^(usr\/)?lib\/modules\/[^/]+\/.*\.ko(\.(gz|xz|zst))?$/) f=1} END{exit(f?0:1)}' "$listing"; then
+    printf '%s\n' kernel-modules
+  else
+    case "$pkg" in
+      linux-headers-*|linux-*-headers-*) printf '%s\n' headers ;;
+      linux-qcom-*-tools-*|linux-tools-*|linux-*-tools-*) printf '%s\n' tools ;;
+      linux-libc-dev|*-dev|*-dbgsym|*-dbg) printf '%s\n' development ;;
+      linux-source-*|linux-buildinfo-*|*.buildinfo|*.changes) printf '%s\n' metadata ;;
+      *) printf '%s\n' support ;;
+    esac
+  fi
 }
 
 array_contains_exact() {
@@ -1857,45 +1960,503 @@ array_contains_exact() {
   return 1
 }
 
+kernel_deb_selection_role() {
+  local deb="$1"
+  [[ -s "$KERNEL_PACKAGE_CLOSURE_JSON" ]] || { printf 'reference-only'; return 0; }
+  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .role' \
+    "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
+}
+
+kernel_deb_selection_reason() {
+  local deb="$1"
+  [[ -s "$KERNEL_PACKAGE_CLOSURE_JSON" ]] || { printf 'not selected'; return 0; }
+  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .reason' \
+    "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
+}
+
 write_kernel_package_selection_manifest() {
   local manifest="$TMP_ROOT/kernel-package-selection.tsv"
-  local deb pkg version arch class target live reason
+  local deb pkg version arch class target live role reason archive_name
 
   {
-    printf 'package\tversion\tarchitecture\tclass\ttarget_install\tlive_boot\tarchive_path\tsource_deb\treason\n'
+    printf 'package\tversion\tarchitecture\tclass\tclosure_role\ttarget_install\tlive_extract\tarchive_path\tsource_deb\treason\n'
     for deb in "${KERNEL_DEBS[@]}"; do
       pkg="$(package_field "$deb" Package)"
       version="$(package_field "$deb" Version)"
       arch="$(package_field "$deb" Architecture)"
       class="$(classify_kernel_deb_for_target "$deb")"
+      role="$(kernel_deb_selection_role "$deb")"
+      reason="$(kernel_deb_selection_reason "$deb")"
+      archive_name="$(kernel_deb_canonical_name "$deb")"
       target=no
       live=no
-      reason="reference-only"
+      array_contains_exact "$deb" "${TARGET_KERNEL_DEBS[@]}" && target=yes
+      array_contains_exact "$deb" "${LIVE_KERNEL_DEBS[@]}" && live=yes
+      [[ -n "$role" ]] || role=reference-only
+      [[ -n "$reason" ]] || reason="not selected for $KERNEL_RELEASE"
 
-      if array_contains_exact "$deb" "${TARGET_KERNEL_DEBS[@]}"; then
-        target=yes
-        reason="boot-critical target package"
-      elif [[ "$class" == tools ]]; then
-        reason="optional tools excluded; may require unavailable linux-tools-common"
-      elif [[ "$class" == headers ]]; then
-        reason="headers excluded from immutable runtime image"
-      elif [[ "$class" == development ]]; then
-        reason="development package excluded from immutable runtime image"
-      elif [[ "$class" == metadata ]]; then
-        reason="build metadata excluded from runtime installation"
-      else
-        reason="not selected as boot-critical for $KERNEL_RELEASE"
-      fi
-
-      if array_contains_exact "$deb" "${LIVE_KERNEL_DEBS[@]}"; then
-        live=yes
-      fi
-
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$pkg" "$version" "$arch" "$class" "$target" "$live" \
-        "/root/custom-kernel-packages/$(basename "$deb")" "$deb" "$reason"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$pkg" "$version" "$arch" "$class" "$role" "$target" "$live" \
+        "/root/custom-kernel-packages/$archive_name" "$deb" "$reason"
     done
   } > "$manifest"
+}
+
+resolve_kernel_package_closure() {
+  local selector="$TMP_ROOT/select-kernel-package-closure.py"
+  cat > "$selector" <<'KERNEL_SELECTOR_PY'
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict, deque
+
+
+def die(message: str) -> None:
+    print(f"kernel package closure: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def field(path: str, name: str) -> str:
+    proc = subprocess.run(
+        ["dpkg-deb", "-f", path, name],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_listing(path: str):
+    proc = subprocess.run(
+        ["dpkg-deb", "-c", path],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        die(f"cannot list {path}: {proc.stderr.strip()}")
+    regular = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        mode, raw_path = parts[0], parts[5]
+        if " -> " in raw_path:
+            raw_path = raw_path.split(" -> ", 1)[0]
+        raw_path = raw_path.removeprefix("./")
+        if mode.startswith("-"):
+            regular.append(raw_path)
+    return sorted(set(regular))
+
+
+def canonical_name(pkg: str, version: str, arch: str) -> str:
+    safe = version.replace(":", "%3A")
+    safe = re.sub(r"[^A-Za-z0-9.+~_=%-]", "_", safe)
+    return f"{pkg}_{safe}_{arch}.deb"
+
+
+def parse_relations(value: str):
+    groups = []
+    if not value:
+        return groups
+    # Binary control relations cannot contain commas inside version clauses.
+    for group_text in value.split(","):
+        alternatives = []
+        for alt_text in group_text.split("|"):
+            text = re.sub(r"\[[^]]*\]", "", alt_text)
+            text = re.sub(r"<[^>]*>", "", text).strip()
+            match = re.match(
+                r"^([a-z0-9][a-z0-9+.-]*)(?::(?:any|native|[a-z0-9-]+))?"
+                r"(?:\s*\((<<|<=|=|>=|>>)\s*([^)]+)\))?",
+                text,
+            )
+            if match:
+                alternatives.append(
+                    {
+                        "name": match.group(1),
+                        "op": match.group(2) or "",
+                        "version": (match.group(3) or "").strip(),
+                    }
+                )
+        if alternatives:
+            groups.append(alternatives)
+    return groups
+
+
+def version_satisfies(actual: str, op: str, required: str) -> bool:
+    if not op:
+        return True
+    return subprocess.run(
+        ["dpkg", "--compare-versions", actual, op, required],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def classify(pkg: str, paths):
+    if any(re.fullmatch(r"boot/vmlinuz-.+", p) for p in paths):
+        return "kernel-image"
+    if any(re.fullmatch(r"(?:usr/)?lib/modules/[^/]+/.+\.ko(?:\.(?:gz|xz|zst))?", p) for p in paths):
+        return "kernel-modules"
+    if re.match(r"linux-(?:.*-)?headers-", pkg) or pkg.startswith("linux-headers-"):
+        return "headers"
+    if "tools" in pkg and pkg.startswith("linux-"):
+        return "tools"
+    if pkg.endswith(("-dbg", "-dbgsym", "-dev")) or pkg == "linux-libc-dev":
+        return "development"
+    if pkg.startswith(("linux-source-", "linux-buildinfo-")):
+        return "metadata"
+    return "support"
+
+
+if len(sys.argv) < 5 or sys.argv[4] != "--":
+    die("internal invocation error")
+output, release, override = sys.argv[1:4]
+paths = [os.path.realpath(p) for p in sys.argv[5:]]
+if not paths:
+    die("no package paths supplied")
+
+facts = []
+for path in paths:
+    pkg = field(path, "Package")
+    version = field(path, "Version")
+    arch = field(path, "Architecture")
+    if not pkg or not version or not arch:
+        die(f"missing Package/Version/Architecture metadata: {path}")
+    regular = parse_listing(path)
+    vmlinuz_releases = sorted(
+        p[len("boot/vmlinuz-") :]
+        for p in regular
+        if p.startswith("boot/vmlinuz-") and len(p) > len("boot/vmlinuz-")
+    )
+    vmlinux_releases = sorted(
+        p[len("boot/vmlinux-") :]
+        for p in regular
+        if p.startswith("boot/vmlinux-") and len(p) > len("boot/vmlinux-")
+    )
+    module_paths = sorted(
+        p for p in regular
+        if re.fullmatch(
+            rf"(?:usr/)?lib/modules/{re.escape(release)}/.+\.ko(?:\.(?:gz|xz|zst))?",
+            p,
+        )
+    )
+    auxiliary_paths = sorted(
+        p for p in regular
+        if p in {f"boot/config-{release}", f"boot/System.map-{release}"}
+        or p.startswith(f"usr/lib/linux-image-{release}/")
+        or p.startswith(f"lib/linux-image-{release}/")
+        or p.startswith(f"boot/dtb-{release}/")
+        or p.startswith(f"boot/dtb/{release}/")
+    )
+    facts.append(
+        {
+            "path": path,
+            "package": pkg,
+            "version": version,
+            "architecture": arch,
+            "sha256": sha256(path),
+            "canonical_name": canonical_name(pkg, version, arch),
+            "depends": field(path, "Depends"),
+            "pre_depends": field(path, "Pre-Depends"),
+            "provides": field(path, "Provides"),
+            "regular_paths": regular,
+            "vmlinuz_releases": vmlinuz_releases,
+            "vmlinux_releases": vmlinux_releases,
+            "module_paths": module_paths,
+            "auxiliary_paths": auxiliary_paths,
+            "class": classify(pkg, regular),
+        }
+    )
+
+by_path = {f["path"]: f for f in facts}
+image_candidates = [f for f in facts if release in f["vmlinuz_releases"]]
+if override:
+    override = os.path.realpath(override)
+    if override not in by_path:
+        die(f"--kernel-image-deb is not in the supplied package set: {override}")
+    if release not in by_path[override]["vmlinuz_releases"]:
+        die(f"selected image package does not own /boot/vmlinuz-{release}: {override}")
+    image = by_path[override]
+else:
+    if len(image_candidates) != 1:
+        details = "; ".join(
+            f"{f['package']}={f['version']} ({f['path']})" for f in image_candidates
+        ) or "none"
+        die(
+            f"expected exactly one owner of /boot/vmlinuz-{release}; found "
+            f"{len(image_candidates)}: {details}. Use --kernel-image-deb for an intentional choice."
+        )
+    image = image_candidates[0]
+
+if image["architecture"] != "arm64":
+    die(
+        f"package owning /boot/vmlinuz-{release} must be Architecture: arm64; "
+        f"found {image['architecture']} in {image['package']}={image['version']}"
+    )
+
+selected = {}
+
+def add(fact, role: str, reason: str) -> bool:
+    current = selected.get(fact["path"])
+    if current:
+        roles = set(current["role"].split("+"))
+        roles.add(role)
+        current["role"] = "+".join(sorted(roles))
+        if reason not in current["reason"]:
+            current["reason"] += "; " + reason
+        return False
+    selected[fact["path"]] = {
+        "path": fact["path"],
+        "package": fact["package"],
+        "version": fact["version"],
+        "architecture": fact["architecture"],
+        "canonical_name": fact["canonical_name"],
+        "role": role,
+        "reason": reason,
+    }
+    return True
+
+add(image, "image", f"owns regular /boot/vmlinuz-{release}")
+# Once an explicit image owner is selected, other packages that also own the
+# same /boot/vmlinuz path are reference-only alternatives. Do not pull their
+# modules or auxiliary payload into the selected closure indirectly.
+module_facts = [
+    f for f in facts
+    if f["module_paths"]
+    and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])
+]
+aux_facts = [
+    f for f in facts
+    if f["auxiliary_paths"]
+    and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])
+]
+
+for fact in module_facts:
+    if fact["architecture"] != "arm64":
+        die(
+            f"package containing runtime modules for {release} must be "
+            f"Architecture: arm64; found {fact['architecture']} in "
+            f"{fact['package']}={fact['version']}"
+        )
+
+# Distinct modules and modules-extra packages are valid, but two packages must
+# never claim the same runtime module path for one uname -r value.
+module_owners = defaultdict(list)
+for fact in module_facts:
+    for module_path in fact["module_paths"]:
+        module_owners[module_path].append(fact)
+overlap = {p: owners for p, owners in module_owners.items() if len(owners) > 1}
+if overlap:
+    path, owners = sorted(overlap.items())[0]
+    die(
+        f"overlapping runtime module payload {path}: "
+        + ", ".join(f"{f['package']}={f['version']}" for f in owners)
+    )
+
+# Fail before APT or live-filesystem extraction if different packages claim the
+# same boot-critical regular path. Byte-identical duplicate package identities
+# were already collapsed by the shell preflight; a remaining collision is an
+# ambiguous or internally inconsistent supplied package set.
+critical_owners = defaultdict(list)
+critical_facts = {image["path"]: image}
+for fact in module_facts + aux_facts:
+    critical_facts[fact["path"]] = fact
+for fact in critical_facts.values():
+    critical_paths = set(fact["module_paths"]) | set(fact["auxiliary_paths"])
+    if fact["path"] == image["path"]:
+        critical_paths.add(f"boot/vmlinuz-{release}")
+    for critical_path in critical_paths:
+        critical_owners[critical_path].append(fact)
+critical_overlap = {
+    path: owners for path, owners in critical_owners.items() if len(owners) > 1
+}
+if critical_overlap:
+    path, owners = sorted(critical_overlap.items())[0]
+    die(
+        f"overlapping boot-critical payload {path}: "
+        + ", ".join(f"{f['package']}={f['version']}" for f in owners)
+    )
+
+for fact in module_facts:
+    add(fact, "modules", f"contains runtime module objects for {release}")
+for fact in aux_facts:
+    add(fact, "auxiliary", f"contains release-bound support payload for {release}")
+
+# Debian 6.19+ may place the boot image and modules in linux-binary and
+# linux-modules packages while a release-specific linux-image package carries
+# orchestration/triggers and depends directly on both. Detect that relationship
+# semantically so an arbitrarily named equivalent is also retained, while a
+# rolling meta-package that only depends on the release wrapper is not selected.
+module_package_names = {f["package"] for f in module_facts}
+orchestrators = []
+for fact in facts:
+    if fact["path"] in selected:
+        continue
+    relation_names = {
+        alt["name"]
+        for group in (
+            parse_relations(fact["pre_depends"]) + parse_relations(fact["depends"])
+        )
+        for alt in group
+    }
+    if image["package"] in relation_names and relation_names.intersection(module_package_names):
+        orchestrators.append(fact)
+if len(orchestrators) > 1:
+    die(
+        "multiple supplied release-orchestrator packages depend directly on the "
+        f"selected image/modules closure: "
+        + ", ".join(f"{f['package']}={f['version']}" for f in orchestrators)
+    )
+if orchestrators:
+    add(
+        orchestrators[0],
+        "orchestrator",
+        f"depends directly on selected image and module packages for {release}",
+    )
+
+by_name = defaultdict(list)
+providers = defaultdict(list)
+for fact in facts:
+    by_name[fact["package"]].append(fact)
+    for group in parse_relations(fact["provides"]):
+        for provided in group:
+            providers[provided["name"]].append((fact, provided))
+
+queue = deque(selected.keys())
+processed = set()
+while queue:
+    parent_path = queue.popleft()
+    if parent_path in processed:
+        continue
+    processed.add(parent_path)
+    parent = by_path[parent_path]
+    relations = parse_relations(parent["pre_depends"]) + parse_relations(parent["depends"])
+    for alternatives in relations:
+        chosen = None
+        chosen_relation = None
+        for alt in alternatives:
+            candidates = [
+                f for f in by_name.get(alt["name"], [])
+                if version_satisfies(f["version"], alt["op"], alt["version"])
+            ]
+            if not candidates:
+                provider_candidates = []
+                for provider_fact, provided in providers.get(alt["name"], []):
+                    provided_version = provided["version"]
+                    if not alt["op"]:
+                        provider_candidates.append(provider_fact)
+                    elif provided_version and version_satisfies(
+                        provided_version, alt["op"], alt["version"]
+                    ):
+                        provider_candidates.append(provider_fact)
+                candidates = provider_candidates
+            if candidates:
+                identities = {(f["package"], f["version"], f["architecture"]) for f in candidates}
+                if len(identities) != 1:
+                    die(
+                        f"ambiguous supplied dependency '{alt['name']}' required by "
+                        f"{parent['package']}: "
+                        + ", ".join(f"{f['package']}={f['version']} ({f['path']})" for f in candidates)
+                    )
+                chosen = sorted(candidates, key=lambda f: f["path"])[0]
+                chosen_relation = alt
+                break
+        if chosen is not None:
+            relation_text = chosen_relation["name"]
+            if chosen_relation["op"]:
+                relation_text += f" ({chosen_relation['op']} {chosen_relation['version']})"
+            if add(
+                chosen,
+                "dependency",
+                f"supplied local dependency of {parent['package']}: {relation_text}",
+            ):
+                queue.append(chosen["path"])
+
+selected_facts = [by_path[p] for p in selected]
+selected_names = defaultdict(list)
+for fact in selected_facts:
+    selected_names[fact["package"]].append(fact)
+for pkg, matches in selected_names.items():
+    versions = {(f["version"], f["architecture"]) for f in matches}
+    if len(versions) > 1:
+        die(
+            f"selected closure contains multiple versions/architectures of {pkg}: "
+            + ", ".join(f"{f['version']}/{f['architecture']}" for f in matches)
+        )
+
+if not any(f["module_paths"] for f in selected_facts):
+    die(f"no selected package contains runtime module objects for {release}")
+
+selected_output = sorted(selected.values(), key=lambda x: (x["package"], x["path"]))
+selected_paths = {x["path"] for x in selected_output}
+excluded_output = [
+    {
+        "path": f["path"],
+        "package": f["package"],
+        "version": f["version"],
+        "architecture": f["architecture"],
+        "canonical_name": f["canonical_name"],
+        "class": f["class"],
+    }
+    for f in facts
+    if f["path"] not in selected_paths
+]
+
+fact_summary = [
+    {
+        "path": f["path"],
+        "package": f["package"],
+        "version": f["version"],
+        "architecture": f["architecture"],
+        "sha256": f["sha256"],
+        "canonical_name": f["canonical_name"],
+        "class": f["class"],
+        "depends": f["depends"],
+        "pre_depends": f["pre_depends"],
+        "provides": f["provides"],
+        "vmlinuz_releases": f["vmlinuz_releases"],
+        "vmlinux_releases": f["vmlinux_releases"],
+        "runtime_module_count": len(f["module_paths"]),
+        "auxiliary_paths": f["auxiliary_paths"],
+    }
+    for f in facts
+]
+
+result = {
+    "schema_version": 1,
+    "release": release,
+    "image_deb": image["path"],
+    "image_package": image["package"],
+    "image_version": image["version"],
+    "selected": selected_output,
+    "excluded": sorted(excluded_output, key=lambda x: (x["package"], x["path"])),
+    "facts": fact_summary,
+}
+with open(output, "w", encoding="utf-8") as stream:
+    json.dump(result, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+KERNEL_SELECTOR_PY
+  chmod 0755 "$selector"
+
+  python3 "$selector" "$KERNEL_PACKAGE_CLOSURE_JSON" "$KERNEL_RELEASE" \
+    "$KERNEL_IMAGE_DEB_OVERRIDE" -- "${KERNEL_DEBS[@]}"
+  jq -e --arg release "$KERNEL_RELEASE" \
+    '.schema_version == 1 and .release == $release and (.selected | length) > 0' \
+    "$KERNEL_PACKAGE_CLOSURE_JSON" >/dev/null || \
+    die "Kernel package closure output failed structural validation."
 }
 
 discover_kernel_and_dtb_inputs() {
@@ -1904,47 +2465,58 @@ discover_kernel_and_dtb_inputs() {
   TARGET_EXCLUDED_KERNEL_DEBS=()
   LIVE_KERNEL_DEBS=()
   DTB_CANDIDATES=()
+  KERNEL_IMAGE_DEB=""
+  KERNEL_RELEASE_REQUESTED="$EXPECTED_CUSTOM_KERNEL_RELEASE"
+  case "$KERNEL_RELEASE_POLICY" in
+    prefer|require|auto) : ;;
+    *) die "Unsupported kernel release policy: $KERNEL_RELEASE_POLICY" ;;
+  esac
   mkdir -p "$TMP_ROOT/deb-listings"
 
-  mapfile -t KERNEL_DEBS < <(
+  local -a discovered_debs=()
+  mapfile -t discovered_debs < <(
     find "$KERNEL_DEB_DIR" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print 2>/dev/null |
       sort -u
   )
-  ((${#KERNEL_DEBS[@]} > 0)) || die "No .deb files found in $KERNEL_DEB_DIR or $ARTIFACT_DIR."
+  if [[ -n "$KERNEL_IMAGE_DEB_OVERRIDE" ]]; then
+    [[ -f "$KERNEL_IMAGE_DEB_OVERRIDE" ]] || die "Kernel image package override does not exist: $KERNEL_IMAGE_DEB_OVERRIDE"
+    discovered_debs+=("$KERNEL_IMAGE_DEB_OVERRIDE")
+  fi
+  mapfile -t discovered_debs < <(printf '%s\n' "${discovered_debs[@]}" | sed '/^$/d' | sort -u)
+  ((${#discovered_debs[@]} > 0)) || die "No .deb files found in $KERNEL_DEB_DIR or $ARTIFACT_DIR."
 
-  local -a release_candidates=()
-  local deb pkg version arch listing rel
-  local image_pkg_count=0 module_pkg_count=0
+  local -a release_candidates=() vmlinux_candidates=() normalized_debs=()
+  local deb pkg version arch listing rel identity digest prior_digest
+  declare -A identity_path=() identity_sha=()
   : > "$TMP_ROOT/debian-package-inventory.tsv"
 
-  for deb in "${KERNEL_DEBS[@]}"; do
+  for deb in "${discovered_debs[@]}"; do
+    deb="$(readlink -f -- "$deb")"
+    [[ "$deb" != *$'\n'* && "$deb" != *$'\r'* ]] || die "Kernel package path contains a newline: $deb"
     pkg="$(package_field "$deb" Package)"
     version="$(package_field "$deb" Version)"
     arch="$(package_field "$deb" Architecture)"
-    [[ -n "$pkg" ]] || die "Unable to read Debian package metadata: $deb"
+    [[ -n "$pkg" && -n "$version" && -n "$arch" ]] || die "Unable to read Debian package metadata: $deb"
     [[ "$arch" == "arm64" || "$arch" == "all" ]] || die "Package $pkg has unsupported architecture '$arch': $deb"
 
-    printf '%s\t%s\t%s\t%s\n' "$pkg" "$version" "$arch" "$deb" >> "$TMP_ROOT/debian-package-inventory.tsv"
-    listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
+    identity="$pkg"$'\037'"$version"$'\037'"$arch"
+    digest="$(sha256sum "$deb" | awk '{print $1}')"
+    if [[ -n "${identity_path[$identity]:-}" ]]; then
+      prior_digest="${identity_sha[$identity]}"
+      if [[ "$digest" == "$prior_digest" ]]; then
+        warn "Ignoring byte-identical duplicate package identity: $pkg=$version/$arch ($deb)"
+        continue
+      fi
+      die "Conflicting bytes for duplicate package identity $pkg=$version/$arch: ${identity_path[$identity]} and $deb"
+    fi
+    identity_path[$identity]="$deb"
+    identity_sha[$identity]="$digest"
+    normalized_debs+=("$deb")
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$version" "$arch" "$digest" "$deb" >> "$TMP_ROOT/debian-package-inventory.tsv"
+    listing="$(kernel_deb_listing_path "$deb")"
     write_deb_content_listing "$deb" "$listing"
 
-    case "$pkg" in
-      linux-image-arm64|linux-image-generic*|linux-image-virtual*)
-        ;;
-      linux-image-unsigned-*)
-        rel="${pkg#linux-image-unsigned-}"
-        release_candidates+=("$rel")
-        image_pkg_count=$((image_pkg_count+1))
-        ;;
-      linux-image-*)
-        rel="${pkg#linux-image-}"
-        release_candidates+=("$rel")
-        image_pkg_count=$((image_pkg_count+1))
-        ;;
-    esac
-
-    # Payload fallback for unusually named image packages. Only regular
-    # /boot/vmlinuz-* archive members qualify; symlinks and directories do not.
     while IFS= read -r rel; do
       [[ -n "$rel" ]] && release_candidates+=("$rel")
     done < <(
@@ -1959,95 +2531,53 @@ discover_kernel_and_dtb_inputs() {
         }
       ' "$listing"
     )
-  done
-
-  KERNEL_RELEASE="$(select_kernel_release_from_candidates "${release_candidates[@]}")"
-
-  local class selected_reason
-  for deb in "${KERNEL_DEBS[@]}"; do
-    pkg="$(package_field "$deb" Package)"
-    class="$(classify_kernel_deb_for_target "$deb")"
-    listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
-    selected_reason=""
-
-    case "$pkg" in
-      linux-image-$KERNEL_RELEASE|linux-image-unsigned-$KERNEL_RELEASE|linux-image-$KERNEL_RELEASE-*|linux-image-unsigned-$KERNEL_RELEASE-*)
-        LIVE_KERNEL_DEBS+=("$deb")
-        selected_reason="package name identifies selected kernel image"
-        ;;
-      linux-modules-$KERNEL_RELEASE|linux-modules-$KERNEL_RELEASE-*|linux-modules-extra-$KERNEL_RELEASE|linux-modules-extra-$KERNEL_RELEASE-*)
-        LIVE_KERNEL_DEBS+=("$deb")
-        module_pkg_count=$((module_pkg_count+1))
-        selected_reason="package name identifies selected runtime modules"
-        ;;
-      *)
-        # Never allow known non-runtime classes to reach the payload fallback.
-        # In particular, linux-headers packages can contain the conventional
-        # /lib/modules/<release>/build symlink and must remain excluded.
-        case "$class" in
-          headers|tools|development|metadata)
-            continue
-            ;;
-        esac
-
-        if deb_listing_has_regular_boot_kernel "$listing" "$KERNEL_RELEASE"; then
-          LIVE_KERNEL_DEBS+=("$deb")
-          selected_reason="regular kernel image payload fallback"
-        elif deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
-          LIVE_KERNEL_DEBS+=("$deb")
-          module_pkg_count=$((module_pkg_count+1))
-          selected_reason="regular runtime module object payload fallback"
-        fi
-        ;;
-    esac
-
-    if [[ -n "$selected_reason" ]]; then
-      info "Boot package selection: $pkg — $selected_reason"
-    fi
-  done
-  mapfile -t LIVE_KERNEL_DEBS < <(printf '%s\n' "${LIVE_KERNEL_DEBS[@]}" | sort -u)
-
-  # Fail closed if a known non-runtime class entered selection through any
-  # future rule change.
-  for deb in "${LIVE_KERNEL_DEBS[@]}"; do
-    class="$(classify_kernel_deb_for_target "$deb")"
-    pkg="$(package_field "$deb" Package)"
-    case "$class" in
-      headers|tools|development|metadata)
-        die "Internal package-selection guard rejected non-runtime package: $pkg ($class)"
-        ;;
-    esac
-  done
-
-  # Install the same boot-critical image/module closure into the target OCI.
-  # Optional headers, tools, development packages, and metadata remain archived
-  # under /root/custom-kernel-packages and do not enter APT dependency solving.
-  TARGET_KERNEL_DEBS=("${LIVE_KERNEL_DEBS[@]}")
-  local candidate
-  for candidate in "${KERNEL_DEBS[@]}"; do
-    if ! array_contains_exact "$candidate" "${TARGET_KERNEL_DEBS[@]}"; then
-      TARGET_EXCLUDED_KERNEL_DEBS+=("$candidate")
-    fi
-  done
-  mapfile -t TARGET_KERNEL_DEBS < <(printf '%s\n' "${TARGET_KERNEL_DEBS[@]}" | sort -u)
-  if ((${#TARGET_EXCLUDED_KERNEL_DEBS[@]} > 0)); then
-    mapfile -t TARGET_EXCLUDED_KERNEL_DEBS < <(
-      printf '%s\n' "${TARGET_EXCLUDED_KERNEL_DEBS[@]}" | sort -u
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] && vmlinux_candidates+=("$rel")
+    done < <(
+      awk '
+        $1 ~ /^-/ {
+          path=$NF
+          sub(/^\.\//, "", path)
+          if (path ~ /^boot\/vmlinux-/) {
+            sub(/^boot\/vmlinux-/, "", path)
+            print path
+          }
+        }
+      ' "$listing"
     )
+  done
+  KERNEL_DEBS=("${normalized_debs[@]}")
+
+  if ((${#release_candidates[@]} == 0 && ${#vmlinux_candidates[@]} > 0)); then
+    mapfile -t vmlinux_candidates < <(printf '%s\n' "${vmlinux_candidates[@]}" | sort -u)
+    die "Only /boot/vmlinux-* payloads were found (${vmlinux_candidates[*]}). This GRUB/ABRoot harness requires the Debian-family /boot/vmlinuz-<release> boot artifact."
   fi
 
-  (( image_pkg_count > 0 )) || warn "No package named linux-image-$KERNEL_RELEASE was found; the release came from archive contents."
-  ((${#LIVE_KERNEL_DEBS[@]} > 0)) || die "No boot-critical image/module packages selected for $KERNEL_RELEASE."
-  (( module_pkg_count > 0 )) || {
-    local has_modules=0
-    for deb in "${LIVE_KERNEL_DEBS[@]}"; do
-      listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
-      if deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
-        has_modules=1
-      fi
-    done
-    (( has_modules == 1 )) ||       die "No selected package contains a regular runtime module object for $KERNEL_RELEASE."
-  }
+  KERNEL_RELEASE="$(select_kernel_release_from_candidates "${release_candidates[@]}")"
+  resolve_kernel_package_closure
+  KERNEL_IMAGE_DEB="$(jq -r '.image_deb' "$KERNEL_PACKAGE_CLOSURE_JSON")"
+  mapfile -t TARGET_KERNEL_DEBS < <(jq -r '.selected[].path' "$KERNEL_PACKAGE_CLOSURE_JSON")
+  mapfile -t LIVE_KERNEL_DEBS < <(
+    jq -r '.selected[] |
+      select(.role | test("(^|\\+)(image|modules|auxiliary)(\\+|$)")) |
+      .path' "$KERNEL_PACKAGE_CLOSURE_JSON"
+  )
+  mapfile -t TARGET_EXCLUDED_KERNEL_DEBS < <(jq -r '.excluded[].path' "$KERNEL_PACKAGE_CLOSURE_JSON")
+
+  [[ -f "$KERNEL_IMAGE_DEB" ]] || die "Resolved kernel image package is unavailable: $KERNEL_IMAGE_DEB"
+  ((${#TARGET_KERNEL_DEBS[@]} > 0)) || die "Kernel package closure selected no target packages."
+  deb_listing_has_regular_boot_kernel "$(kernel_deb_listing_path "$KERNEL_IMAGE_DEB")" "$KERNEL_RELEASE" || \
+    die "Resolved image package no longer contains /boot/vmlinuz-$KERNEL_RELEASE"
+
+  local has_modules=0
+  for deb in "${LIVE_KERNEL_DEBS[@]}"; do
+    listing="$(kernel_deb_listing_path "$deb")"
+    if deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
+      has_modules=1
+      break
+    fi
+  done
+  (( has_modules == 1 )) || die "No selected package contains a regular runtime module object for $KERNEL_RELEASE."
 
   mapfile -t DTB_CANDIDATES < <(
     find "$ARTIFACT_DIR/dtb" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.dtb' -print 2>/dev/null |
@@ -2076,21 +2606,24 @@ discover_kernel_and_dtb_inputs() {
   [[ "$DTB_NAME" != */* && -n "$DTB_NAME" ]] || die "Installed DTB name must be a basename: $DTB_NAME"
   write_kernel_package_selection_manifest
 
-  ok "Custom kernel release: $KERNEL_RELEASE"
-  ok "Supplied kernel-related packages: ${#KERNEL_DEBS[@]}"
-  ok "Boot-critical target OCI packages selected for installation: ${#TARGET_KERNEL_DEBS[@]}"
-  ok "Reference-only target OCI packages excluded from APT: ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}"
-  ok "Boot-critical live ISO packages: ${#LIVE_KERNEL_DEBS[@]}"
-  ok "All supplied packages will be archived in target /root/custom-kernel-packages."
+  ok "Kernel release selected from payload: $KERNEL_RELEASE"
+  ok "Kernel image owner: $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)"
+  ok "Kernel image source: $KERNEL_IMAGE_DEB"
+  ok "Supplied unique kernel-related packages: ${#KERNEL_DEBS[@]}"
+  ok "Resolved target/live package closure: ${#TARGET_KERNEL_DEBS[@]}"
+  ok "Reference-only packages excluded from installation: ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}"
+  ok "All supplied packages will be archived in target /root/custom-kernel-packages using canonical metadata-derived names."
   ok "Selected DTB: $DTB_FILE"
 
-  local excluded class pkg
+  local excluded class role
   for excluded in "${TARGET_EXCLUDED_KERNEL_DEBS[@]}"; do
     pkg="$(package_field "$excluded" Package)"
     class="$(classify_kernel_deb_for_target "$excluded")"
-    warn "Target APT exclusion: $pkg ($class); archived for reference only."
+    role="$(kernel_deb_selection_role "$excluded")"
+    warn "Target APT exclusion: $pkg ($class/${role:-reference-only}); archived for reference only."
   done
 }
+
 
 # ------------------------- repository handling --------------------------
 
@@ -3103,12 +3636,16 @@ Resolved v$SCRIPT_VERSION plan
 Work directory:             $WORKDIR
 Profile:                    $PROFILE
 Artifact directory:         $ARTIFACT_DIR
-Kernel release:             $KERNEL_RELEASE
-Supplied local .debs:       ${#KERNEL_DEBS[@]}
-Target OCI install .debs:   ${#TARGET_KERNEL_DEBS[@]}
-Target OCI excluded .debs:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
+Kernel release requested:   ${KERNEL_RELEASE_REQUESTED:-none}
+Kernel release policy:      $KERNEL_RELEASE_POLICY
+Kernel release selected:    $KERNEL_RELEASE
+Kernel image package:       $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)
+Kernel image source:        $KERNEL_IMAGE_DEB
+Supplied unique .debs:      ${#KERNEL_DEBS[@]}
+Target OCI closure .debs:   ${#TARGET_KERNEL_DEBS[@]}
+Reference-only .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
 Target OCI archived .debs:  ${#KERNEL_DEBS[@]}
-Live boot .debs:            ${#LIVE_KERNEL_DEBS[@]}
+Live extraction closure:    ${#LIVE_KERNEL_DEBS[@]}
 DTB:                        $DTB_FILE
 Firmware mode:              $FIRMWARE_MODE
 Firmware source:            ${FIRMWARE_SOURCE:-to be staged during execution}
@@ -3152,8 +3689,11 @@ Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 Safety invariants:
   - No host initramfs implementation is installed or replaced.
   - dpkg-deb archive listings complete before any grep validation.
-  - Only named boot packages or packages with regular kernel/module objects
-    enter target or live package transactions.
+  - Kernel selection is independent of binary package names and filenames.
+  - A regular /boot/vmlinuz-<release> owns boot identity; regular runtime .ko
+    payloads and supplied local Depends/Pre-Depends form the install closure.
+  - Duplicate image ownership, overlapping boot-critical payloads, mixed
+    architectures, and conflicting package identities fail closed.
   - Package registration is attested during the unlocked build stage; the final
     immutable target is not expected to retain apt, dpkg, or dpkg-query.
   - /lib/modules/<release>/build and source symlinks never qualify as modules.
@@ -3174,6 +3714,10 @@ Safety invariants:
 Exact non-interactive execute command:
   sudo env WORKDIR=$(printf '%q' "$WORKDIR") PROFILE=$(printf '%q' "$PROFILE") \
     ARTIFACT_DIR=$(printf '%q' "$ARTIFACT_DIR") ROOT_SOURCE=$(printf '%q' "$ROOT_SOURCE") \
+    KERNEL_DEB_DIR=$(printf '%q' "$KERNEL_DEB_DIR") \
+    EXPECTED_CUSTOM_KERNEL_RELEASE=$(printf '%q' "$KERNEL_RELEASE") \
+    KERNEL_RELEASE_POLICY=require \
+    KERNEL_IMAGE_DEB_OVERRIDE=$(printf '%q' "$KERNEL_IMAGE_DEB") \
     FIRMWARE_MODE=$(printf '%q' "$FIRMWARE_MODE") FIRMWARE_PRESTAGED=$(printf '%q' "$FIRMWARE_PRESTAGED") \
     FIRMWARE_QCOM_SOC_POLICY=$(printf '%q' "$FIRMWARE_QCOM_SOC_POLICY") \
     FIRMWARE_QCOM_SOC_DEB=$(printf '%q' "$FIRMWARE_QCOM_SOC_DEB") \
@@ -3681,42 +4225,24 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants" \
     "$CUSTOM_PROJECT/modules"
 
-  local deb class pkg listing
+  local deb class pkg role staged_name staged_count
   for deb in "${TARGET_KERNEL_DEBS[@]}"; do
     class="$(classify_kernel_deb_for_target "$deb")"
     pkg="$(package_field "$deb" Package)"
-    listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
+    role="$(kernel_deb_selection_role "$deb")"
+    [[ -n "$role" && "$role" != "reference-only" ]] || \
+      die "Kernel closure selected a package without a resolved role: $pkg ($deb)"
 
-    case "$class" in
-      headers|tools|development|metadata)
-        die "Refusing to stage non-runtime target package: $pkg ($class)"
-        ;;
-    esac
-
-    case "$class" in
-      boot)
-        ;;
-      other)
-        if ! deb_listing_has_regular_boot_kernel "$listing" "$KERNEL_RELEASE" &&
-           ! deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
-          die "Unrecognized selected package lacks a regular boot payload: $pkg"
-        fi
-        ;;
-    esac
-
-    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/deb-pkgs/"
+    staged_name="$(kernel_deb_canonical_name "$deb")"
+    [[ ! -e "$CUSTOM_PROJECT/includes.container/deb-pkgs/$staged_name" ]] || \
+      die "Canonical staged package name collision: $staged_name"
+    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/deb-pkgs/$staged_name"
+    info "Staged kernel closure package: $pkg ($class/$role) -> $staged_name"
   done
 
-  # Assert the staged transaction itself contains no known non-runtime package.
-  for deb in "$CUSTOM_PROJECT/includes.container/deb-pkgs/"*.deb; do
-    class="$(classify_kernel_deb_for_target "$deb")"
-    pkg="$(package_field "$deb" Package)"
-    case "$class" in
-      headers|tools|development|metadata)
-        die "Staged target transaction contains forbidden package: $pkg ($class)"
-        ;;
-    esac
-  done
+  staged_count="$(find "$CUSTOM_PROJECT/includes.container/deb-pkgs" -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d '[:space:]')"
+  [[ "$staged_count" == "${#TARGET_KERNEL_DEBS[@]}" ]] || \
+    die "Staged kernel closure count mismatch: expected=${#TARGET_KERNEL_DEBS[@]} actual=$staged_count"
 
   if [[ -n "$FIRMWARE_SOURCE" ]]; then
     rsync -aHAX "$FIRMWARE_SOURCE/" "$CUSTOM_PROJECT/includes.container/usr/lib/firmware/"
@@ -3743,7 +4269,10 @@ prepare_custom_image_project() {
   # into the immutable runtime package transaction.
   mkdir -p "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages"
   for deb in "${KERNEL_DEBS[@]}"; do
-    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/"
+    staged_name="$(kernel_deb_canonical_name "$deb")"
+    [[ ! -e "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/$staged_name" ]] || \
+      die "Canonical archived package name collision: $staged_name"
+    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/$staged_name"
   done
   cp -a "$TMP_ROOT/kernel-package-selection.tsv" \
     "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/PACKAGE-SELECTION.tsv"
@@ -3751,9 +4280,11 @@ prepare_custom_image_project() {
 These Debian packages are retained as build and diagnostic artifacts.
 
 Only packages marked target_install=yes in PACKAGE-SELECTION.tsv were installed
-into the immutable target image. Headers, development packages, build metadata,
-and optional tools remain archived here so they cannot introduce unavailable
-runtime dependencies such as linux-tools-common.
+into the immutable target image. Selection is based on conventional kernel
+payloads plus the deterministic local Depends/Pre-Depends closure, not on a
+linux-image, linux-modules, Ubuntu, Armbian, or private-fork package name.
+Reference-only headers, tools, development packages, metadata, and unrelated
+packages remain archived here.
 PACKAGE_ARCHIVE_README
 
   printf '%s' "$CUSTOM_IMAGE_BASE" > "$CUSTOM_PROJECT/includes.container/image-info/base-image-name"
@@ -3785,10 +4316,11 @@ command -v dpkg-query >/dev/null 2>&1 || {
 
 apt-get update
 
-# Only the boot-critical image/module closure is staged here. Optional headers,
-# tools, development packages, and metadata are archived under
-# /root/custom-kernel-packages and never enter this APT transaction.
-printf 'Installing selected boot-critical local packages:\n'
+# The target transaction contains the payload-selected kernel image/modules,
+# release-bound auxiliary packages, a release-specific orchestrator when one is
+# supplied, and local Depends/Pre-Depends needed by that closure. Unrelated
+# packages remain archived under /root/custom-kernel-packages.
+printf 'Installing selected local kernel package closure:\n'
 printf '  %s\n' "${packages[@]}"
 apt-get install -y "${packages[@]}"
 
@@ -4260,14 +4792,19 @@ Kernel packages discovered from:
   Compatibility fallback: $ARTIFACT_DIR/*.deb
 
 Package handling:
-  Supplied:          ${#KERNEL_DEBS[@]}
-  Target installed: ${#TARGET_KERNEL_DEBS[@]} boot-critical image/module packages
-  Target excluded:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]} optional/reference packages
+  Supplied unique:  ${#KERNEL_DEBS[@]}
+  Target installed: ${#TARGET_KERNEL_DEBS[@]} payload/dependency closure packages
+  Live extracted:   ${#LIVE_KERNEL_DEBS[@]} image/module/auxiliary packages
+  Target excluded:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]} reference-only packages
   Target archived:  all supplied packages under /root/custom-kernel-packages
   Selection record: /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
+  Closure record:   kernel-package-closure.json in release evidence
 
 Selected release:
   $KERNEL_RELEASE
+Selected image package:
+  $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)
+  $KERNEL_IMAGE_DEB
 
 Selected DTB:
   $DTB_FILE
@@ -7708,6 +8245,7 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/kernel-package-selection.tsv" "$RELEASE_DIR/"
+  cp -a "$KERNEL_PACKAGE_CLOSURE_JSON" "$RELEASE_DIR/kernel-package-closure.json"
   cp -a "$PROFILE_RESOLVED_JSON" "$RELEASE_DIR/profile.resolved.json"
   cp -a "$PROFILE_VALIDATION_REPORT" "$RELEASE_DIR/profile-validation.tsv"
   cp -a "$LIVE_KERNEL_CMDLINE_JSON" "$RELEASE_DIR/live-kernel-command-line.json"
@@ -7749,6 +8287,9 @@ Base image:               $CUSTOM_IMAGE_BASE
 Profile:                  $PROFILE
 Profile display name:     $PROFILE_DISPLAY_NAME
 Kernel:                   $KERNEL_RELEASE
+Kernel image package:     $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)
+Kernel image source:      $KERNEL_IMAGE_DEB
+Kernel closure record:    kernel-package-closure.json
 DTB:                      $DTB_NAME
 Kernel command additions: ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
 Qualcomm FW package:      ${FIRMWARE_QCOM_SOC_DEB:-none}
@@ -7785,13 +8326,16 @@ Profile source:              $PROFILE_FILE_RESOLVED
 Profile resolved record:     profile.resolved.json
 Kernel package directory:    $KERNEL_DEB_DIR
 Kernel release:              $KERNEL_RELEASE
-Supplied kernel .debs:       ${#KERNEL_DEBS[@]}
-Target-installed .debs:      ${#TARGET_KERNEL_DEBS[@]}
+Kernel image package:        $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)
+Kernel image source:         $KERNEL_IMAGE_DEB
+Kernel closure record:       kernel-package-closure.json
+Supplied unique .debs:       ${#KERNEL_DEBS[@]}
+Target-installed closure:    ${#TARGET_KERNEL_DEBS[@]}
 Target-excluded .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
 Target archive location:     /root/custom-kernel-packages
 Installed package receipt:   /usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv
 Runtime dpkg-query required: no
-Live boot .debs:             ${#LIVE_KERNEL_DEBS[@]}
+Live extraction closure:     ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
 GRUB binding evidence:       grub-patch-manifest.tsv and final-grub.cfg
 Firmware source:             ${FIRMWARE_SOURCE:-none}
@@ -7891,7 +8435,7 @@ main() {
   resolve_qcom_soc_firmware_package
   discover_kernel_and_dtb_inputs
   # Refresh resolved profile evidence with the deterministic discovered values.
-  EXPECTED_CUSTOM_KERNEL_RELEASE="$KERNEL_RELEASE"
+  KERNEL_IMAGE_DEB_OVERRIDE="$KERNEL_IMAGE_DEB"
   DTB_FILE_OVERRIDE="$DTB_FILE"
   DTB_INSTALLED_NAME_OVERRIDE="$DTB_NAME"
   write_resolved_profile
