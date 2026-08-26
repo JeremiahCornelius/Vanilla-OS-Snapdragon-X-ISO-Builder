@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.3.0
+# Version: 2.3.1
 #
 # Purpose:
 #   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
 
 # -----------------------------
@@ -182,6 +182,38 @@ USAGE
 ui_line() { printf '%s\n' "$*" >&2; }
 ui_blank() { printf '\n' >&2; }
 
+
+trim_outer_whitespace() {
+  # Remove accidental leading/trailing whitespace and CR characters from
+  # interactive answers. This is intentionally conservative: embedded spaces
+  # are preserved so paths such as "My Driver Archive.zip" remain valid.
+  local value="$1"
+  value="${value//$'\r'/}"
+  # shellcheck disable=SC2001
+  value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "$value"
+}
+
+normalize_user_path() {
+  # Normalize user-entered paths without changing valid embedded spaces.
+  # Handles common paste mistakes:
+  #   - trailing spaces after a filename
+  #   - surrounding single or double quotes
+  #   - leading ~/ expansion
+  local value="$1"
+  value="$(trim_outer_whitespace "$value")"
+
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+
+  value="$(trim_outer_whitespace "$value")"
+  value="${value/#\~/$HOME}"
+  printf '%s' "$value"
+}
+
 open_interactive_shell() {
   local dir="${1:-$PWD}"
   ui_blank
@@ -196,6 +228,7 @@ prompt_value() {
   ui_line "$label"
   ui_line "Default: $default"
   read -r -p "$label [$default]: " value || true
+  value="$(trim_outer_whitespace "$value")"
   if [[ -z "$value" ]]; then
     value="$default"
   fi
@@ -234,7 +267,7 @@ prompt_existing_dir_or_create() {
   local label="$1" default="$2" path="" choice=""
   while true; do
     path="$(prompt_value "$label" "$default")"
-    path="${path/#\~/$HOME}"
+    path="$(normalize_user_path "$path")"
     if [[ -d "$path" ]]; then
       printf '%s' "$path"
       return 0
@@ -250,6 +283,12 @@ $label
 
 The selected directory does not exist:
   $path
+
+Shell-escaped interpretation:
+  $(printf '%q' "$path")
+
+Path length:
+  ${#path} characters
 
 Select an action:
 
@@ -304,7 +343,7 @@ prompt_file_optional() {
   local label="$1" default="$2" path="" choice=""
   while true; do
     path="$(prompt_value "$label" "$default")"
-    path="${path/#\~/$HOME}"
+    path="$(normalize_user_path "$path")"
     if [[ -z "$path" ]]; then
       printf ''
       return 0
@@ -324,6 +363,12 @@ $label
 
 The selected file does not exist:
   $path
+
+Shell-escaped interpretation:
+  $(printf '%q' "$path")
+
+Path length:
+  ${#path} characters
 
 Select an action:
 
