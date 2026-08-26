@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.2"
+SCRIPT_VERSION="2.4.3"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -781,9 +781,10 @@ stage_qcom_firmware() {
 set -Eeuo pipefail
 
 log() { printf 'qcom-container: %s\n' "$*"; }
+fail() { printf 'qcom-container: ERROR: %s\n' "$*" >&2; exit 1; }
 
 log "Disposable extraction environment started."
-log "This container may write to its own /lib/firmware, not to the build host."
+log "This container may write only inside the container and /out, never to the build host."
 
 # Fail early with a clear diagnostic instead of allowing apt-get to continue
 # with stale/empty indexes and then produce misleading package errors.
@@ -795,47 +796,99 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends \
-  ca-certificates curl unzip p7zip-full zstd rsync bash coreutils findutils file
+# qcom-firmware-updater currently needs unzip, msiextract from msitools,
+# sha256sum/coreutils, and either 7zz/7z. Debian package naming for 7z has
+# changed across releases, so try 7zip first and fall back to p7zip-full.
+if ! apt-get install -y --no-install-recommends \
+  ca-certificates curl unzip msitools 7zip zstd rsync bash coreutils findutils file grep sed gawk; then
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl unzip msitools p7zip-full zstd rsync bash coreutils findutils file grep sed gawk
+fi
 
 # qcom-firmware-updater is designed for a live target system and uses sudo
-# only for installation steps. Inside this disposable container we are already
-# root and /lib/firmware belongs to the container, not the build host. Provide
-# a harmless sudo shim so the updater can copy into the container firmware tree
-# without requiring the sudo package or touching the host.
+# only for installation steps. This wrapper avoids its installation path and
+# captures the extracted firmware staging directory directly. Keep a harmless
+# sudo shim anyway so any incidental sudo calls cannot affect the build host.
 printf '#!/usr/bin/env bash\nexec "$@"\n' >/usr/local/bin/sudo
 chmod +x /usr/local/bin/sudo
 
-mkdir -p /out/lib/firmware /work
+mkdir -p /out/lib/firmware /out/logs /work
 cp -a /updater /work/qcom-firmware-updater
 cd /work/qcom-firmware-updater
 
-log "Running qcom-firmware-updater in disposable container."
+log "Preparing qcom-firmware-updater capture wrapper."
 log "Device path: ${QCOM_DEVICE_PATH:-unset}"
 
+# The upstream script's install function may be disabled/commented in current
+# revisions. Therefore do not rely on /lib/firmware side effects. Instead,
+# load the script's functions but suppress the trailing 'main "$@"', then run
+# parse/check/extract/find ourselves and copy fw_staging into /out.
+orig="$(cat ./qcom-firmware-updater.sh)"
+orig="${orig%$'\n'}"
+case "$orig" in
+  *'main "$@"') orig="${orig%main \"\$@\"}" ;;
+  *) log "Could not strip trailing main invocation using suffix match; falling back to direct execution." ;;
+esac
+printf '%s\n' "$orig" > /work/qcom-functions.sh
+cat >> /work/qcom-functions.sh <<'CAPTURE_EOF'
+
+capture_main() {
+  parse_args "$@"
+  check_deps
+
+  if [[ -z "$DEVICE_PATH" ]]; then
+    detect_device
+  else
+    info "Using manual device path: $DEVICE_PATH"
+  fi
+
+  FIRMWARE_DIR="$FIRMWARE_BASE/$DEVICE_PATH"
+  TMPDIR=$(mktemp -d /tmp/qcom-fw-capture.XXXXXX)
+
+  local input_path=""
+  if [[ -n "$INPUT_URL" ]]; then
+    input_path="$TMPDIR/download.zip"
+    download_driver "$input_path"
+  else
+    [[ -f "$INPUT_FILE" ]] || die "File not found: $INPUT_FILE"
+    input_path="$INPUT_FILE"
+  fi
+
+  local extract_root
+  extract_root=$(extract_exe "$input_path")
+
+  local fw_staging
+  fw_staging=$(find_firmware "$extract_root")
+
+  local dest="/out/lib/firmware/qcom/$DEVICE_PATH"
+  mkdir -p "$dest"
+  cp -a "$fw_staging"/. "$dest"/
+  chmod -R a+rX /out/lib/firmware || true
+
+  printf '%s\n' "$fw_staging" > /out/logs/fw_staging_path.txt
+  find "$dest" -type f | sort > /out/logs/captured-firmware-files.txt
+  info "Captured $(find "$dest" -type f | wc -l) firmware file(s) into $dest"
+}
+
+capture_main "$@"
+CAPTURE_EOF
+chmod +x /work/qcom-functions.sh
+
 if [[ -n "${QCOM_URL:-}" ]]; then
-  # Current qcom-firmware-updater syntax accepts the target path via
-  # --device-path, not as a second positional argument. Passing the device path
-  # positionally causes: "ERROR: Only one input file allowed".
-  bash ./qcom-firmware-updater.sh --device-path "$QCOM_DEVICE_PATH" --url "$QCOM_URL" || true
+  log "Using Qualcomm driver URL."
+  bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" --url "$QCOM_URL" 2>&1 | tee /out/logs/qcom-capture.log
 elif compgen -G "/input/*" >/dev/null; then
   local_file="$(find /input -maxdepth 1 -type f | sort | head -n1)"
   log "Using local driver archive: $local_file"
-  bash ./qcom-firmware-updater.sh --device-path "$QCOM_DEVICE_PATH" "$local_file" || true
+  bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" "$local_file" 2>&1 | tee /out/logs/qcom-capture.log
 else
-  log "No local archive or URL was supplied to the container."
+  fail "No local archive or URL was supplied to the container."
 fi
 
-# Capture any firmware installed inside the disposable container.
-if [[ -d /lib/firmware ]]; then
-  rsync -a /lib/firmware/ /out/lib/firmware/
-fi
-
-# Some updater versions may leave extracted material in the working tree.
-# Preserve that too for inspection, without assuming it is already suitable
-# for direct injection.
+# Preserve the updater working tree and extraction logs for operator inspection.
 mkdir -p /out/updater-workdir
 rsync -a /work/qcom-firmware-updater/ /out/updater-workdir/ || true
+rsync -a /work/qcom-functions.sh /out/logs/qcom-functions.capture.sh || true
 
 if find /out/lib/firmware -type f | grep -q .; then
   log "Captured firmware files under /out/lib/firmware."
