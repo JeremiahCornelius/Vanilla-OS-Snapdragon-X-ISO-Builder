@@ -1,36 +1,41 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.9
+# Version 7.0.10
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
 #     ghcr.io/vanilla-os/desktop:dev.
 #   - The graphical installer ISO is built from a clean official live-iso
 #     checkout using the proven Pico workflow.
-#   - The upstream live graphical package closure is never modified.
+#   - Upstream package-list source files remain byte-identical. A derived ARM64
+#     projection removes only explicitly approved snapshot-incompatible x86
+#     support packages; GNOME and installer package closure is preserved.
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.9 corrections after the v7.0.8 target-verification field test:
-#   - Removes the invalid assumption that dpkg-query remains available inside
-#     the locked final VanillaOS target image.
-#   - Verifies every selected local package immediately after APT installation,
-#     while dpkg-query is still available, and writes a persistent signed-off
-#     package receipt under /usr/lib/conception.
-#   - Final OCI verification compares that receipt against host-derived package
-#     name, version, and architecture expectations without invoking APT or dpkg.
-#   - Desktop-layer preservation is verified by executable paths for GNOME
-#     Shell, Mutter, GDM, and NetworkManager rather than package-manager state.
-#   - Exports the actual installed-package receipt into release evidence.
-#   - Adds a regression test proving final verification succeeds in a target
-#     root where dpkg-query is deliberately absent.
-#   - Preserves all v7.0.8 source, Vib/FsGuard, firmware, DTB, package
-#     classification, package archive, OCI, and live-ISO closure safeguards.
+# v7.0.10 corrections after the v7.0.9 ARM64 live-ISO field test:
+#   - Corrects the official orchid live-iso architecture mismatch: ARCH=arm64
+#     still selects the unqualified vanilla-installer package-list suffix, whose
+#     current snapshot includes five AMD64/VirtualBox-only package entries.
+#   - Leaves every upstream package-list source file byte-identical and creates
+#     a derived package-lists.vanilla-installer-arm64 projection in the detached
+#     build worktree.
+#   - Removes only an explicit, reviewable set of snapshot-incompatible entries:
+#     shim-helpers-amd64-signed, intel-microcode, amd64-microcode,
+#     virtualbox-guest-utils, and virtualbox-guest-x11.
+#   - Refuses broad or silent package pruning, refuses removal of protected
+#     GNOME/installer packages, and fails on any unapproved suspicious x86 token.
+#   - Records source and derived tree checksums plus a line-by-line exclusion
+#     manifest, and proves both trees remain unchanged during live-build.
+#   - Final remaster verification remains byte-identical to the accepted ARM64
+#     graphical baseline manifests.
+#   - Preserves all v7.0.9 source, Vib/FsGuard, firmware, DTB, target OCI,
+#     package receipt, package archive, and boot-remaster safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.9"
+SCRIPT_VERSION="7.0.10"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -51,6 +56,13 @@ LIVE_ISO_REPO_URL="${LIVE_ISO_REPO_URL:-https://github.com/Vanilla-OS/live-iso.g
 LIVE_ISO_REF="${LIVE_ISO_REF:-orchid}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
+
+# The current orchid installer list is shared with AMD64. These exact entries
+# are unavailable in the configured ARM64 snapshot. The value is intentionally
+# explicit and environment-overridable; broad "remove every unavailable
+# package" behavior is prohibited.
+LIVE_ARM64_PACKAGE_LIST_SUFFIX="${LIVE_ARM64_PACKAGE_LIST_SUFFIX:-vanilla-installer-arm64}"
+LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-shim-helpers-amd64-signed,intel-microcode,amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11}"
 
 QCOM_UPDATER_REPO_URL="${QCOM_UPDATER_REPO_URL:-https://github.com/alejandroqh/qcom-firmware-updater.git}"
 QCOM_UPDATER_REF="${QCOM_UPDATER_REF:-main}"
@@ -132,6 +144,10 @@ ROOT_PROBE_REL=""
 UPSTREAM_ISO=""
 UPSTREAM_MANIFEST=""
 UPSTREAM_REMOVE_MANIFEST=""
+LIVE_PACKAGE_LIST_SOURCE_SUFFIX=""
+LIVE_PACKAGE_LIST_SOURCE_DIR=""
+LIVE_PACKAGE_LIST_DERIVED_DIR=""
+LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST=""
 LIVE_SOURCE_COMMIT=""
 CUSTOM_SOURCE_COMMIT=""
 SOURCES_SYNCHRONIZED=0
@@ -358,6 +374,14 @@ Vib toolchain defaults:
                                   fsguard-<host-arch>.so asset.
   GITHUB_TOKEN=<optional>         Raise GitHub API rate limits.
 
+ARM64 live-ISO package projection:
+  LIVE_ARM64_PACKAGE_LIST_SUFFIX=vanilla-installer-arm64
+  LIVE_ARM64_EXCLUDE_PACKAGES=shim-helpers-amd64-signed,intel-microcode,
+      amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11
+
+  The canonical upstream package-lists.vanilla-installer tree is never edited.
+  Only exact package lines named above are omitted from the derived ARM64 tree.
+
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
   ├── kernel-debs/
@@ -416,7 +440,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.9-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.10-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -1706,6 +1730,8 @@ Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
 Push target OCI:            $PUSH_TARGET_IMAGE
 Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
+ARM64 package-list suffix:  $LIVE_ARM64_PACKAGE_LIST_SUFFIX
+ARM64 package exclusions:   $LIVE_ARM64_EXCLUDE_PACKAGES
 Requested Vib version:      $VIB_VERSION
 FsGuard plugin request:     $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_VERSION
 Expected release ID:        $preview_id
@@ -1720,10 +1746,12 @@ Safety invariants:
     immutable target is not expected to retain apt, dpkg, or dpkg-query.
   - /lib/modules/<release>/build and source symlinks never qualify as modules.
   - Optional tools, headers, development, and metadata .debs are reference-only.
-  - Official live package lists are never edited.
-  - The pristine upstream graphical manifest is accepted before remastering.
+  - Official live package-list source files remain byte-identical.
+  - The derived ARM64 list may omit only explicitly approved x86 support
+    packages; no GNOME or installer package may be removed.
+  - The upstream-derived ARM64 graphical manifest is accepted before remastering.
   - Final filesystem.packages and filesystem.packages-remove are byte-identical
-    to the pristine upstream ISO.
+    to the accepted ARM64 baseline ISO.
   - Only boot-critical hardware payload is added to the live filesystem.
 
 Exact non-interactive execute command:
@@ -2677,7 +2705,283 @@ VERIFY_OCI_EOF
 
 # --------------------------- live ISO build ------------------------------
 
-prepare_pristine_live_worktree() {
+hash_directory_tree() {
+  local root="$1"
+  [[ -d "$root" ]] || die "Cannot hash absent directory tree: $root"
+  (
+    cd "$root"
+    find . -type f -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum
+  )
+}
+
+read_terraform_value() {
+  local file="$1" key="$2"
+  sed -n -E "s/^[[:space:]]*${key}=[\"']?([^\"']+)[\"']?[[:space:]]*$/\\1/p" "$file" |
+    sed -n '1p'
+}
+
+prepare_arm64_package_list_projection() {
+  local conf="$1"
+  local source_suffix source_dir derived_dir
+  local protected_packages
+  local expected_manifest="$TMP_ROOT/arm64-package-list-projection.expected.tsv"
+
+  source_suffix="$(read_terraform_value "$conf" PACKAGE_LISTS_SUFFIX)"
+  [[ -n "$source_suffix" ]] || die "Unable to read PACKAGE_LISTS_SUFFIX from $conf"
+
+  source_dir="$LIVE_BUILD_DIR/etc/config/package-lists.$source_suffix"
+  derived_dir="$LIVE_BUILD_DIR/etc/config/package-lists.$LIVE_ARM64_PACKAGE_LIST_SUFFIX"
+
+  [[ -d "$source_dir" ]] || \
+    die "Configured upstream live package-list directory is absent: $source_dir"
+  [[ "$source_dir" != "$derived_dir" ]] || \
+    die "Derived ARM64 package-list suffix must differ from upstream suffix: $source_suffix"
+
+  LIVE_PACKAGE_LIST_SOURCE_SUFFIX="$source_suffix"
+  LIVE_PACKAGE_LIST_SOURCE_DIR="$source_dir"
+  LIVE_PACKAGE_LIST_DERIVED_DIR="$derived_dir"
+  LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST="$TMP_ROOT/arm64-package-list-exclusions.tsv"
+
+  hash_directory_tree "$source_dir" \
+    > "$TMP_ROOT/upstream-package-lists.original.before.sha256"
+
+  protected_packages="gnome-shell,gnome-session,mutter,gdm3,xwayland,network-manager,vanilla-installer"
+
+  python3 - \
+    "$source_dir" \
+    "$derived_dir" \
+    "$LIVE_ARM64_EXCLUDE_PACKAGES" \
+    "$protected_packages" \
+    "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST" \
+    "$expected_manifest" <<'PY_ARM64_PACKAGE_PROJECTION'
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+derived = Path(sys.argv[2])
+exclusion_text = sys.argv[3]
+protected_text = sys.argv[4]
+manifest = Path(sys.argv[5])
+expected_manifest = Path(sys.argv[6])
+
+package_name_re = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*$")
+single_package_line_re = re.compile(
+    r"^(?P<indent>\s*)(?P<pkg>[A-Za-z0-9][A-Za-z0-9+.-]*)(?P<tail>\s*(?:#.*)?)$"
+)
+
+exclusions = {
+    item
+    for item in re.split(r"[\s,]+", exclusion_text.strip())
+    if item
+}
+protected = {
+    item
+    for item in re.split(r"[\s,]+", protected_text.strip())
+    if item
+}
+
+if not exclusions:
+    raise SystemExit("ARM64 package exclusion set is empty; refusing an undefined projection")
+
+invalid = sorted(item for item in exclusions if not package_name_re.fullmatch(item))
+if invalid:
+    raise SystemExit(f"Invalid package name(s) in exclusion set: {', '.join(invalid)}")
+
+intersection = sorted(exclusions & protected)
+if intersection:
+    raise SystemExit(
+        "Protected graphical/installer package requested for exclusion: "
+        + ", ".join(intersection)
+    )
+
+if derived.exists():
+    shutil.rmtree(derived)
+shutil.copytree(source, derived, symlinks=True)
+
+removed: list[tuple[str, int, str, str]] = []
+suspicious_unapproved: list[tuple[str, int, str]] = []
+source_counts: dict[str, int] = {}
+derived_counts: dict[str, int] = {}
+
+def suspicious_x86_package(pkg: str) -> bool:
+    return bool(
+        re.search(r"(^|[-.])(amd64|i386)([-.]|$)", pkg)
+        or pkg == "intel-microcode"
+        or pkg.startswith("virtualbox-guest-")
+    )
+
+def count_token(counts: dict[str, int], pkg: str) -> None:
+    counts[pkg] = counts.get(pkg, 0) + 1
+
+for source_file in sorted(p for p in source.rglob("*") if p.is_file()):
+    rel = source_file.relative_to(source)
+    derived_file = derived / rel
+
+    try:
+        raw = source_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"Non-UTF-8 package-list file cannot be projected: {source_file}") from exc
+
+    out_lines: list[str] = []
+    for lineno, line_with_end in enumerate(raw.splitlines(keepends=True), start=1):
+        line = line_with_end.rstrip("\r\n")
+        newline = line_with_end[len(line):]
+        match = single_package_line_re.fullmatch(line)
+        if not match:
+            out_lines.append(line_with_end)
+            continue
+
+        pkg = match.group("pkg")
+        count_token(source_counts, pkg)
+
+        if suspicious_x86_package(pkg) and pkg not in exclusions:
+            suspicious_unapproved.append((str(rel), lineno, pkg))
+
+        if pkg in exclusions:
+            removed.append(
+                (
+                    str(rel),
+                    lineno,
+                    pkg,
+                    "explicit ARM64 snapshot-incompatible package",
+                )
+            )
+            continue
+
+        count_token(derived_counts, pkg)
+        out_lines.append(line + newline)
+
+    derived_file.write_text("".join(out_lines), encoding="utf-8")
+    shutil.copymode(source_file, derived_file, follow_symlinks=False)
+
+if suspicious_unapproved:
+    details = "\n".join(
+        f"  {rel}:{lineno}: {pkg}"
+        for rel, lineno, pkg in suspicious_unapproved
+    )
+    raise SystemExit(
+        "Suspicious x86-specific package line is not in the explicit exclusion set:\n"
+        + details
+    )
+
+# Verify that no protected graphical/installer token disappeared.
+for pkg in sorted(protected):
+    before = source_counts.get(pkg, 0)
+    after = derived_counts.get(pkg, 0)
+    if before != after:
+        raise SystemExit(
+            f"Protected package token count changed for {pkg}: before={before} after={after}"
+        )
+
+# Verify that every removed token is explicitly approved, and every approved
+# token still present in the source has been removed from the projection.
+removed_names = {row[2] for row in removed}
+unapproved_removed = sorted(removed_names - exclusions)
+if unapproved_removed:
+    raise SystemExit("Unapproved package removal: " + ", ".join(unapproved_removed))
+
+still_present = sorted(
+    pkg for pkg in exclusions if derived_counts.get(pkg, 0) > 0
+)
+if still_present:
+    raise SystemExit(
+        "Excluded package remains in derived ARM64 package lists: "
+        + ", ".join(still_present)
+    )
+
+manifest.parent.mkdir(parents=True, exist_ok=True)
+with manifest.open("w", encoding="utf-8") as handle:
+    handle.write("source_file\tline\tpackage\treason\n")
+    for rel, lineno, pkg, reason in removed:
+        handle.write(f"{rel}\t{lineno}\t{pkg}\t{reason}\n")
+
+with expected_manifest.open("w", encoding="utf-8") as handle:
+    handle.write("package\tpresent_in_upstream\tremoved_occurrences\n")
+    for pkg in sorted(exclusions):
+        handle.write(
+            f"{pkg}\t{source_counts.get(pkg, 0)}\t"
+            f"{sum(1 for row in removed if row[2] == pkg)}\n"
+        )
+
+print(f"Created ARM64 package-list projection: {derived}")
+print(f"Approved exclusions configured: {len(exclusions)}")
+print(f"Package-list lines excluded: {len(removed)}")
+for pkg in sorted(exclusions):
+    print(
+        f"  {pkg}: upstream={source_counts.get(pkg, 0)} "
+        f"excluded={sum(1 for row in removed if row[2] == pkg)}"
+    )
+PY_ARM64_PACKAGE_PROJECTION
+
+  [[ -d "$derived_dir" ]] || die "ARM64 package-list projection was not created."
+  [[ -s "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST" ]] || \
+    die "ARM64 package-list exclusion manifest was not created."
+
+  hash_directory_tree "$derived_dir" \
+    > "$TMP_ROOT/arm64-package-lists.derived.before.sha256"
+
+  # Select the derived package-list suffix. This changes only the active list
+  # directory; it does not modify the canonical upstream list files.
+  sed -i -E \
+    "s/^PACKAGE_LISTS_SUFFIX=.*/PACKAGE_LISTS_SUFFIX=\"$LIVE_ARM64_PACKAGE_LIST_SUFFIX\"/" \
+    "$conf"
+  grep -Fqx "PACKAGE_LISTS_SUFFIX=\"$LIVE_ARM64_PACKAGE_LIST_SUFFIX\"" "$conf" || \
+    die "Unable to select derived ARM64 package-list suffix."
+
+  local excluded_count
+  excluded_count="$(awk 'NR > 1 { count++ } END { print count + 0 }' \
+    "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST")"
+
+  ok "Upstream package-list tree retained: $source_dir"
+  ok "Derived ARM64 package-list tree: $derived_dir"
+  ok "Approved architecture exclusions applied: $excluded_count line(s)"
+  info "Architecture exclusion manifest: $LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST"
+  sed -n '1,120p' "$LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST"
+}
+
+verify_arm64_package_list_projection_after_build() {
+  [[ -d "$LIVE_PACKAGE_LIST_SOURCE_DIR" ]] || \
+    die "Original upstream package-list tree disappeared during build."
+  [[ -d "$LIVE_PACKAGE_LIST_DERIVED_DIR" ]] || \
+    die "Derived ARM64 package-list tree disappeared during build."
+
+  hash_directory_tree "$LIVE_PACKAGE_LIST_SOURCE_DIR" \
+    > "$TMP_ROOT/upstream-package-lists.original.after.sha256"
+  hash_directory_tree "$LIVE_PACKAGE_LIST_DERIVED_DIR" \
+    > "$TMP_ROOT/arm64-package-lists.derived.after.sha256"
+
+  cmp -s \
+    "$TMP_ROOT/upstream-package-lists.original.before.sha256" \
+    "$TMP_ROOT/upstream-package-lists.original.after.sha256" || \
+    die "Canonical upstream live package-list source files changed during build."
+
+  cmp -s \
+    "$TMP_ROOT/arm64-package-lists.derived.before.sha256" \
+    "$TMP_ROOT/arm64-package-lists.derived.after.sha256" || \
+    die "Derived ARM64 package-list files changed during build."
+
+  local active_link="$LIVE_BUILD_DIR/tmp/arm64/config/package-lists"
+  [[ -L "$active_link" ]] || \
+    die "Live-build did not create the expected active package-list symlink: $active_link"
+
+  local active_target
+  active_target="$(readlink "$active_link")"
+  [[ "$active_target" == "package-lists.$LIVE_ARM64_PACKAGE_LIST_SUFFIX" ]] || \
+    die "Live-build selected unexpected package-list target: $active_target"
+
+  ok "Canonical upstream and derived ARM64 package-list trees remained byte-identical during live-build."
+  ok "Active live-build package-list target: $active_target"
+}
+
+prepare_arm64_live_worktree() {
   rm -rf "$LIVE_BUILD_DIR"
   git -C "$LIVE_ISO_SOURCE" worktree add --detach "$LIVE_BUILD_DIR" "$LIVE_SOURCE_COMMIT"
 
@@ -2685,33 +2989,43 @@ prepare_pristine_live_worktree() {
   local build="$LIVE_BUILD_DIR/build.sh"
   [[ -f "$conf" && -f "$build" ]] || die "Official live-iso build inputs are missing."
 
-  (
-    cd "$LIVE_BUILD_DIR"
-    find etc/config -type f \
-      \( -path '*/package-lists*/*' -o -name '*.list.chroot' -o -name '*.list.binary' \) \
-      -print0 | sort -z | xargs -0 sha256sum
-  ) > "$TMP_ROOT/upstream-package-lists.before.sha256"
-
   sed -i -E 's/^ARCH=.*/ARCH="arm64"/' "$conf"
   grep -q '^ARCH="arm64"$' "$conf" || die "Unable to select ARM64 in terraform.conf."
 
-  # The official orchid build script may still hard-code only the final AMD64
+  prepare_arm64_package_list_projection "$conf"
+
+  # The official orchid build script still hard-codes the final AMD64 output
   # source path. This replacement happens after lb build and cannot alter the
   # package closure or live filesystem content.
   if grep -Fq 'tmp/amd64/live-image-amd64.hybrid.iso' "$build"; then
-    sed -i 's#tmp/amd64/live-image-amd64\.hybrid\.iso#tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso#' "$build"
+    sed -i \
+      's#tmp/amd64/live-image-amd64\.hybrid\.iso#tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso#' \
+      "$build"
   fi
 
-  local changed unexpected
+  local changed unexpected untracked unexpected_untracked
   changed="$(git -C "$LIVE_BUILD_DIR" diff --name-only)"
-  unexpected="$(printf '%s\n' "$changed" | grep -Ev '^(build\.sh|etc/terraform\.conf)$' || true)"
-  [[ -z "$unexpected" ]] || die "Refusing live-iso source modifications outside build.sh and terraform.conf: $unexpected"
-  ok "Pristine live-iso worktree prepared at commit $LIVE_SOURCE_COMMIT."
+  unexpected="$(
+    printf '%s\n' "$changed" |
+      grep -Ev '^(build\.sh|etc/terraform\.conf)$' || true
+  )"
+  [[ -z "$unexpected" ]] || \
+    die "Refusing tracked live-iso source modifications outside build.sh and terraform.conf: $unexpected"
+
+  untracked="$(git -C "$LIVE_BUILD_DIR" ls-files --others --exclude-standard)"
+  unexpected_untracked="$(
+    printf '%s\n' "$untracked" |
+      grep -Ev "^etc/config/package-lists\\.${LIVE_ARM64_PACKAGE_LIST_SUFFIX}/" || true
+  )"
+  [[ -z "$unexpected_untracked" ]] || \
+    die "Refusing unexpected untracked live-iso build files: $unexpected_untracked"
+
+  ok "Upstream-derived ARM64 live-iso worktree prepared at commit $LIVE_SOURCE_COMMIT."
 }
 
-build_pristine_live_iso() {
+build_arm64_live_iso() {
   pushd "$LIVE_BUILD_DIR" >/dev/null
-  CURRENT_LOG="$LOG_DIR/${SESSION_ID}-build-pristine-live-iso.log"
+  CURRENT_LOG="$LOG_DIR/${SESSION_ID}-build-arm64-live-iso.log"
   info "Log: $CURRENT_LOG"
 
   "$LIVE_ISO_RUNTIME" run --rm --privileged --network host -i \
@@ -2723,21 +3037,19 @@ build_pristine_live_iso() {
     2>&1 | tee "$CURRENT_LOG"
   popd >/dev/null
 
-  UPSTREAM_ISO="$(find "$LIVE_BUILD_DIR/builds/arm64" "$LIVE_BUILD_DIR/builds" \
-    -type f -name '*.iso' -print 2>/dev/null | sort -u | tail -n1 || true)"
-  [[ -n "$UPSTREAM_ISO" && -s "$UPSTREAM_ISO" ]] || die "The pristine official ARM64 ISO was not produced."
+  UPSTREAM_ISO="$(
+    find "$LIVE_BUILD_DIR/builds/arm64" "$LIVE_BUILD_DIR/builds" \
+      -type f -name '*.iso' -print 2>/dev/null |
+      sort -u |
+      tail -n1 || true
+  )"
+  [[ -n "$UPSTREAM_ISO" && -s "$UPSTREAM_ISO" ]] || \
+    die "The upstream-derived ARM64 graphical ISO was not produced."
 
-  (
-    cd "$LIVE_BUILD_DIR"
-    find etc/config -type f \
-      \( -path '*/package-lists*/*' -o -name '*.list.chroot' -o -name '*.list.binary' \) \
-      -print0 | sort -z | xargs -0 sha256sum
-  ) > "$TMP_ROOT/upstream-package-lists.after.sha256"
-  cmp -s "$TMP_ROOT/upstream-package-lists.before.sha256" "$TMP_ROOT/upstream-package-lists.after.sha256" || \
-    die "Official live package-list source files changed during the build."
-
-  verify_pristine_graphical_iso
+  verify_arm64_package_list_projection_after_build
+  verify_arm64_graphical_iso
 }
+
 
 extract_iso_file() {
   local iso="$1" iso_path="$2" destination="$3"
@@ -2745,7 +3057,7 @@ extract_iso_file() {
   xorriso -osirrox on -indev "$iso" -extract "$iso_path" "$destination" >/dev/null 2>&1
 }
 
-verify_pristine_graphical_iso() {
+verify_arm64_graphical_iso() {
   UPSTREAM_MANIFEST="$TMP_ROOT/upstream-filesystem.packages"
   UPSTREAM_REMOVE_MANIFEST="$TMP_ROOT/upstream-filesystem.packages-remove"
   extract_iso_file "$UPSTREAM_ISO" /live/filesystem.packages "$UPSTREAM_MANIFEST"
@@ -2755,13 +3067,13 @@ verify_pristine_graphical_iso() {
   local pkg
   for pkg in "${required[@]}"; do
     grep -Eq "^${pkg}([[:space:]]|$)" "$UPSTREAM_MANIFEST" || \
-      die "Pristine official ISO lacks required graphical package: $pkg"
+      die "ARM64 baseline ISO lacks required graphical package: $pkg"
   done
 
   local count
   count="$(wc -l < "$UPSTREAM_MANIFEST")"
   (( count >= MIN_GRAPHICAL_PACKAGE_COUNT )) || \
-    die "Pristine official ISO has only $count packages; minimum is $MIN_GRAPHICAL_PACKAGE_COUNT. Refusing to remaster an incomplete source."
+    die "ARM64 baseline ISO has only $count packages; minimum is $MIN_GRAPHICAL_PACKAGE_COUNT. Refusing to remaster an incomplete source."
 
   extract_iso_file "$UPSTREAM_ISO" /live/filesystem.squashfs "$TMP_ROOT/upstream-filesystem.squashfs"
   local squash_bytes
@@ -2769,7 +3081,7 @@ verify_pristine_graphical_iso() {
 
   sha256sum "$UPSTREAM_MANIFEST" > "$TMP_ROOT/upstream-manifest.sha256"
   sha256sum "$UPSTREAM_REMOVE_MANIFEST" > "$TMP_ROOT/upstream-remove-manifest.sha256"
-  ok "Pristine graphical ISO accepted: $count packages, $squash_bytes-byte squashfs."
+  ok "Upstream-derived ARM64 graphical baseline accepted: $count packages, $squash_bytes-byte squashfs."
 }
 
 mount_chroot_filesystems() {
@@ -2821,7 +3133,7 @@ remaster_boot_hardware_only() {
   rm -rf "$iso_tree" "$squash_root"
   mkdir -p "$iso_tree" "$squash_root"
 
-  info "Extracting pristine official ISO tree."
+  info "Extracting accepted ARM64 baseline ISO tree."
   xorriso -osirrox on -indev "$UPSTREAM_ISO" -extract / "$iso_tree" >/dev/null 2>&1
   cp -a "$iso_tree/live/filesystem.squashfs" "$original_squash"
 
@@ -2856,7 +3168,7 @@ remaster_boot_hardware_only() {
     elif command -v dracut >/dev/null 2>&1; then
       dracut --force \"/boot/initrd.img-\$release\" \"\$release\"
     else
-      echo 'Neither update-initramfs nor dracut exists inside the pristine live filesystem.' >&2
+      echo 'Neither update-initramfs nor dracut exists inside the ARM64 baseline live filesystem.' >&2
       exit 90
     fi
     test -s \"/boot/initrd.img-\$release\"
@@ -2921,8 +3233,8 @@ verify_final_release() {
 
   extract_iso_file "$FINAL_ISO" /live/filesystem.packages "$final_manifest"
   extract_iso_file "$FINAL_ISO" /live/filesystem.packages-remove "$final_remove"
-  cmp -s "$UPSTREAM_MANIFEST" "$final_manifest" || die "Final filesystem.packages differs from pristine upstream."
-  cmp -s "$UPSTREAM_REMOVE_MANIFEST" "$final_remove" || die "Final filesystem.packages-remove differs from pristine upstream."
+  cmp -s "$UPSTREAM_MANIFEST" "$final_manifest" || die "Final filesystem.packages differs from accepted ARM64 baseline."
+  cmp -s "$UPSTREAM_REMOVE_MANIFEST" "$final_remove" || die "Final filesystem.packages-remove differs from accepted ARM64 baseline."
 
   extract_iso_file "$FINAL_ISO" "/live/vmlinuz-$KERNEL_RELEASE" "$verify_dir/vmlinuz"
   extract_iso_file "$FINAL_ISO" "/live/initrd.img-$KERNEL_RELEASE" "$verify_dir/initrd"
@@ -2949,7 +3261,12 @@ verify_final_release() {
   grep -Fq -- "-e '/boot/grub/efi.img'" "$el_torito" || die "Final ISO lacks the expected ARM64 El Torito EFI image."
 
   sha256sum "$FINAL_ISO" > "$FINAL_ISO.sha256"
-  cp -a "$TMP_ROOT/upstream-package-lists.before.sha256" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/upstream-package-lists.original.before.sha256" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/upstream-package-lists.original.after.sha256" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/arm64-package-lists.derived.before.sha256" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/arm64-package-lists.derived.after.sha256" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/arm64-package-list-exclusions.tsv" "$RELEASE_DIR/"
+  cp -a "$TMP_ROOT/arm64-package-list-projection.expected.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
@@ -3005,9 +3322,12 @@ Vib version:                 $VIB_DETECTED_VERSION
 FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG
 custom-image source commit:  $CUSTOM_SOURCE_COMMIT
 live-iso source commit:      $LIVE_SOURCE_COMMIT
-Pristine ISO:                $UPSTREAM_ISO
+Upstream package-list suffix:$LIVE_PACKAGE_LIST_SOURCE_SUFFIX
+ARM64 package-list suffix:   $LIVE_ARM64_PACKAGE_LIST_SUFFIX
+ARM64 exclusions:            $LIVE_ARM64_EXCLUDE_PACKAGES
+ARM64 baseline ISO:          $UPSTREAM_ISO
 Final ISO:                   $FINAL_ISO
-Live package manifests:      byte-identical before and after remaster
+Live package manifests:      byte-identical to accepted ARM64 baseline
 Built:                       $(date -u --iso-8601=seconds)
 EOF_MANIFEST
 
@@ -3073,9 +3393,9 @@ main() {
   stage "8/12 Building and verifying the desktop:dev-derived target OCI"
   build_target_oci
 
-  stage "9/12 Preparing and building a pristine graphical ARM64 live ISO"
-  prepare_pristine_live_worktree
-  build_pristine_live_iso
+  stage "9/12 Preparing and building an upstream-derived graphical ARM64 live ISO"
+  prepare_arm64_live_worktree
+  build_arm64_live_iso
 
   stage "10/12 Remastering only boot-critical hardware content"
   remaster_boot_hardware_only
