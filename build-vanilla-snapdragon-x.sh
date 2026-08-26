@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.4.sh
+# build-vanilla-arm64-release-v2.5.5.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.4
+# Version: 2.5.5
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.4"
+SCRIPT_VERSION="2.5.5"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -882,7 +882,7 @@ check_dependencies() {
   fail "Missing required tools: ${missing[*]}"
   printf '\nSuggested Debian 13 packages for common tools:\n' >&2
   printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
+  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage file binutils strace bsdutils util-linux file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
   printf 'Additional builder requirement:\n' >&2
   printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
 
@@ -1664,8 +1664,14 @@ vib_deep_diagnostics() {
     ldd "$(command -v vib)" 2>/dev/null || true
     printf '\n'
 
+    printf '## Vib version data\n'
+    printf 'recipe vibversion: %s\n' "$(recipe_declared_vibversion "$PWD")"
+    printf 'installed vib version token: %s\n' "$(installed_vib_version_string)"
+    vib --version 2>&1 || true
+    printf '\n'
+
     printf '## Recipe header\n'
-    sed -n '1,160p' recipe.yml 2>/dev/null || true
+    sed -n '1,200p' recipe.yml 2>/dev/null || true
     printf '\n'
 
     printf '## Plugin files\n'
@@ -1689,22 +1695,33 @@ vib_deep_diagnostics() {
     command -v docker && docker --version || true
     printf '\n'
 
-    printf '## Direct vib execution\n'
-    vib build recipe.yml
+    printf '## Direct vib execution, stdout+stderr\n'
+    vib build recipe.yml 2>&1
     printf '\nDirect exit status: %s\n\n' "$?"
 
-    printf '## Vib execution with debug-ish environment\n'
-    VIB_LOG_LEVEL=debug RUST_BACKTRACE=1 vib build recipe.yml
+    printf '## Vib execution with debug-ish environment, stdout+stderr\n'
+    VIB_LOG_LEVEL=debug RUST_BACKTRACE=full RUST_LOG=debug vib build recipe.yml 2>&1
     printf '\nDebug-env exit status: %s\n\n' "$?"
 
-    if command -v strace >/dev/null 2>&1; then
-      printf '## strace vib build, last 160 lines\n'
-      strace -f -o /tmp/vib-build.strace vib build recipe.yml
-      printf 'strace-wrapped exit status: %s\n\n' "$?"
-      tail -n 160 /tmp/vib-build.strace || true
+    if command -v script >/dev/null 2>&1; then
+      printf '## Vib execution under pseudo-TTY via script(1)\n'
+      script -q -e -c 'vib build recipe.yml' /tmp/vib-build.typescript
+      printf 'script-wrapped exit status: %s\n' "$?"
+      printf '\n--- typescript output ---\n'
+      cat /tmp/vib-build.typescript || true
       printf '\n'
     else
-      printf 'strace not installed; skipping syscall trace. Install package 'strace' for syscall-level Vib diagnostics.\n'
+      printf 'script(1) not installed; skipping pseudo-TTY capture.\n'
+    fi
+
+    if command -v strace >/dev/null 2>&1; then
+      printf '## strace vib build, last 240 lines\n'
+      strace -f -s 256 -o /tmp/vib-build.strace vib build recipe.yml
+      printf 'strace-wrapped exit status: %s\n\n' "$?"
+      tail -n 240 /tmp/vib-build.strace || true
+      printf '\n'
+    else
+      printf 'strace not installed; skipping syscall trace. Install package strace for syscall-level Vib diagnostics.\n'
     fi
 
     printf '## Files generated/changed in repo root after Vib attempts\n'
@@ -1717,119 +1734,6 @@ vib_deep_diagnostics() {
 
   print_failure_tail "$log"
   warn "Deep Vib diagnostics complete. Review: $log"
-}
-
-validate_recipe_yaml_parse() {
-  # Parse recipe.yml with PyYAML before invoking Vib. Vib can exit 1 without
-  # explaining YAML parser failures, so this preflight reports line/column
-  # directly. python3-yaml is installed by the dependency resolver.
-  local workdir="$1"
-  local log="$2"
-
-  if ! python3 - "$workdir/recipe.yml" >>"$log" 2>&1 <<'PY'
-import sys
-path = sys.argv[1]
-try:
-    import yaml
-except Exception as exc:
-    print(f"PYTHON_YAML_IMPORT_ERROR: {exc}")
-    sys.exit(22)
-
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-except Exception as exc:
-    print(f"YAML_PARSE_ERROR: {exc}")
-    sys.exit(23)
-
-if not isinstance(data, dict):
-    print("YAML_STRUCTURE_ERROR: top-level recipe document is not a mapping")
-    sys.exit(24)
-
-required = ["name", "id", "vibversion", "stages"]
-missing = [k for k in required if k not in data]
-if missing:
-    print("YAML_STRUCTURE_ERROR: missing required top-level keys:", ", ".join(missing))
-    sys.exit(25)
-
-if not isinstance(data.get("stages"), list) or not data["stages"]:
-    print("YAML_STRUCTURE_ERROR: stages must be a non-empty list")
-    sys.exit(26)
-
-print("YAML_PARSE_OK")
-PY
-  then
-    return 1
-  fi
-
-  return 0
-}
-
-validate_fsguard_plugin_abi() {
-  # If recipe.yml uses `type: fsguard`, confirm that plugins/fsguard.so is:
-  #   - present and non-empty
-  #   - the correct machine architecture
-  #   - dynamically loadable according to ldd
-  #   - exports the Vib plugin entry points PlugInfo and BuildModule
-  local workdir="$1"
-  local log="$2"
-  local plugin="$workdir/plugins/fsguard.so"
-  local status=0
-
-  if ! grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$workdir/recipe.yml"; then
-    return 0
-  fi
-
-  {
-    printf '\n## fsguard plugin ABI validation\n'
-    printf 'plugin: %s\n' "$plugin"
-
-    if [[ ! -s "$plugin" ]]; then
-      printf 'FSGUARD_PLUGIN_ERROR: missing or empty fsguard plugin\n'
-      exit 31
-    fi
-
-    if command -v file >/dev/null 2>&1; then
-      file "$plugin" || true
-    fi
-
-    if command -v ldd >/dev/null 2>&1; then
-      printf '\nldd plugins/fsguard.so:\n'
-      ldd "$plugin" || exit 32
-    fi
-
-    if command -v nm >/dev/null 2>&1; then
-      printf '\nExported Vib plugin symbols:\n'
-      nm -D "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
-    elif command -v readelf >/dev/null 2>&1; then
-      printf '\nExported Vib plugin symbols:\n'
-      readelf -Ws "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
-    else
-      printf 'WARN: neither nm nor readelf is available for symbol validation.\n'
-    fi
-
-    printf 'FSGUARD_PLUGIN_ABI_OK\n'
-  } >>"$log" 2>&1 || status=$?
-
-  return "$status"
-}
-
-validate_required_recipe_plugins() {
-  local workdir="$1"
-  local log="$2"
-
-  {
-    printf '\n## Required recipe plugin validation\n'
-    awk '
-      /^[[:space:]]*type:[[:space:]]*/ {
-        gsub(/^[[:space:]]*type:[[:space:]]*/, "", $0)
-        gsub(/[[:space:]]*$/, "", $0)
-        print $0
-      }
-    ' "$workdir/recipe.yml" | sort -u
-  } >>"$log" 2>&1 || true
-
-  validate_fsguard_plugin_abi "$workdir" "$log"
 }
 
 
@@ -1920,6 +1824,12 @@ vib_preflight() {
 
   if [[ ! -f "$workdir/recipe.yml" ]]; then
     fail "recipe.yml is missing in $workdir"
+    print_failure_tail "$log"
+    return 1
+  fi
+
+  if ! validate_vib_version_matches_recipe "$workdir" "$log"; then
+    fail "Vib version compatibility validation failed before Vib execution."
     print_failure_tail "$log"
     return 1
   fi
