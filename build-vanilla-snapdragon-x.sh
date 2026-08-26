@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.8.sh
+# build-vanilla-arm64-release-v2.7.9.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.8
+# Version: 2.7.9
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.8"
+SCRIPT_VERSION="2.7.9"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -45,6 +45,7 @@ LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
 LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.io/vanilla-os/pico:dev ghcr.io/vanilla-os/pico:latest debian:trixie}"
+VERIFY_CUSTOM_KERNEL_IN_ISO="${VERIFY_CUSTOM_KERNEL_IN_ISO:-1}"
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -1682,6 +1683,196 @@ the expected Qualcomm package, or additional manual interaction is required." "1
   esac
 }
 
+
+resolve_custom_kernel_release() {
+  # Determine the kernel release expected from the supplied linux-image .deb.
+  # Prefer the package name because Debian kernel packages conventionally use:
+  #   linux-image-<kernel-release>
+  local deb pkg release
+
+  for deb in "${KERNEL_DEBS[@]:-}"; do
+    [[ -f "$deb" ]] || continue
+    pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+    case "$pkg" in
+      linux-image-*)
+        release="${pkg#linux-image-}"
+        printf '%s\n' "$release"
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+patch_live_iso_grub_for_custom_dtb() {
+  # Patch the actual live-build GRUB template. The previous implementation
+  # wrote includes.binary/boot/grub/custom-dtb.cfg, but live-build uses:
+  #   config/bootloaders/grub-pc/grub.cfg
+  # with KERNEL_LIVE and INITRD_LIVE placeholders.
+  local live="$1"
+  local dtb_name="$2"
+  local grub="$live/etc/config/bootloaders/grub-pc/grub.cfg"
+  local backup tmp
+
+  [[ -f "$grub" ]] || die "Live ISO GRUB template not found: $grub"
+
+  backup="$grub.builder-backup-custom-dtb.$(date -u +%Y%m%d%H%M%S)"
+  cp -a "$grub" "$backup"
+  tmp="$grub.builder-patched.$$"
+
+  python3 - "$grub" "$tmp" "$dtb_name" <<'PY'
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+dtb = sys.argv[3]
+
+lines = src.read_text(encoding="utf-8").splitlines()
+out = []
+marker = "# CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER"
+
+for line in lines:
+    # Remove previously generated directives/marker so reruns are idempotent.
+    if marker in line:
+        continue
+    if line.strip().startswith("devicetree ") and "/boot/dtbs/" in line:
+        continue
+
+    out.append(line)
+
+    # Add DTB immediately after every live kernel command so every standard
+    # Vanilla menu entry uses the board DTB.
+    if line.lstrip().startswith("linux ") and "KERNEL_LIVE" in line:
+        indent = line[: len(line) - len(line.lstrip())]
+        out.append(f"{indent}devicetree /boot/dtbs/{dtb} {marker}")
+
+dst.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+
+  mv "$tmp" "$grub"
+
+  if ! grep -q "devicetree /boot/dtbs/$dtb_name" "$grub"; then
+    die "Failed to add custom DTB directive to live ISO GRUB template."
+  fi
+
+  ok "Patched live ISO GRUB template to load DTB: $dtb_name"
+}
+
+verify_live_iso_source_integration() {
+  local live="$1"
+  local expected_kver="$2"
+  local dtb_name="$3"
+  local failed=0
+
+  info "Verifying live ISO custom kernel/DTB source integration."
+
+  [[ -d "$live/etc/config/packages.chroot" ]] || {
+    fail "Missing live-build packages.chroot directory."
+    failed=1
+  }
+
+  if ! find "$live/etc/config/packages.chroot" -maxdepth 1 -type f -name 'linux-image-*.deb' | grep -q .; then
+    fail "No custom linux-image .deb staged under config/packages.chroot."
+    failed=1
+  fi
+
+  [[ -x "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot" ]] || {
+    fail "Missing executable custom-kernel live-build hook."
+    failed=1
+  }
+
+  grep -q "EXPECTED_CUSTOM_KERNEL=$expected_kver" "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot" || {
+    fail "Custom-kernel hook does not contain expected kernel release: $expected_kver"
+    failed=1
+  }
+
+  grep -q "devicetree /boot/dtbs/$dtb_name" "$live/etc/config/bootloaders/grub-pc/grub.cfg" || {
+    fail "GRUB template does not load expected DTB: $dtb_name"
+    failed=1
+  }
+
+  [[ -f "$live/etc/config/includes.binary/boot/dtbs/$dtb_name" ]] || {
+    fail "DTB is missing from ISO binary includes."
+    failed=1
+  }
+
+  [[ "$failed" -eq 0 ]] || return 1
+  ok "Live ISO custom kernel/DTB source integration verified."
+}
+
+verify_built_iso_custom_boot_artifacts() {
+  # Verify the ISO itself, not only the source tree. This checks:
+  #   - DTB present in ISO binary filesystem
+  #   - GRUB config contains devicetree directive
+  #   - live squashfs contains custom /boot/vmlinuz and /lib/modules release
+  local live="$1"
+  local expected_kver="$2"
+  local dtb_name="$3"
+  local iso work listing squashfs grub_extract log
+
+  [[ "$VERIFY_CUSTOM_KERNEL_IN_ISO" == "1" ]] || return 0
+
+  iso="$(find "$live/builds" -type f -name '*.iso' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2- || true)"
+  [[ -n "$iso" && -f "$iso" ]] || die "Unable to locate generated ISO for custom boot verification."
+
+  work="$TMP_DIR/iso-custom-boot-verify-$$"
+  listing="$work/iso-listing.txt"
+  squashfs="$work/filesystem.squashfs"
+  grub_extract="$work/grub.cfg"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-iso-custom-kernel-dtb-verification-$(date -u +%H%M%S).log"
+  mkdir -p "$work" "$OUTPUT_DIR/logs"
+
+  {
+    printf 'ISO: %s\n' "$iso"
+    printf 'Expected kernel release: %s\n' "$expected_kver"
+    printf 'Expected DTB: %s\n\n' "$dtb_name"
+  } >"$log"
+
+  xorriso -indev "$iso" -find / -type f -print >"$listing" 2>>"$log" \
+    || die "Unable to list generated ISO with xorriso."
+
+  grep -q "/boot/dtbs/$dtb_name" "$listing" || {
+    fail "Generated ISO does not contain /boot/dtbs/$dtb_name"
+    warn "Verification log: $log"
+    return 1
+  }
+
+  # Locate/extract GRUB config from common live-build ISO paths.
+  local grub_path
+  grub_path="$(grep -E '/boot/grub/grub.cfg$|/EFI/BOOT/grub.cfg$' "$listing" | head -n1 || true)"
+  if [[ -n "$grub_path" ]]; then
+    xorriso -osirrox on -indev "$iso" -extract "$grub_path" "$grub_extract" >>"$log" 2>&1 || true
+    if [[ -f "$grub_extract" ]]; then
+      grep -q "devicetree /boot/dtbs/$dtb_name" "$grub_extract" || {
+        fail "Generated ISO GRUB config does not contain expected devicetree directive."
+        warn "Verification log: $log"
+        return 1
+      }
+    fi
+  fi
+
+  local squash_path
+  squash_path="$(grep -E '/live/filesystem\.squashfs$' "$listing" | head -n1 || true)"
+  [[ -n "$squash_path" ]] || {
+    fail "Generated ISO does not contain /live/filesystem.squashfs"
+    return 1
+  }
+
+  xorriso -osirrox on -indev "$iso" -extract "$squash_path" "$squashfs" >>"$log" 2>&1 \
+    || die "Unable to extract filesystem.squashfs for verification."
+
+  if ! unsquashfs -ll "$squashfs" 2>>"$log" | grep -Eq "(/boot/vmlinuz-$expected_kver|/lib/modules/$expected_kver)"; then
+    fail "Generated ISO live filesystem does not contain custom kernel release $expected_kver."
+    warn "Verification log: $log"
+    return 1
+  fi
+
+  ok "Generated ISO contains the custom kernel and DTB boot integration."
+  printf 'ISO verification log:\n  %s\n' "$log" >&2
+}
+
 # ------------------------- staging into repos --------------------------
 
 stage_customizations() {
@@ -1728,55 +1919,98 @@ EOF
   done
 
   if [[ -d "$live" ]]; then
-    mkdir -p "$live/etc/config/includes.chroot/opt/vendor-kernel" \
+    local expected_kver dtb_name
+    expected_kver="$(resolve_custom_kernel_release || true)"
+    [[ -n "$expected_kver" ]] || die "Unable to determine custom kernel release from supplied linux-image .deb."
+    [[ -n "${PRIMARY_DTB:-}" ]] || die "A primary DTB is required for the ARM64 live ISO."
+    dtb_name="$(basename "$PRIMARY_DTB")"
+
+    # live-build native local package input. Packages placed here are installed
+    # into the live chroot as packages, rather than copied as inert files.
+    mkdir -p "$live/etc/config/packages.chroot" \
              "$live/etc/config/includes.chroot/boot/dtbs" \
              "$live/etc/config/includes.binary/boot/dtbs" \
              "$live/etc/config/includes.chroot/root"
-    for f in "${KERNEL_DEBS[@]:-}"; do cp -a "$f" "$live/etc/config/includes.chroot/opt/vendor-kernel/"; done
+
+    # Remove stale copies from previous builder revisions to keep reruns
+    # deterministic and prevent multiple kernel versions from accumulating.
+    find "$live/etc/config/packages.chroot" -maxdepth 1 -type f \
+      \( -name 'linux-image-*.deb' -o -name 'linux-modules-*.deb' -o -name 'linux-headers-*.deb' -o -name 'linux-tools-*.deb' -o -name 'linux-buildinfo-*.deb' \) \
+      -delete 2>/dev/null || true
+    rm -rf "$live/etc/config/includes.chroot/opt/vendor-kernel"
+    rm -f "$live/etc/config/hooks/live/010-custom-arm64-kernel.chroot"
+    rm -f "$live/etc/config/includes.binary/boot/grub/custom-dtb.cfg"
+
+    for f in "${KERNEL_DEBS[@]:-}"; do
+      cp -a "$f" "$live/etc/config/packages.chroot/"
+    done
+
     for f in "${DTB_FILES[@]:-}"; do
       cp -a "$f" "$live/etc/config/includes.chroot/boot/dtbs/"
       cp -a "$f" "$live/etc/config/includes.binary/boot/dtbs/"
     done
+
     if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
       rsync -a "$ROOT_OVERLAY_DIR"/ "$live/etc/config/includes.chroot/root"/
     fi
+
     if [[ -d "$STAGED_QCOM_DIR" ]] && find "$STAGED_QCOM_DIR" -type f | grep -q .; then
-      mkdir -p "$live/etc/config/includes.chroot/lib/firmware"
-      rsync -a "$STAGED_QCOM_DIR"/ "$live/etc/config/includes.chroot/lib/firmware"/
+      mkdir -p "$live/etc/config/includes.chroot/usr/lib/firmware"
+      rsync -a "$STAGED_QCOM_DIR"/ "$live/etc/config/includes.chroot/usr/lib/firmware"/
     fi
 
+    # Run late enough that Vanilla's core-package hooks have completed, but
+    # before final cleanup. Fail hard if the expected custom kernel did not
+    # install. Do not silently fall back to the standard kernel.
     mkdir -p "$live/etc/config/hooks/live"
-    cat >"$live/etc/config/hooks/live/010-custom-arm64-kernel.chroot" <<'EOF'
+    cat >"$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot" <<EOF
 #!/bin/sh
 set -eu
-if ls /opt/vendor-kernel/*.deb >/dev/null 2>&1; then
-  dpkg -i /opt/vendor-kernel/*.deb || apt -f install -y
-fi
-mkdir -p /boot/dtbs
-if command -v update-initramfs >/dev/null 2>&1; then
-  update-initramfs -c -k all || update-initramfs -u -k all || true
-fi
-if command -v update-grub >/dev/null 2>&1; then
-  update-grub || true
-fi
-EOF
-    chmod +x "$live/etc/config/hooks/live/010-custom-arm64-kernel.chroot"
 
-    # Generated GRUB fragment; actual inclusion depends on live-iso layout.
-    if [[ -n "${PRIMARY_DTB:-}" ]]; then
-      mkdir -p "$live/etc/config/includes.binary/boot/grub"
-      local dtb_name
-      dtb_name="$(basename "$PRIMARY_DTB")"
-      {
-        printf '# Generated by %s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
-        printf '# Review live-iso GRUB inclusion rules. This fragment demonstrates required DTB loading.\n'
-        printf 'menuentry "Vanilla OS ARM64 - Custom DTB (%s)" {\n' "$dtb_name"
-        printf '    linux /live/vmlinuz boot=live components quiet splash\n'
-        printf '    initrd /live/initrd.img\n'
-        printf '    devicetree /boot/dtbs/%s\n' "$dtb_name"
-        printf '}\n'
-      } >"$live/etc/config/includes.binary/boot/grub/custom-dtb.cfg"
-    fi
+EXPECTED_CUSTOM_KERNEL=$expected_kver
+EXPECTED_CUSTOM_DTB=$dtb_name
+
+echo "Validating custom ARM64 kernel: \$EXPECTED_CUSTOM_KERNEL"
+
+if [ ! -d "/lib/modules/\$EXPECTED_CUSTOM_KERNEL" ]; then
+  echo "ERROR: custom kernel modules missing: /lib/modules/\$EXPECTED_CUSTOM_KERNEL" >&2
+  dpkg-query -W 'linux-image-*' 'linux-modules-*' 2>/dev/null || true
+  exit 81
+fi
+
+if [ ! -e "/boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL" ]; then
+  echo "ERROR: custom kernel image missing: /boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL" >&2
+  exit 82
+fi
+
+if [ ! -f "/boot/dtbs/\$EXPECTED_CUSTOM_DTB" ]; then
+  echo "ERROR: custom DTB missing: /boot/dtbs/\$EXPECTED_CUSTOM_DTB" >&2
+  exit 83
+fi
+
+# Generate an initramfs specifically for the custom kernel. A generic '-k all'
+# can leave live-build selecting the wrong kernel/initrd pair.
+rm -f "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL"
+update-initramfs -c -k "\$EXPECTED_CUSTOM_KERNEL"
+
+test -s "/boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" || {
+  echo "ERROR: custom initramfs was not generated." >&2
+  exit 84
+}
+
+# Make the intended kernel explicit for tools that follow the standard links.
+ln -sfn "boot/vmlinuz-\$EXPECTED_CUSTOM_KERNEL" /vmlinuz
+ln -sfn "boot/initrd.img-\$EXPECTED_CUSTOM_KERNEL" /initrd.img
+
+printf '%s\n' "\$EXPECTED_CUSTOM_KERNEL" > /etc/vanilla-custom-kernel-release
+printf '%s\n' "\$EXPECTED_CUSTOM_DTB" > /etc/vanilla-custom-dtb
+
+echo "Custom ARM64 kernel and DTB validated successfully."
+EOF
+    chmod +x "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot"
+
+    patch_live_iso_grub_for_custom_dtb "$live" "$dtb_name"
+    verify_live_iso_source_integration "$live" "$expected_kver" "$dtb_name"
   fi
 }
 
@@ -3958,7 +4192,12 @@ build_iso() {
   set -e
 
   if [[ "$status" -eq 0 ]]; then
-    ok "Build live ISO completed successfully."
+    local expected_kver dtb_name
+    expected_kver="$(resolve_custom_kernel_release || true)"
+    dtb_name="$(basename "${PRIMARY_DTB:-}")"
+    [[ -n "$expected_kver" && -n "$dtb_name" ]] || die "Missing expected kernel/DTB metadata for ISO verification."
+    verify_built_iso_custom_boot_artifacts "$live" "$expected_kver" "$dtb_name"
+    ok "Build live ISO completed successfully with verified custom kernel and DTB."
     return 0
   fi
 
