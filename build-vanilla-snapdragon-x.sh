@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.10
+# Version 7.0.11
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,29 +13,25 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.10 corrections after the v7.0.9 ARM64 live-ISO field test:
-#   - Corrects the official orchid live-iso architecture mismatch: ARCH=arm64
-#     still selects the unqualified vanilla-installer package-list suffix, whose
-#     current snapshot includes five AMD64/VirtualBox-only package entries.
-#   - Leaves every upstream package-list source file byte-identical and creates
-#     a derived package-lists.vanilla-installer-arm64 projection in the detached
-#     build worktree.
-#   - Removes only an explicit, reviewable set of snapshot-incompatible entries:
-#     shim-helpers-amd64-signed, intel-microcode, amd64-microcode,
-#     virtualbox-guest-utils, and virtualbox-guest-x11.
-#   - Refuses broad or silent package pruning, refuses removal of protected
-#     GNOME/installer packages, and fails on any unapproved suspicious x86 token.
-#   - Records source and derived tree checksums plus a line-by-line exclusion
-#     manifest, and proves both trees remain unchanged during live-build.
-#   - Final remaster verification remains byte-identical to the accepted ARM64
-#     graphical baseline manifests.
-#   - Preserves all v7.0.9 source, Vib/FsGuard, firmware, DTB, target OCI,
-#     package receipt, package archive, and boot-remaster safeguards.
+# v7.0.11 corrections after the v7.0.10 ARM64 projection field test:
+#   - Adds the three AMD64-only GRUB EFI packages present in the upstream
+#     pool.list.binary to the explicit ARM64 exclusion set:
+#       grub-efi-amd64, grub-efi-amd64-bin, grub-efi-amd64-signed.
+#   - Keeps the architecture-neutral shim-signed and efibootmgr entries.
+#   - Assigns package-specific exclusion reasons in the audit manifest instead
+#     of one generic reason for every omitted line.
+#   - Clears stale command-log state at every stage boundary so a pre-build
+#     projection failure no longer prints the previous target-OCI log.
+#   - Adds a regression fixture matching the upstream pool.list.binary content
+#     and verifies that all eight approved incompatible package lines are
+#     removed while ARM-neutral EFI and graphical packages remain.
+#   - Preserves all v7.0.10 source, Vib/FsGuard, firmware, DTB, target OCI,
+#     package receipt, package archive, ARM64 projection, and remaster guards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.10"
+SCRIPT_VERSION="7.0.11"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -57,12 +53,13 @@ LIVE_ISO_REF="${LIVE_ISO_REF:-orchid}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
 LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 
-# The current orchid installer list is shared with AMD64. These exact entries
-# are unavailable in the configured ARM64 snapshot. The value is intentionally
+# The current orchid installer list is shared with AMD64. These exact x86,
+# AMD64 EFI, and unavailable VirtualBox entries are incompatible with the
+# configured ARM64 snapshot. The value is intentionally
 # explicit and environment-overridable; broad "remove every unavailable
 # package" behavior is prohibited.
 LIVE_ARM64_PACKAGE_LIST_SUFFIX="${LIVE_ARM64_PACKAGE_LIST_SUFFIX:-vanilla-installer-arm64}"
-LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-shim-helpers-amd64-signed,intel-microcode,amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11}"
+LIVE_ARM64_EXCLUDE_PACKAGES="${LIVE_ARM64_EXCLUDE_PACKAGES:-grub-efi-amd64,grub-efi-amd64-bin,grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11}"
 
 QCOM_UPDATER_REPO_URL="${QCOM_UPDATER_REPO_URL:-https://github.com/alejandroqh/qcom-firmware-updater.git}"
 QCOM_UPDATER_REF="${QCOM_UPDATER_REF:-main}"
@@ -167,6 +164,12 @@ hr()   { printf '%*s\n' 78 '' | tr ' ' '-'; }
 
 stage() {
   CURRENT_STAGE="$1"
+
+  # A stage may fail during an unlogged preflight before run_logged() selects a
+  # new command log. Clear the previous stage's path so the error handler never
+  # presents stale output as though it belonged to the current failure.
+  CURRENT_LOG=""
+
   printf '\n[%s]\n' "$CURRENT_STAGE"
 }
 
@@ -294,6 +297,8 @@ on_error() {
     else
       fail "The failing command produced an empty log."
     fi
+  else
+    fail "No command-specific log was active for this stage preflight failure."
   fi
   exit "$rc"
 }
@@ -376,7 +381,8 @@ Vib toolchain defaults:
 
 ARM64 live-ISO package projection:
   LIVE_ARM64_PACKAGE_LIST_SUFFIX=vanilla-installer-arm64
-  LIVE_ARM64_EXCLUDE_PACKAGES=shim-helpers-amd64-signed,intel-microcode,
+  LIVE_ARM64_EXCLUDE_PACKAGES=grub-efi-amd64,grub-efi-amd64-bin,
+      grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,
       amd64-microcode,virtualbox-guest-utils,virtualbox-guest-x11
 
   The canonical upstream package-lists.vanilla-installer tree is never edited.
@@ -440,7 +446,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.10-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.11-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -2818,6 +2824,17 @@ def suspicious_x86_package(pkg: str) -> bool:
         or pkg.startswith("virtualbox-guest-")
     )
 
+def exclusion_reason(pkg: str) -> str:
+    if pkg.startswith("grub-efi-amd64"):
+        return "AMD64-only GRUB EFI package; live-build must select the ARM64 bootloader"
+    if pkg == "shim-helpers-amd64-signed":
+        return "AMD64-only signed shim helper package"
+    if pkg in {"intel-microcode", "amd64-microcode"}:
+        return "x86 CPU microcode package unavailable for ARM64"
+    if pkg.startswith("virtualbox-guest-"):
+        return "VirtualBox guest package unavailable in the configured ARM64 snapshot"
+    return "explicitly approved ARM64 snapshot-incompatible package"
+
 def count_token(counts: dict[str, int], pkg: str) -> None:
     counts[pkg] = counts.get(pkg, 0) + 1
 
@@ -2851,7 +2868,7 @@ for source_file in sorted(p for p in source.rglob("*") if p.is_file()):
                     str(rel),
                     lineno,
                     pkg,
-                    "explicit ARM64 snapshot-incompatible package",
+                    exclusion_reason(pkg),
                 )
             )
             continue
