@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.9.sh
+# build-vanilla-arm64-release-v2.7.10.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.9
+# Version: 2.7.10
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.9"
+SCRIPT_VERSION="2.7.10"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -1706,58 +1706,100 @@ resolve_custom_kernel_release() {
 }
 
 patch_live_iso_grub_for_custom_dtb() {
-  # Patch the actual live-build GRUB template. The previous implementation
-  # wrote includes.binary/boot/grub/custom-dtb.cfg, but live-build uses:
-  #   config/bootloaders/grub-pc/grub.cfg
-  # with KERNEL_LIVE and INITRD_LIVE placeholders.
+  # The upstream ARM live-ISO GRUB template may be minified onto one physical
+  # line. Patch the complete file as text instead of requiring a line beginning
+  # with "linux".
   local live="$1"
   local dtb_name="$2"
   local grub="$live/etc/config/bootloaders/grub-pc/grub.cfg"
-  local backup tmp
+  local backup tmp log expected_entries patched_entries rc
 
   [[ -f "$grub" ]] || die "Live ISO GRUB template not found: $grub"
 
   backup="$grub.builder-backup-custom-dtb.$(date -u +%Y%m%d%H%M%S)"
-  cp -a "$grub" "$backup"
   tmp="$grub.builder-patched.$$"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-grub-dtb-patch-$(date -u +%H%M%S).log"
+  mkdir -p "$OUTPUT_DIR/logs"
+  cp -a "$grub" "$backup"
 
+  expected_entries="$(grep -oE 'initrd(efi)?[[:space:]]+INITRD_LIVE' "$grub" | wc -l | awk '{print $1}')"
+
+  {
+    printf 'GRUB template: %s\n' "$grub"
+    printf 'DTB: %s\n' "$dtb_name"
+    printf 'INITRD_LIVE entries: %s\n\n' "$expected_entries"
+    sed -n '1,240p' "$grub"
+  } >"$log"
+
+  if [[ "${expected_entries:-0}" -eq 0 ]]; then
+    fail "The live ISO GRUB template contains no INITRD_LIVE commands."
+    warn "GRUB patch log: $log"
+    return 1
+  fi
+
+  set +e
   python3 - "$grub" "$tmp" "$dtb_name" <<'PY'
+import re
 import sys
 from pathlib import Path
 
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 dtb = sys.argv[3]
+marker = "CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER"
 
-lines = src.read_text(encoding="utf-8").splitlines()
-out = []
-marker = "# CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER"
+data = src.read_text(encoding="utf-8")
 
-for line in lines:
-    # Remove previously generated directives/marker so reruns are idempotent.
-    if marker in line:
-        continue
-    if line.strip().startswith("devicetree ") and "/boot/dtbs/" in line:
-        continue
+# Remove directives from previous builder runs.
+data = re.sub(
+    r"\s*devicetree\s+/boot/dtbs/[^\s;}\n]+"
+    r"(?:\s+#\s*CUSTOM_ARM64_DTB_MANAGED_BY_BUILDER)?\s*",
+    " ",
+    data,
+)
 
-    out.append(line)
+# Insert before every live initrd placeholder, regardless of one-line or
+# multi-line formatting.
+pattern = re.compile(r"\b(initrd(?:efi)?\s+INITRD_LIVE)\b")
+replacement = (
+    f"\n    devicetree /boot/dtbs/{dtb} # {marker}\n"
+    r"    \1"
+)
+data, count = pattern.subn(replacement, data)
 
-    # Add DTB immediately after every live kernel command so every standard
-    # Vanilla menu entry uses the board DTB.
-    if line.lstrip().startswith("linux ") and "KERNEL_LIVE" in line:
-        indent = line[: len(line) - len(line.lstrip())]
-        out.append(f"{indent}devicetree /boot/dtbs/{dtb} {marker}")
+if count == 0:
+    sys.exit(20)
 
-dst.write_text("\n".join(out) + "\n", encoding="utf-8")
+dst.write_text(data, encoding="utf-8")
+print(count)
 PY
+  rc=$?
+  set -e
 
-  mv "$tmp" "$grub"
-
-  if ! grep -q "devicetree /boot/dtbs/$dtb_name" "$grub"; then
-    die "Failed to add custom DTB directive to live ISO GRUB template."
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    fail "Unable to patch live ISO GRUB template with custom DTB."
+    warn "GRUB patch log: $log"
+    return "$rc"
   fi
 
-  ok "Patched live ISO GRUB template to load DTB: $dtb_name"
+  mv "$tmp" "$grub"
+  patched_entries="$(grep -c "devicetree /boot/dtbs/$dtb_name" "$grub" || true)"
+
+  {
+    printf '\nPatched directive count: %s\n' "$patched_entries"
+    printf '\nDiff:\n'
+    diff -u "$backup" "$grub" || true
+  } >>"$log"
+
+  if [[ "${patched_entries:-0}" -ne "${expected_entries:-0}" ]]; then
+    fail "DTB directive count mismatch: expected $expected_entries, patched $patched_entries."
+    warn "GRUB patch log: $log"
+    return 1
+  fi
+
+  ok "Patched $patched_entries live ISO GRUB entries to load DTB: $dtb_name"
+  printf 'GRUB patch log:\n  %s\n' "$log" >&2
 }
 
 verify_live_iso_source_integration() {
@@ -2009,8 +2051,10 @@ echo "Custom ARM64 kernel and DTB validated successfully."
 EOF
     chmod +x "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot"
 
-    patch_live_iso_grub_for_custom_dtb "$live" "$dtb_name"
-    verify_live_iso_source_integration "$live" "$expected_kver" "$dtb_name"
+    patch_live_iso_grub_for_custom_dtb "$live" "$dtb_name" \
+      || die "Unable to integrate the custom DTB into the live ISO GRUB template."
+    verify_live_iso_source_integration "$live" "$expected_kver" "$dtb_name" \
+      || die "Live ISO custom kernel/DTB source verification failed."
   fi
 }
 
