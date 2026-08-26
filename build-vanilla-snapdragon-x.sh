@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.8.4.sh
+# build-vanilla-arm64-release-v3.0.0.sh
 #
-# Conception Vanilla ARM64 Release Builder
-# Version: 2.8.4
+# Conception Vanilla ARM64 Installer ISO Builder
+# Version: 3.0.0
 #
 # Purpose:
-#   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
-#   Vanilla ARM GitHub sources, local board-specific artifacts, and optional
+#   Deterministically build the upstream VanillaOS installer-only ARM64 UEFI ISO
+#   from Vanilla-OS/live-iso, local board-specific artifacts, and optional
 #   staged Qualcomm firmware, while preserving release provenance.
 #
 # Primary build host:
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.8.4"
+SCRIPT_VERSION="3.0.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -42,7 +42,7 @@ NORMALIZE_FIRMWARE_TO_USR_LIB="${NORMALIZE_FIRMWARE_TO_USR_LIB:-1}"
 STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
-LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:dev}"
+LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:main}"
 LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
 LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.io/vanilla-os/pico:dev ghcr.io/vanilla-os/pico:latest debian:trixie}"
 VERIFY_CUSTOM_KERNEL_IN_ISO="${VERIFY_CUSTOM_KERNEL_IN_ISO:-1}"
@@ -1083,46 +1083,36 @@ ensure_required_recipe_specific_plugins() {
 
 
 check_dependencies() {
+  # v3.0.0 builds only the upstream Vanilla-OS/live-iso tree. Vib and the
+  # separate core-image/desktop-image container builds are intentionally no
+  # longer part of this harness.
   local missing=()
-  local required=(git curl gawk find tar python3 podman docker rsync sha256sum)
-  local t
+  local required=(git curl gawk find tar python3 dpkg-deb rsync sha256sum)
+  local t runtime
+
   for t in "${required[@]}"; do
     have "$t" || missing+=("$t")
   done
-  [[ -n "$(find_iso_reader)" ]] || missing+=("isoinfo-or-xorriso")
-  have vib || missing+=("vib")
+
+  runtime="$(live_iso_runtime_cmd)"
+  have "$runtime" || missing+=("$runtime")
+  [[ -n "$(find_iso_reader)" ]] || missing+=("xorriso-or-bsdtar-or-isoinfo")
 
   if [[ "${#missing[@]}" -eq 0 ]]; then
-    ok "All required dependencies found."
+    ok "All live-ISO build dependencies found."
     return 0
   fi
 
-  printf '\n' >&2
   fail "Missing required tools: ${missing[*]}"
-  printf '\nSuggested Debian 13 packages for common tools:\n' >&2
-  printf '  sudo apt update\n' >&2
-  printf '  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 python3-yaml podman docker.io xorriso genisoimage libarchive-tools file binutils strace bsdutils util-linux acl file binutils strace jq file rsync squashfs-tools gnupg zstd\n\n' >&2
-  printf 'Additional builder requirement:\n' >&2
-  printf '  vib must be installed from Vanilla-OS/Vib release assets.\n\n' >&2
+  printf '
+Install the host-side Debian dependencies with:
+' >&2
+  printf '  apt update
+' >&2
+  printf '  apt install -y git curl ca-certificates gawk coreutils findutils tar python3 dpkg-dev podman rsync xorriso libarchive-tools genisoimage squashfs-tools jq file zstd
 
-  local choice
-  choice="$(menu "Dependency Remediation" "1" \
-    "1|Install apt-managed dependencies, then resolve Vib|Recommended on a fresh Debian 13 build host." \
-    "2|Resolve Vib only|Use this if all apt dependencies are already installed." \
-    "3|Open an interactive shell|Install or inspect dependencies manually, then resume." \
-    "4|Re-check dependencies|Use this after manual changes." \
-    "5|Abort build|Stop immediately.")"
-
-  case "$choice" in
-    1) apt_install_deps; resolve_vib ;;
-    2) resolve_vib ;;
-    3) open_shell "$WORKDIR" ;;
-    4) ;;
-    5) die "Dependency check failed." ;;
-  esac
-
-  # Recurse once after remediation. If still missing, show menu again.
-  check_dependencies
+' >&2
+  die "Dependency check failed. Install the missing tools and rerun."
 }
 
 # --------------------------- source handling ---------------------------
@@ -4894,6 +4884,69 @@ isolated to Stage 9." "1" \
 }
 
 
+prepare_live_iso_v3_tree() {
+  # Configure the upstream installer-only live-iso tree for ARM64. This keeps
+  # Vanilla's installer package-list model and avoids composing the separate
+  # core-image and desktop-image projects.
+  local live="$SOURCES_DIR/live-iso"
+  local conf="$live/etc/terraform.conf"
+  local build="$live/build.sh"
+  local pkgdir="$live/etc/config/package-lists.vanilla-installer"
+  local runtime_list="$pkgdir/zz-conception-installer-runtime.list.chroot"
+
+  [[ -d "$live/.git" ]] || die "live-iso Git checkout is missing: $live"
+  [[ -f "$conf" ]] || die "live-iso terraform.conf is missing: $conf"
+  [[ -f "$build" ]] || die "live-iso build.sh is missing: $build"
+
+  # Architecture is selected by terraform.conf and passed through auto/config.
+  sed -i 's/^ARCH=.*/ARCH="arm64"/' "$conf"
+  grep -q '^ARCH=' "$conf" || printf 'ARCH="arm64"\n' >>"$conf"
+  sed -i 's/^PACKAGE_LISTS_SUFFIX=.*/PACKAGE_LISTS_SUFFIX="vanilla-installer"/' "$conf"
+  grep -q '^PACKAGE_LISTS_SUFFIX=' "$conf" || printf 'PACKAGE_LISTS_SUFFIX="vanilla-installer"\n' >>"$conf"
+
+  # Upstream currently moves an amd64-named result regardless of BUILD_ARCH.
+  # Make the source and destination architecture-aware without changing the
+  # live-build logic itself.
+  python3 - "$build" <<'PYBUILD'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1])
+s=p.read_text()
+s=s.replace('mv $BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso "$OUTPUT_DIR/${FNAME}.iso"',
+            'mv "$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"')
+s=s.replace('mv "$BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"',
+            'mv "$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"')
+if 'tmp/amd64/live-image-amd64.hybrid.iso' in s:
+    raise SystemExit('Unable to replace upstream hard-coded amd64 ISO output path')
+p.write_text(s)
+PYBUILD
+
+  # The live medium only needs the graphical runtime required to launch the
+  # installer. The installed immutable/A-B system remains repository-driven at
+  # install time. Keep this list separate and builder-managed.
+  mkdir -p "$pkgdir"
+  cat >"$runtime_list" <<'EOF_RUNTIME'
+# Installer-session runtime only; target-system packages are downloaded by
+# Vanilla Installer from the configured Vanilla repositories.
+vanilla-installer
+gnome-shell
+gnome-session
+gnome-session-bin
+mutter
+mutter-common
+gdm3
+xwayland
+network-manager
+sudo
+EOF_RUNTIME
+
+  grep -q '^ARCH="arm64"' "$conf" || die "Unable to set ARM64 in terraform.conf"
+  grep -q '^PACKAGE_LISTS_SUFFIX="vanilla-installer"' "$conf" || die "Unable to select installer-only package lists"
+  grep -q 'live-image-\$BUILD_ARCH.hybrid.iso' "$build" || die "Unable to make build.sh output path architecture-aware"
+  [[ -s "$runtime_list" ]] || die "Installer runtime package list was not created"
+  ok "Prepared upstream live-iso tree for ARM64 installer-only build."
+}
+
 patch_live_conf() {
   local conf="$SOURCES_DIR/live-iso/etc/terraform.conf"
   [[ -f "$conf" ]] || { warn "terraform.conf not found at $conf"; return 0; }
@@ -4910,6 +4963,7 @@ build_iso() {
   local action
 
   [[ -d "$live" ]] || die "live-iso source missing."
+  prepare_live_iso_v3_tree
   patch_live_conf
   preflight_live_iso_container "$live" || die "Live ISO container preflight failed. See log above."
 
@@ -5016,10 +5070,7 @@ write_manifest() {
     printf '  "qcom_mode": "%s",\n' "${QCOM_MODE:-skip}"
     printf '  "qcom_device_path": "%s",\n' "${QCOM_DEVICE_PATH:-}"
     printf '  "repositories": {\n'
-    printf '    "core_image": "%s",\n' "$(git_commit_or_unknown "$SOURCES_DIR/core-image")"
-    printf '    "desktop_image": "%s",\n' "$(git_commit_or_unknown "$SOURCES_DIR/desktop-image")"
-    printf '    "live_iso": "%s",\n' "$(git_commit_or_unknown "$SOURCES_DIR/live-iso")"
-    printf '    "pico_image": "%s"\n' "$(git_commit_or_unknown "$SOURCES_DIR/pico-image")"
+    printf '    "live_iso": "%s"\n' "$(git_commit_or_unknown "$SOURCES_DIR/live-iso")"
     printf '  }\n'
     printf '}\n'
   } >"$json"
@@ -5150,7 +5201,7 @@ fi
 
 cat >&2 <<EOF
 
-Conception Vanilla ARM64 Release Builder
+Conception Vanilla ARM64 Installer ISO Builder
 Version: $SCRIPT_VERSION
 
 Primary host assumption:
@@ -5170,100 +5221,59 @@ Default directories:
 
 EOF
 
-stage 1 11 "Checking host dependencies."
+stage 1 9 "Checking host dependencies."
 check_dependencies
 
-stage 2 11 "Refreshing source repositories."
+stage 2 9 "Refreshing the VanillaOS installer-only live-iso repository."
 choose_repo_policy_once
 repair_source_tree_ownership_for_git
-sync_repo "pico-image" "$PICO_REPO_URL" "$PICO_BRANCH" "$SOURCES_DIR/pico-image"
-sync_repo "core-image" "$CORE_REPO_URL" "$CORE_BRANCH" "$SOURCES_DIR/core-image"
-sync_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_BRANCH" "$SOURCES_DIR/desktop-image"
 sync_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_BRANCH" "$SOURCES_DIR/live-iso"
 
-info "Ensuring Vib plugin bundles are installed for image recipes."
-ensure_vib_plugins_for_image_repos
-info "Ensuring recipe-specific Vib plugins are installed."
-ensure_required_recipe_specific_plugins
-
-info "Checking and repairing known Vib recipe YAML indentation issues."
-repair_known_vib_recipes
-
-stage 3 11 "Validating local kernel and DTB artifacts."
+stage 3 9 "Validating local kernel and DTB artifacts."
 validate_artifacts
 
-stage 4 11 "Configuring Qualcomm firmware staging."
+stage 4 9 "Configuring Qualcomm firmware staging."
 configure_qcom_firmware
 
-stage 5 11 "Staging Qualcomm firmware without modifying build host."
+stage 5 9 "Staging Qualcomm firmware without modifying the build host."
 stage_qcom_firmware
 
-stage 6 11 "Preparing build summary."
+stage 6 9 "Preparing installer-only ARM64 live-iso source tree."
+prepare_live_iso_v3_tree
 release_id="$(next_release_id)"
 release_dir_preview="$RELEASES_DIR/${BUILD_DATE}-${release_id}-${PROFILE}"
 mkdir -p "$release_dir_preview/logs"
 cat >"$release_dir_preview/BUILD-PLAN.md" <<EOF
-# Vanilla ARM64 Build Plan
+# Conception Vanilla ARM64 Installer ISO Build Plan
 
 Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+Builder version: $SCRIPT_VERSION
 Profile: $PROFILE
 Architecture: $ARCH
+Live ISO repository: $LIVE_REPO_URL ($LIVE_BRANCH)
+Live package-list mode: vanilla-installer
 Primary DTB: ${PRIMARY_DTB:-none selected}
 Artifact directory: $ARTIFACT_DIR
-Root overlay directory: $ROOT_OVERLAY_DIR
+Derived custom kernel release: $(resolve_custom_kernel_release)
 Qualcomm firmware mode: ${QCOM_MODE:-skip}
-Qualcomm device path: ${QCOM_DEVICE_PATH:-not applicable}
+Container runtime: $LIVE_ISO_CONTAINER_RUNTIME
+Requested container platform: $LIVE_ISO_CONTAINER_PLATFORM
 
-This file is written before the long-running build begins so the stamped
-release directory exists during pre-build inspection.
+The target immutable/A-B VanillaOS system is installed from configured package
+repositories. This ISO contains only the live installer environment plus the
+user-supplied ARM64 kernel, initramfs, DTB, and optional firmware.
 EOF
-info "Prepared stamped release directory before build: $release_dir_preview"
+ok "Prepared stamped release directory: $release_dir_preview"
 
-summary_choice="$(menu "Build Summary
-
-Profile:
-  $PROFILE
-
-Architecture:
-  $ARCH
-
-Primary DTB:
-  ${PRIMARY_DTB:-none selected}
-
-Custom artifact directory:
-  $ARTIFACT_DIR
-
-Root overlay directory:
-  $ROOT_OVERLAY_DIR
-
-Qualcomm firmware:
-  Mode: ${QCOM_MODE:-skip}
-  Device path: ${QCOM_DEVICE_PATH:-not applicable}
-
-Output release directory:
-  $release_dir_preview" "1" \
-  "1|Begin build|Start image and ISO creation using the settings above." \
-  "2|Open an interactive shell before build|Inspect or modify files, then exit to resume." \
-  "3|Abort build|Stop immediately.")"
-case "$summary_choice" in
-  2) open_shell "$WORKDIR" ;;
-  3) die "Build aborted by operator." ;;
-esac
-
-stage 7 11 "Staging custom kernel, DTB, firmware, and /root overlay."
+stage 7 9 "Staging custom kernel, DTB, firmware, installer runtime, and GRUB configuration."
 stage_customizations
 
-stage 8 11 "Building core and desktop images."
-build_images
-
-stage 9 11 "Building live ISO."
+stage 8 9 "Building the installer-only ARM64 live ISO."
 build_iso
 
-stage 10 11 "Archiving stamped release artifacts."
+stage 9 9 "Archiving and verifying the ISO release artifact."
 release_dir="$(archive_release "$release_id")"
-
-stage 11 11 "Verifying ISO release artifact."
 verify_iso "$release_dir"
 
 ok "Build completed."
