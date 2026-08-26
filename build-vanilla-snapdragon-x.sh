@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v6.0.1.sh
+# build-vanilla-arm64-release-v6.0.2.sh
 #
 # Conception VanillaOS ARM64 OCI-First Dev Release Builder
-# Version: 6.0.1
+# Version: 6.0.2
 #
 # Purpose:
 #   Deterministically build the upstream VanillaOS installer-only ARM64 UEFI ISO
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.0.1"
+SCRIPT_VERSION="6.0.2"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -70,7 +70,7 @@ INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
 FORCE_CLEAN_LIVE_BUILD="${FORCE_CLEAN_LIVE_BUILD:-1}"
 VERIFY_INSTALLER_RUNTIME_IN_ISO="${VERIFY_INSTALLER_RUNTIME_IN_ISO:-1}"
 
-# v6.0.1 artifact and capacity policy.
+# v6.0.2 artifact and capacity policy.
 # OCI export is intentionally optional because the local Podman image is the
 # primary build product and a large OCI archive is not required to build the ISO.
 EXPORT_OCI_ARCHIVE="${EXPORT_OCI_ARCHIVE:-0}"
@@ -4957,7 +4957,14 @@ verify_target_oci_v6() {
   verify_predicate "custom module tree exists" "test -d '/lib/modules/$kver'"
   verify_predicate "custom kernel file exists" "test -s '/boot/vmlinuz-$kver'"
   verify_predicate "root /vmlinuz resolves to custom release" "test \"\$(readlink -f /vmlinuz)\" = '/boot/vmlinuz-$kver'"
-  verify_predicate "custom initramfs file exists" "test -s '/boot/initrd.img-$kver'"
+  # VanillaOS desktop-image intentionally removes generated initramfs payloads late in
+  # the image build, then recreates the selected target as a zero-length placeholder
+  # using `touch $(readlink -f /initrd.img)`.  The installed system/ABRoot boot update
+  # later materializes the real initramfs on the boot partition.  Therefore the final
+  # OCI invariant is existence of a regular placeholder at the selected path, not a
+  # non-empty initramfs payload.  The live ISO is verified separately and must contain
+  # a real, non-empty initramfs.
+  verify_predicate "custom initramfs placeholder exists" "test -f '/boot/initrd.img-$kver'"
   verify_predicate "root /initrd.img resolves to custom release" "test \"\$(readlink -f /initrd.img)\" = '/boot/initrd.img-$kver'"
   verify_predicate "selected DTB exists" "test -s '/boot/dtbs/$dtb_name'"
   verify_predicate "kernel metadata records custom release" "test -f /etc/conception-custom-kernel-release && grep -Fx '$kver' /etc/conception-custom-kernel-release"
