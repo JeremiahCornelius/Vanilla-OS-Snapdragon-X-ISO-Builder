@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.11.sh
+# build-vanilla-arm64-release-v2.7.12.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.11
+# Version: 2.7.12
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.11"
+SCRIPT_VERSION="2.7.12"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -48,6 +48,7 @@ LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.i
 VERIFY_CUSTOM_KERNEL_IN_ISO="${VERIFY_CUSTOM_KERNEL_IN_ISO:-1}"
 INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE:-0}"
 INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE:-0}"
+PATCH_LIVE_INSTALLER_HOOK="${PATCH_LIVE_INSTALLER_HOOK:-1}"
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -2078,9 +2079,99 @@ initramfs-tools
 wireless-regdb
 rsync
 uuid-runtime
+wget
+ca-certificates
 EOF
 
   ok "Wrote custom kernel dependency package list: $list"
+}
+
+
+patch_live_installer_hook() {
+  local live="$1"
+  local hook="$live/etc/config/hooks/live/001-install-vanilla-installer.chroot"
+  local backup log albius_url installer_url
+
+  [[ "$PATCH_LIVE_INSTALLER_HOOK" == "1" ]] || return 0
+  [[ -f "$hook" ]] || { warn "Installer hook not found: $hook"; return 0; }
+
+  backup="$hook.builder-backup.$(date -u +%Y%m%d%H%M%S)"
+  log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-installer-hook-patch-$(date -u +%H%M%S).log"
+  mkdir -p "$OUTPUT_DIR/logs"
+  cp -a "$hook" "$backup"
+
+  albius_url="$(grep -Eo 'https?://[^"'"'"' ]*albius[^"'"'"' ]*\.deb' "$hook" | head -n1 || true)"
+  installer_url="$(grep -Eo 'https?://[^"'"'"' ]*vanilla-installer[^"'"'"' ]*\.deb' "$hook" | head -n1 || true)"
+
+  [[ -n "$albius_url" && -n "$installer_url" ]] || {
+    fail "Could not extract installer package URLs from $hook"
+    return 1
+  }
+
+  cat >"$hook" <<EOF
+#!/bin/sh
+set -eu
+ALBIUS_URL='$albius_url'
+INSTALLER_URL='$installer_url'
+
+apt-get update
+apt-get install -y --no-install-recommends wget ca-certificates
+
+download_deb() {
+  url="\$1"
+  output="\$2"
+  rm -f "\$output"
+  wget --https-only --tries=5 --timeout=30 -O "\$output" "\$url"
+  test -s "\$output" || { echo "ERROR: empty download: \$output" >&2; exit 91; }
+  dpkg-deb --info "\$output" >/dev/null 2>&1 || {
+    echo "ERROR: invalid Debian package: \$output" >&2
+    exit 92
+  }
+}
+
+download_deb "\$ALBIUS_URL" /tmp/albius.deb
+apt-get install -y /tmp/albius.deb
+rm -f /tmp/albius.deb
+
+download_deb "\$INSTALLER_URL" /tmp/vanilla-installer.deb
+apt-get install -y /tmp/vanilla-installer.deb
+rm -f /tmp/vanilla-installer.deb
+EOF
+
+  chmod +x "$hook"
+  {
+    printf 'Hook: %s\nBackup: %s\n' "$hook" "$backup"
+    diff -u "$backup" "$hook" || true
+  } >"$log"
+
+  ok "Hardened Vanilla installer live-build hook."
+  printf 'Installer hook patch log:\n  %s\n' "$log" >&2
+}
+
+patch_remove_blacklisted_packages_hook() {
+  local live="$1"
+  local hook="$live/etc/config/hooks/live/000-remove-blacklisted-packages.chroot"
+  [[ -f "$hook" ]] || return 0
+
+  python3 - "$hook" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+out = []
+for line in lines:
+    stripped = line.strip()
+    if "/etc/rc.local" in line and not stripped.startswith(("if ", "[ ", "test ")):
+        indent = line[:len(line)-len(line.lstrip())]
+        out.append(f"{indent}if [ -e /etc/rc.local ]; then")
+        out.append(f"{indent}  {line.lstrip()}")
+        out.append(f"{indent}fi")
+    else:
+        out.append(line)
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+  chmod +x "$hook"
 }
 
 # ------------------------- staging into repos --------------------------
@@ -2154,6 +2245,8 @@ EOF
     stage_live_custom_kernel_packages "$live"       || die "Unable to stage boot-critical custom kernel packages for live ISO."
     remove_standard_kernel_metapackages_from_live "$live"
     write_live_custom_kernel_dependency_list "$live"
+    patch_live_installer_hook "$live"       || die "Unable to harden the Vanilla installer live-build hook."
+    patch_remove_blacklisted_packages_hook "$live"
 
     for f in "${DTB_FILES[@]:-}"; do
       cp -a "$f" "$live/etc/config/includes.chroot/boot/dtbs/"
