@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.3.sh
+# build-vanilla-arm64-release-v2.7.5.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.3
+# Version: 2.7.5
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.3"
+SCRIPT_VERSION="2.7.5"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -37,7 +37,11 @@ VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
 DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD:-auto}"  # auto|1|0
 PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
 RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK:-1}"
+PRESERVE_FIRMWARE_IN_INCLUDES_RECONSTRUCTION="${PRESERVE_FIRMWARE_IN_INCLUDES_RECONSTRUCTION:-1}"
+STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
+LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
+LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:main}"
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -3205,6 +3209,26 @@ EOF
 }
 
 
+
+is_preserved_include_path() {
+  # Return true for paths that must never be excluded from includes.container
+  # reconstruction. Firmware blobs are not executable runtime components and
+  # should not be classified by a /bin/sh liveness probe. Previous versions
+  # falsely excluded Qualcomm firmware files here, defeating the build-time
+  # firmware incorporation requirement.
+  local rel="$1"
+
+  if [[ "$PRESERVE_FIRMWARE_IN_INCLUDES_RECONSTRUCTION" == "1" ]]; then
+    case "$rel" in
+      lib/firmware/*|usr/lib/firmware/*)
+        return 0
+        ;;
+    esac
+  fi
+
+  return 1
+}
+
 file_breaks_shell_when_added() {
   # Return 0 if adding exactly one file from includes.container into the pico
   # base image causes /bin/sh to become unusable. This identifies the actual
@@ -3265,6 +3289,14 @@ reconstruct_includes_container_safely() {
 
   while IFS= read -r rel; do
     total_count=$((total_count + 1))
+    if is_preserved_include_path "$rel"; then
+      printf 'PRESERVE include file without shell probe: %s\n' "$rel" >&2
+      printf 'PRESERVE %s\n' "$rel" >>"$manifest"
+      mkdir -p "$rebuilt/$(dirname "$rel")"
+      cp -a "$original/$rel" "$rebuilt/$rel"
+      continue
+    fi
+
     printf 'Testing include file: %s\n' "$rel" >&2
     printf 'TEST %s\n' "$rel" >>"$manifest"
 
@@ -3366,6 +3398,35 @@ EOF
   return 0
 }
 
+
+
+verify_preserved_firmware_after_reconstruction() {
+  local repo="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-firmware-preservation-check-$(date -u +%H%M%S).log"
+  local count=0
+
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  {
+    printf '### Firmware preservation check for %s\n' "$label"
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### repo: %s\n\n' "$repo"
+    printf 'Firmware files in includes.container:\n'
+    find "$repo/includes.container" -type f \( -path '*/lib/firmware/*' -o -path '*/usr/lib/firmware/*' \) -print | sort || true
+  } >"$log"
+
+  count="$(find "$repo/includes.container" -type f \( -path '*/lib/firmware/*' -o -path '*/usr/lib/firmware/*' \) -print 2>/dev/null | wc -l | awk '{print $1}')"
+
+  if [[ "${count:-0}" -gt 0 ]]; then
+    ok "Firmware preservation check passed for $label: $count firmware file(s) remain in includes.container."
+    printf 'Firmware preservation log:\n  %s\n' "$log" >&2
+  else
+    warn "No firmware files found in includes.container after reconstruction for $label."
+    warn "If Qualcomm firmware was expected, inspect staging and reconstruction logs."
+    warn "Firmware preservation log: $log"
+  fi
+}
 
 podman_network_args() {
   case "${PODMAN_BUILD_NETWORK,,}" in
@@ -3473,6 +3534,8 @@ podman_build_with_optional_no_cache() {
   local tag="$3"
   local network_arg
   local safe_label
+  local log
+  local status
 
   safe_label="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
   network_arg="$(podman_network_args)"
@@ -3480,17 +3543,78 @@ podman_build_with_optional_no_cache() {
   preflight_podman_build_dns "$safe_label" \
     || die "Podman build DNS preflight failed. Set PODMAN_BUILD_NETWORK=host or repair container DNS."
 
-  if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
-    if [[ -n "$network_arg" ]]; then
-      run_logged "$label" "$repo" podman image build "$network_arg" --no-cache -t "$tag" .
+  if [[ "$STREAM_LONG_COMMAND_OUTPUT" == "1" ]]; then
+    mkdir -p "$OUTPUT_DIR/logs"
+    log="$OUTPUT_DIR/logs/${BUILD_DATE}-${safe_label}-$(date -u +%H%M%S).log"
+    LAST_COMMAND_LOG="$log"
+
+    info "$label"
+    printf 'Working directory: %s\n' "$repo" >&2
+    if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
+      printf 'Command: podman image build %s --no-cache -t %s .\n' "${network_arg:-}" "$tag" >&2
     else
-      run_logged "$label" "$repo" podman image build --no-cache -t "$tag" .
+      printf 'Command: podman image build %s -t %s .\n' "${network_arg:-}" "$tag" >&2
     fi
+    printf 'Command log: %s\n' "$log" >&2
+
+    {
+      printf '### %s\n' "$label"
+      printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '### PWD: %s\n' "$repo"
+      if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
+        printf '### COMMAND: podman image build %s --no-cache -t %s .\n\n' "${network_arg:-}" "$tag"
+      else
+        printf '### COMMAND: podman image build %s -t %s .\n\n' "${network_arg:-}" "$tag"
+      fi
+    } > "$log"
+
+    set +e
+    (
+      cd "$repo" || exit 97
+      if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
+        if [[ -n "$network_arg" ]]; then
+          podman image build "$network_arg" --no-cache -t "$tag" .
+        else
+          podman image build --no-cache -t "$tag" .
+        fi
+      else
+        if [[ -n "$network_arg" ]]; then
+          podman image build "$network_arg" -t "$tag" .
+        else
+          podman image build -t "$tag" .
+        fi
+      fi
+    ) 2>&1 | tee -a "$log"
+    status=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$status" -eq 0 ]]; then
+      ok "$label completed successfully."
+      return 0
+    fi
+
+    classify_container_build_failure "$log"
+    action="$(command_failure_menu "$label" "$repo" "$log" "$status")"
+    case "$action" in
+      shell) open_shell "$repo" ;;
+      logshell) open_shell "$OUTPUT_DIR/logs" ;;
+      retry) podman_build_with_optional_no_cache "$label" "$repo" "$tag"; return $? ;;
+      diagnose) warn "Deep diagnostics are currently implemented for Vib commands only." ;;
+      abort|*) die "Build aborted after failed command. See log: $log" ;;
+    esac
   else
-    if [[ -n "$network_arg" ]]; then
-      run_logged "$label" "$repo" podman image build "$network_arg" -t "$tag" .
+    if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
+      if [[ -n "$network_arg" ]]; then
+        run_logged "$label" "$repo" podman image build "$network_arg" --no-cache -t "$tag" .
+      else
+        run_logged "$label" "$repo" podman image build --no-cache -t "$tag" .
+      fi
     else
-      run_logged "$label" "$repo" podman image build -t "$tag" .
+      if [[ -n "$network_arg" ]]; then
+        run_logged "$label" "$repo" podman image build "$network_arg" -t "$tag" .
+      else
+        run_logged "$label" "$repo" podman image build -t "$tag" .
+      fi
     fi
   fi
 }
@@ -3516,6 +3640,7 @@ build_container_image_with_context_workarounds() {
       warn "includes.container still breaks /bin/sh after quarantine."
       if reconstruct_includes_container_safely "$repo" "$safe_label"; then
         diagnose_generated_container_context "$repo" "${safe_label}-after-reconstruction"
+        verify_preserved_firmware_after_reconstruction "$repo" "${safe_label}-after-reconstruction"
         probe_includes_container_runtime_effect "$repo" "${safe_label}-after-reconstruction" \
           || die "Reconstructed includes.container still breaks /bin/sh. Review reconstruction manifest and probe logs."
       else
@@ -3524,6 +3649,7 @@ build_container_image_with_context_workarounds() {
     fi
   fi
 
+  verify_preserved_firmware_after_reconstruction "$repo" "$safe_label"
   podman_build_with_optional_no_cache "$label" "$repo" "$tag"
 }
 
@@ -3548,6 +3674,55 @@ build_images() {
   fi
 }
 
+preflight_live_iso_container() {
+  # Verify that the container used to build the live ISO can execute /bin/bash
+  # on this ARM64 build host. The observed failure:
+  #   exec container process `/bin/bash`: Exec format error
+  # means Docker selected or received a non-ARM64 image for the live ISO
+  # builder. Force --platform and fail early with a clear message.
+  local live="$1"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-iso-container-preflight-$(date -u +%H%M%S).log"
+  local status=0
+
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  info "Running live ISO container architecture preflight."
+  printf 'Live ISO container image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE" >&2
+  printf 'Live ISO container platform: %s\n' "$LIVE_ISO_CONTAINER_PLATFORM" >&2
+  printf 'Preflight log: %s\n' "$log" >&2
+
+  {
+    printf '### Live ISO container preflight\n'
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### host uname: %s\n' "$(uname -m)"
+    printf '### image: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf '### platform: %s\n\n' "$LIVE_ISO_CONTAINER_PLATFORM"
+
+    printf '## docker version\n'
+    docker version 2>&1 || true
+    printf '\n'
+
+    printf '## image manifest/platform metadata if available\n'
+    docker buildx imagetools inspect "$LIVE_ISO_CONTAINER_IMAGE" 2>&1 || true
+    printf '\n'
+
+    printf '## execution probe\n'
+    docker run --rm --platform "$LIVE_ISO_CONTAINER_PLATFORM" "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -lc 'uname -m; echo LIVE_ISO_CONTAINER_EXEC_OK'
+  } >"$log" 2>&1 || status=$?
+
+  if [[ "$status" -ne 0 ]]; then
+    fail "Live ISO container preflight failed."
+    warn "This predicts the Stage 9 /bin/bash Exec format error."
+    warn "Log: $log"
+    print_failure_tail "$log"
+    return "$status"
+  fi
+
+  ok "Live ISO container preflight passed."
+  return 0
+}
+
+
 patch_live_conf() {
   local conf="$SOURCES_DIR/live-iso/etc/terraform.conf"
   [[ -f "$conf" ]] || { warn "terraform.conf not found at $conf"; return 0; }
@@ -3560,8 +3735,11 @@ build_iso() {
   local live="$SOURCES_DIR/live-iso"
   [[ -d "$live" ]] || die "live-iso source missing."
   patch_live_conf
+  preflight_live_iso_container "$live"
   # Use bash -lc so the input redirection into build.sh is logged and failures are diagnosed.
-  run_logged "Build live ISO" "$live" bash -lc 'docker run --privileged -i -v /proc:/proc -v "$PWD":/working_dir -w /working_dir ghcr.io/vanilla-os/pico:main /bin/bash -s etc/terraform.conf < build.sh'
+  # Force the platform because Docker may otherwise pull/run the wrong manifest
+  # for the live ISO helper image on Apple Silicon / ARM64 VMs.
+  run_logged "Build live ISO" "$live" bash -lc 'docker run --privileged --platform "$LIVE_ISO_CONTAINER_PLATFORM" -i -v /proc:/proc -v "$PWD":/working_dir -w /working_dir "$LIVE_ISO_CONTAINER_IMAGE" /bin/bash -s etc/terraform.conf < build.sh'
 }
 # ---------------------------- release ---------------------------------
 
