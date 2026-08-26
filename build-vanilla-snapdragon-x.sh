@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.0.sh
+# build-vanilla-arm64-release-v2.5.2.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.0
+# Version: 2.5.2
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.2"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -1405,6 +1405,93 @@ EOF
 
 # ------------------------------- build --------------------------------
 
+repair_known_vib_recipe_yaml() {
+  # Some Vanilla ARM source snapshots have contained malformed YAML indentation
+  # in recipe.yml. Vib can exit status 1 with no useful stdout/stderr when the
+  # recipe cannot be parsed, which makes this failure difficult to diagnose.
+  #
+  # This repair pass is intentionally narrow and idempotent:
+  #   - it creates a timestamped backup before changing recipe.yml
+  #   - it only corrects known malformed indentation patterns observed in
+  #     Vanilla Core's recipe.yml
+  #   - it records a unified diff in output/logs
+  #
+  # Known corrections observed during HP Omnibook 5 ARM64 builder testing:
+  #   "   - mandb -c"        -> "    - mandb -c"
+  #   "   - name: runroot"   -> "  - name: runroot"
+  #   "- name: cleanup2"     -> "  - name: cleanup2"
+  local repo="$1"
+  local repo_name recipe backup diff_log tmp
+  local bad_re
+
+  repo_name="$(basename "$repo")"
+  recipe="$repo/recipe.yml"
+  [[ -f "$recipe" ]] || return 0
+
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  # The expression intentionally matches only known-bad lines. It does not try
+  # to become a generic YAML formatter.
+  bad_re='^[[:space:]]{3}- mandb -c$|^[[:space:]]{3}- name: runroot$|^- name: cleanup2$'
+
+  if grep -Eq "$bad_re" "$recipe"; then
+    backup="$repo/recipe.yml.builder-backup.$(date -u +%Y%m%d%H%M%S)"
+    diff_log="$OUTPUT_DIR/logs/${BUILD_DATE}-${repo_name}-recipe-yaml-repair-$(date -u +%H%M%S).diff"
+    tmp="$repo/recipe.yml.builder-repaired.$$"
+
+    warn "Known malformed YAML indentation detected in $repo_name/recipe.yml."
+    warn "Creating backup before repair: $backup"
+    cp -a "$recipe" "$backup"
+
+    # Use Python for exact line-oriented repair while preserving all other text.
+    python3 - "$recipe" "$tmp" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+changed = False
+out = []
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        stripped = line.rstrip("\n")
+        if stripped == "   - mandb -c":
+            line = "    - mandb -c\n"
+            changed = True
+        elif stripped == "   - name: runroot":
+            line = "  - name: runroot\n"
+            changed = True
+        elif stripped == "- name: cleanup2":
+            line = "  - name: cleanup2\n"
+            changed = True
+        out.append(line)
+with open(dst, "w", encoding="utf-8") as f:
+    f.writelines(out)
+sys.exit(0 if changed else 2)
+PY
+
+    mv "$tmp" "$recipe"
+    diff -u "$backup" "$recipe" >"$diff_log" || true
+    ok "Repaired known YAML indentation issue in $repo_name/recipe.yml."
+    printf 'Recipe repair diff:\n  %s\n' "$diff_log" >&2
+  fi
+
+  # Lightweight structural check for the exact bad patterns after repair.
+  if grep -Eq "$bad_re" "$recipe"; then
+    fail "recipe.yml still contains known malformed YAML indentation after repair attempt: $recipe"
+    grep -nE "$bad_re" "$recipe" >&2 || true
+    return 1
+  fi
+
+  return 0
+}
+
+repair_known_vib_recipes() {
+  local repo
+  for repo in "$SOURCES_DIR/core-image" "$SOURCES_DIR/desktop-image"; do
+    [[ -d "$repo" ]] || continue
+    repair_known_vib_recipe_yaml "$repo"
+  done
+}
+
+
 vib_deep_diagnostics() {
   local workdir="$1"
   local label="$2"
@@ -1530,12 +1617,21 @@ vib_preflight() {
     pwd
     printf '\nrecipe.yml:\n'
     ls -l recipe.yml || true
+    printf '\nrecipe.yml focused excerpt around known fragile sections:\n'
+    grep -nE 'mandb|runroot|fsguard|cleanup2' recipe.yml 2>/dev/null || true
     printf '\nContainerfile / Dockerfile:\n'
     ls -l Containerfile Dockerfile 2>/dev/null || true
     printf '\nplugins directory:\n'
     find plugins -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null | sort || true
     printf '\nTop-level files:\n'
     find . -maxdepth 2 -type f | sort | sed -n '1,200p' || true
+
+    printf '\n## Known YAML indentation issue check\n'
+    if grep -nE '^[[:space:]]{3}- mandb -c$|^[[:space:]]{3}- name: runroot$|^- name: cleanup2$' recipe.yml 2>/dev/null; then
+      printf 'Known malformed recipe.yml indentation remains. Builder repair did not run or did not succeed.\n'
+    else
+      printf 'No known malformed indentation patterns detected.\n'
+    fi
 
     printf '\n## Vib dry diagnostics\n'
     printf 'Attempting: vib build --help\n'
@@ -1834,6 +1930,9 @@ sync_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_BRANCH" "$SOURCES_DIR/live-iso"
 
 info "Ensuring Vib plugin bundles are installed for image recipes."
 ensure_vib_plugins_for_image_repos
+
+info "Checking and repairing known Vib recipe YAML indentation issues."
+repair_known_vib_recipes
 
 stage 3 11 "Validating local kernel and DTB artifacts."
 validate_artifacts
