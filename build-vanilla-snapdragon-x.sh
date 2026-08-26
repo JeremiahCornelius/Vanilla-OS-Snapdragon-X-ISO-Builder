@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 8.0.1
+# Version 8.0.2
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,23 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.2 corrections after the v8.0.1 late-stage remaster field test:
+#   - Fixes an unquoted installer-wrapper heredoc regression. Runtime wrapper
+#     variables such as $host, $port, $repository, $tag, $expected_digest,
+#     $logical_image, and $recipe were expanded by the builder itself while
+#     set -u was active, causing "host: unbound variable" before the live
+#     filesystem could be repacked.
+#   - Generates the wrapper in two deterministic sections: a build-time header
+#     containing shell-escaped resolved values, followed by a single-quoted
+#     runtime body whose variable references cannot be expanded by the builder.
+#   - Adds a regression harness that invokes the complete installer-overlay
+#     generator with no outer host variable defined, validates the generated
+#     wrapper and registries.conf, and executes the wrapper in registry mode
+#     through a controlled fake vanilla-installer command.
+#   - Preserves all v8.0.1 logical-to-physical registry remapping, insecure
+#     loopback HTTP behavior, complete OCI bridge self-test, profile support,
+#     target-image delivery, and v7 live-boot functionality.
 #
 # v8.0.1 corrections after the first offline-installer field test:
 #   - Separates the logical image name consumed by Albius from the physical
@@ -55,7 +72,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.1"
+SCRIPT_VERSION="8.0.2"
 SCRIPT_NAME="$(basename "$0")"
 
 # Record whether profile-resolvable values were explicitly supplied through the
@@ -616,7 +633,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.1-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.2-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -4817,7 +4834,180 @@ install_profile_aware_installer_overlay() {
 
   write_local_oci_registry_server "$registry_server"
 
-  cat > "$wrapper" <<EOF_INSTALLER_WRAPPER
+  # Write only resolved constants through an expanding heredoc. All dynamic
+  # runtime code is appended through a single-quoted heredoc below, preventing
+  # the builder's set -u environment from expanding wrapper-local variables.
+  cat > "$wrapper" <<EOF_INSTALLER_WRAPPER_HEADER
+#!/usr/bin/env bash
+set -Eeuo pipefail
+profile=$(printf '%q' "$PROFILE")
+delivery=$(printf '%q' "$DELIVERY_MODE")
+layout_path=$(printf '%q' "$ISO_IMAGE_LAYOUT_PATH")
+tag=$(printf '%q' "$EMBEDDED_IMAGE_TAG")
+repository=$(printf '%q' "$LOCAL_REGISTRY_NAMESPACE/$PROFILE")
+logical_image=$(printf '%q' "$LOCAL_INSTALL_IMAGE_REF")
+expected_digest=$(printf '%q' "$TARGET_IMAGE_MANIFEST_DIGEST")
+host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
+port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
+recipe=$(printf '%q' "/etc/vanilla-installer/profiles/$PROFILE/recipe.json")
+server_pid=""
+EOF_INSTALLER_WRAPPER_HEADER
+
+  cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_RUNTIME'
+
+cleanup_registry() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_registry EXIT INT TERM
+
+if [[ "$delivery" == "iso-oci" ]]; then
+  medium=""
+  for candidate in /run/live/medium /cdrom /run/media/*/* /media/*/*; do
+    [[ -d "$candidate" ]] || continue
+    if [[ -s "$candidate/${layout_path#/}/oci-layout" ]]; then
+      medium="$candidate"
+      break
+    fi
+  done
+  [[ -n "$medium" ]] || {
+    echo "Unable to locate embedded target OCI layout: $layout_path" >&2
+    exit 70
+  }
+  layout="$medium/${layout_path#/}"
+
+  python3 /usr/local/libexec/conception-oci-registry.py \
+    --layout "$layout" --tag "$tag" --repository "$repository" \
+    --host "$host" --port "$port" \
+    > /tmp/conception-local-registry.log 2>&1 &
+  server_pid=$!
+
+  python3 - "$host" "$port" "$repository" "$tag" "$expected_digest" <<'PY_VERIFY_REGISTRY'
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import time
+import urllib.request
+
+host, port, repository, tag, expected_digest = sys.argv[1:]
+base = f"http://{host}:{port}"
+seen_manifests: set[str] = set()
+seen_blobs: set[str] = set()
+
+accept = ", ".join(
+    [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+)
+
+def request(path: str):
+    req = urllib.request.Request(base + path, method="GET")
+    req.add_header("Accept", accept)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.headers, response.read()
+
+for attempt in range(100):
+    try:
+        request("/v2/")
+        break
+    except Exception:
+        if attempt == 99:
+            raise SystemExit("local OCI registry bridge did not become ready")
+        time.sleep(0.1)
+
+def verify_digest(raw: bytes, expected: str, context: str) -> None:
+    algorithm, encoded = expected.split(":", 1)
+    if algorithm != "sha256":
+        raise SystemExit(f"{context}: unsupported digest algorithm {algorithm}")
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != encoded:
+        raise SystemExit(
+            f"{context}: expected={expected} actual=sha256:{actual}"
+        )
+
+def fetch_blob(descriptor: dict) -> None:
+    digest = descriptor["digest"]
+    if digest in seen_blobs:
+        return
+    _headers, raw = request(f"/v2/{repository}/blobs/{digest}")
+    verify_digest(raw, digest, f"blob {digest}")
+    expected_size = descriptor.get("size")
+    if expected_size is not None and len(raw) != expected_size:
+        raise SystemExit(
+            f"blob {digest}: expected size {expected_size}, received {len(raw)}"
+        )
+    seen_blobs.add(digest)
+
+def fetch_manifest(reference: str, expected: str | None = None) -> str:
+    headers, raw = request(f"/v2/{repository}/manifests/{reference}")
+    digest = headers.get("Docker-Content-Digest")
+    if not digest:
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    verify_digest(raw, digest, f"manifest {reference}")
+    if expected and digest != expected:
+        raise SystemExit(
+            f"manifest {reference}: expected {expected}, received {digest}"
+        )
+    if digest in seen_manifests:
+        return digest
+    seen_manifests.add(digest)
+
+    document = json.loads(raw)
+    media_type = document.get("mediaType", headers.get_content_type())
+    if "manifest.list" in media_type or media_type.endswith("image.index.v1+json"):
+        descriptors = document.get("manifests", [])
+        if not descriptors:
+            raise SystemExit(f"manifest index {digest} has no child manifests")
+        for descriptor in descriptors:
+            child = descriptor["digest"]
+            fetch_manifest(child, child)
+        return digest
+
+    config = document.get("config")
+    layers = document.get("layers", [])
+    if not config or not layers:
+        raise SystemExit(f"image manifest {digest} lacks config or layers")
+    fetch_blob(config)
+    for descriptor in layers:
+        fetch_blob(descriptor)
+    return digest
+
+actual_digest = fetch_manifest(tag, expected_digest)
+summary = {
+    "physical_endpoint": base,
+    "repository": repository,
+    "tag": tag,
+    "expected_digest": expected_digest,
+    "actual_digest": actual_digest,
+    "manifests_verified": len(seen_manifests),
+    "blobs_verified": len(seen_blobs),
+}
+with open(
+    "/tmp/conception-local-registry-selftest.json", "w", encoding="utf-8"
+) as handle:
+    json.dump(summary, handle, indent=2)
+    handle.write("\n")
+
+print(
+    f"Local OCI bridge verified: manifests={len(seen_manifests)} "
+    f"blobs={len(seen_blobs)} digest={actual_digest}"
+)
+PY_VERIFY_REGISTRY
+
+  printf 'Installer logical image: %s\n' "$logical_image"
+  printf 'Physical loopback endpoint: http://%s:%s/%s\n' \
+    "$host" "$port" "$repository"
+fi
+
+export VANILLA_CUSTOM_RECIPE="$recipe"
+EOF_INSTALLER_WRAPPER_RUNTIME
 #!/usr/bin/env bash
 set -Eeuo pipefail
 profile=$(printf '%q' "$PROFILE")
@@ -4983,7 +5173,6 @@ PY_VERIFY_REGISTRY
 fi
 
 export VANILLA_CUSTOM_RECIPE="$recipe"
-EOF_INSTALLER_WRAPPER
   if [[ "$INSTALLER_IGNORE_CPU" == "1" ]]; then
     printf 'export IGNORE_CPU=1\n' >> "$wrapper"
   fi
