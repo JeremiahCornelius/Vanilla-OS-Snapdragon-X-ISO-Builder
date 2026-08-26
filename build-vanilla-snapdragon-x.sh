@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.4.9.sh
+# build-vanilla-arm64-release-v2.5.0.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.4.9
+# Version: 2.5.0
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.9"
+SCRIPT_VERSION="2.5.0"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -80,6 +80,21 @@ print_failure_tail() {
   fi
 }
 
+log_has_only_header() {
+  # Return true when a command log contains only the wrapper header and no
+  # substantive child-process output. This is especially useful for Vib, which
+  # can fail before emitting useful text to stdout/stderr.
+  local log="$1"
+  [[ -f "$log" ]] || return 1
+
+  # Remove blank lines and wrapper header lines. If nothing remains, the child
+  # command produced no useful output.
+  local payload
+  payload="$(sed '/^[[:space:]]*$/d; /^### /d' "$log" 2>/dev/null || true)"
+  [[ -z "$payload" ]]
+}
+
+
 command_failure_menu() {
   # Print diagnostics for a failed subprocess and return the operator's desired
   # next action on stdout. This function must return status 0 so that callers
@@ -101,7 +116,7 @@ command_failure_menu() {
 
   choice="$(menu "Build Command Failure
 
-The previous command failed. You can inspect the working directory and log before deciding whether to abort or retry." "1" \
+The previous command failed. If the command produced no useful output, the builder may already have generated a deep diagnostic log. You can inspect the working directory and logs before deciding whether to abort or retry." "1" \
     "1|Open an interactive shell in the failing working directory [RECOMMENDED]|Inspect recipe files, generated hooks, container state, and logs. Type 'exit' to return." \
     "2|Retry the failed command|Run the same command again after any manual corrections." \
     "3|Run deep Vib diagnostics, then return to this menu|Use this when Vib exits with little or no output. Captures binary, plugin, recipe, runtime, and strace diagnostics." \
@@ -177,6 +192,14 @@ run_logged() {
     if [[ "$status" -eq 0 ]]; then
       ok "$label completed successfully."
       return 0
+    fi
+
+    if [[ "$label" == *"Vib"* || "$*" == *"vib"* ]]; then
+      if log_has_only_header "$log"; then
+        warn "The Vib command failed but produced no stdout/stderr beyond the command header."
+        warn "Running deep Vib diagnostics automatically before presenting the failure menu."
+        vib_deep_diagnostics "$workdir" "$safe"
+      fi
     fi
 
     action="$(command_failure_menu "$label" "$workdir" "$log" "$status")"
