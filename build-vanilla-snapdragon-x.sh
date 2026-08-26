@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.5.sh
+# build-vanilla-arm64-release-v2.7.6.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.5
+# Version: 2.7.6
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.5"
+SCRIPT_VERSION="2.7.6"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -38,6 +38,7 @@ DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CON
 PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
 RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK:-1}"
 PRESERVE_FIRMWARE_IN_INCLUDES_RECONSTRUCTION="${PRESERVE_FIRMWARE_IN_INCLUDES_RECONSTRUCTION:-1}"
+NORMALIZE_FIRMWARE_TO_USR_LIB="${NORMALIZE_FIRMWARE_TO_USR_LIB:-1}"
 STREAM_LONG_COMMAND_OUTPUT="${STREAM_LONG_COMMAND_OUTPUT:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
 LIVE_ISO_CONTAINER_PLATFORM="${LIVE_ISO_CONTAINER_PLATFORM:-linux/arm64}"
@@ -3041,14 +3042,19 @@ diagnose_generated_container_context() {
     ls -l Containerfile Dockerfile 2>/dev/null || true
     printf '\n'
 
-    printf '## High-risk includes.container files\n'
-    find includes.container -maxdepth 4 \( \
+    printf '## High-risk includes.container files and directories\n'
+    printf 'Top-level lib state in build context:\n'
+    ls -ld includes.container/lib includes.container/usr/lib includes.container/usr/lib/firmware 2>/dev/null || true
+    printf '\n'
+    find includes.container -maxdepth 5 \( \
       -path '*/ld.so.preload' -o \
       -path '*/ld-linux*' -o \
       -path '*/ld.so*' -o \
       -path '*/libc.so*' -o \
-      -path '*/libpthread.so*' \
-    \) -print -exec ls -l {} \; 2>/dev/null || true
+      -path '*/libpthread.so*' -o \
+      -path '*/lib/firmware*' -o \
+      -path '*/usr/lib/firmware*' \
+    \) -print -exec ls -ld {} \; 2>/dev/null || true
     printf '\n'
 
     if [[ -f includes.container/ld.so.preload ]]; then
@@ -3210,6 +3216,60 @@ EOF
 
 
 
+
+normalize_firmware_paths_for_usrmerge() {
+  # Debian/Pico images are usr-merged: /lib is normally a symlink into /usr/lib.
+  # Adding an includes.container top-level lib/ tree can poison the container
+  # build context by replacing or masking that symlink during ADD includes.container /,
+  # causing the dynamic loader path needed by /bin/sh to become unavailable.
+  #
+  # Therefore firmware staged as:
+  #   includes.container/lib/firmware/...
+  # is moved before probe/build to:
+  #   includes.container/usr/lib/firmware/...
+  #
+  # The resulting installed path is still valid on usr-merged systems, where
+  # /lib/firmware and /usr/lib/firmware are the same logical firmware tree.
+  local repo="$1"
+  local label="$2"
+  local src_fw="$repo/includes.container/lib/firmware"
+  local dst_fw="$repo/includes.container/usr/lib/firmware"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-firmware-usrmerge-normalization-$(date -u +%H%M%S).log"
+
+  [[ "$NORMALIZE_FIRMWARE_TO_USR_LIB" == "1" ]] || return 0
+  [[ -d "$src_fw" ]] || return 0
+
+  mkdir -p "$OUTPUT_DIR/logs" "$dst_fw"
+
+  {
+    printf '### Firmware usrmerge normalization\n'
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### repo: %s\n' "$repo"
+    printf 'Moving firmware from:\n  %s\n' "$src_fw"
+    printf 'to:\n  %s\n\n' "$dst_fw"
+    printf 'Before:\n'
+    find "$src_fw" -type f -print | sort || true
+  } >"$log"
+
+  # Copy/merge, then remove only the firmware subtree. If lib/ becomes empty,
+  # remove it so ADD includes.container / cannot create or mask top-level /lib.
+  rsync -a "$src_fw"/ "$dst_fw"/
+  rm -rf "$src_fw"
+
+  # Remove empty parent lib directory only if empty.
+  rmdir "$repo/includes.container/lib" 2>/dev/null || true
+
+  {
+    printf '\nAfter destination:\n'
+    find "$dst_fw" -type f -print | sort || true
+    printf '\nTop-level lib state:\n'
+    ls -ld "$repo/includes.container/lib" 2>/dev/null || printf 'includes.container/lib absent\n'
+  } >>"$log"
+
+  warn "Normalized firmware to usr-merged path to avoid top-level /lib ADD breakage."
+  warn "Firmware normalization log: $log"
+}
+
 is_preserved_include_path() {
   # Return true for paths that must never be excluded from includes.container
   # reconstruction. Firmware blobs are not executable runtime components and
@@ -3282,6 +3342,7 @@ reconstruct_includes_container_safely() {
   mkdir -p "$rebuilt" "$OUTPUT_DIR/logs"
   : > "$manifest"
 
+  normalize_firmware_paths_for_usrmerge "$repo" "$label"
   warn "Reconstructing includes.container by probing each file."
   warn "This is slower, but it will identify the file(s) that break /bin/sh."
   printf 'Original includes.container: %s\n' "$original" >>"$manifest"
@@ -3629,6 +3690,7 @@ build_container_image_with_context_workarounds() {
 
   patch_known_debian_changelog_dates "$repo" "$safe_label"
   patch_known_unavailable_packages "$repo" "$safe_label"
+  normalize_firmware_paths_for_usrmerge "$repo" "$safe_label"
   diagnose_generated_container_context "$repo" "$safe_label"
   maybe_disable_ld_so_preload_for_container_build "$repo"
 
