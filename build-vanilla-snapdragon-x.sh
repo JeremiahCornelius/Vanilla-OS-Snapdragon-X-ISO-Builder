@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.4.sh
+# build-vanilla-arm64-release-v2.6.5.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.4
+# Version: 2.6.5
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,12 +29,13 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.4"
+SCRIPT_VERSION="2.6.5"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
 VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
 DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD:-auto}"  # auto|1|0
+PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -2565,14 +2566,140 @@ EOF
   fi
 }
 
+
+probe_includes_container_runtime_effect() {
+  # Build a tiny throwaway image that does only:
+  #   FROM ghcr.io/vanilla-os/pico:dev
+  #   RUN /bin/sh -c 'echo before'
+  #   ADD includes.container /
+  #   RUN inspect high-risk files and execute /bin/sh again
+  #
+  # This isolates whether includes.container itself makes /bin/sh unusable.
+  # It gives a much clearer diagnostic than the full generated Containerfile.
+  local repo="$1"
+  local label="$2"
+  local probe_dir="$TMP_DIR/container-context-probe-${label}-$$"
+  local probe_log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-includes-container-runtime-probe-$(date -u +%H%M%S).log"
+  local status
+
+  mkdir -p "$probe_dir" "$OUTPUT_DIR/logs"
+  cp -a "$repo/includes.container" "$probe_dir/includes.container"
+
+  cat > "$probe_dir/Containerfile" <<'EOF'
+FROM ghcr.io/vanilla-os/pico:dev
+RUN /bin/sh -c 'echo PRE_ADD_SHELL_OK'
+ADD includes.container /
+RUN echo POST_ADD_INSPECTION_START ; \
+    ls -la /bin/sh /etc/ld.so.preload /ld.so.preload /ld.so.preload.builder-disabled /syscall_config.yml /vanilla.key 2>/dev/null || true ; \
+    if [ -f /etc/ld.so.preload ]; then echo ETC_LD_SO_PRELOAD_CONTENT ; cat /etc/ld.so.preload ; fi ; \
+    if [ -f /ld.so.preload ]; then echo ROOT_LD_SO_PRELOAD_CONTENT ; cat /ld.so.preload ; fi ; \
+    echo POST_ADD_SHELL_TEST ; \
+    /bin/sh -c 'echo POST_ADD_SHELL_OK'
+EOF
+
+  info "Running includes.container runtime-effect probe for $label"
+  printf 'Probe log: %s\n' "$probe_log" >&2
+
+  set +e
+  podman image build --no-cache -t "local/${label}-includes-probe:$BUILD_DATE" "$probe_dir" >"$probe_log" 2>&1
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    fail "includes.container runtime-effect probe failed for $label."
+    warn "This confirms that files added by includes.container break /bin/sh before the full build proceeds."
+    print_failure_tail "$probe_log"
+    return "$status"
+  fi
+
+  ok "includes.container runtime-effect probe passed for $label."
+  return 0
+}
+
+quarantine_runtime_breaking_includes_files() {
+  # Conservative remediation for the observed failure. If the includes probe
+  # fails even after ld.so.preload is disabled, move remaining known dynamic
+  # runtime instrumentation files out of includes.container before podman build.
+  #
+  # The ARM build can still proceed; the quarantine note records what was moved.
+  local repo="$1"
+  local quarantine_dir="$repo/includes.container.builder-quarantine"
+  local note="$repo/includes.container.builder-quarantine/README.txt"
+  local moved=0
+  local f rel
+
+  mkdir -p "$quarantine_dir"
+
+  for rel in \
+    "ld.so.preload" \
+    "etc/ld.so.preload" \
+    "syscall_config.yml"
+  do
+    f="$repo/includes.container/$rel"
+    if [[ -e "$f" ]]; then
+      mkdir -p "$quarantine_dir/$(dirname "$rel")"
+      mv "$f" "$quarantine_dir/$rel"
+      moved=$((moved + 1))
+      warn "Quarantined runtime-risk include: includes.container/$rel"
+    fi
+  done
+
+  if [[ "$moved" -gt 0 ]]; then
+    cat > "$note" <<EOF
+This directory was created by $SCRIPT_NAME $SCRIPT_VERSION.
+
+The files here were moved out of includes.container because the generated
+container build failed immediately after:
+
+  ADD includes.container /
+
+with:
+
+  exec container process (missing dynamic library?) /bin/sh: No such file or directory
+
+This indicates dynamic-loader or runtime-instrumentation breakage in the build
+stage before any package commands can run.
+
+Moved files should be reviewed before release. If they are required in the final
+image, they must be restored at a later safe stage, after the libraries they
+reference exist.
+EOF
+  fi
+
+  return 0
+}
+
+podman_build_with_optional_no_cache() {
+  local label="$1"
+  local repo="$2"
+  local tag="$3"
+  if [[ "$PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE" == "1" ]]; then
+    run_logged "$label" "$repo" podman image build --no-cache -t "$tag" .
+  else
+    run_logged "$label" "$repo" podman image build -t "$tag" .
+  fi
+}
+
 build_container_image_with_context_workarounds() {
   local label="$1"
   local repo="$2"
   local tag="$3"
+  local safe_label
 
-  diagnose_generated_container_context "$repo" "$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-')"
+  safe_label="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
+
+  diagnose_generated_container_context "$repo" "$safe_label"
   maybe_disable_ld_so_preload_for_container_build "$repo"
-  run_logged "$label" "$repo" podman image build -t "$tag" .
+
+  if ! probe_includes_container_runtime_effect "$repo" "$safe_label"; then
+    warn "Attempting conservative quarantine of remaining runtime-risk include files."
+    quarantine_runtime_breaking_includes_files "$repo"
+    diagnose_generated_container_context "$repo" "${safe_label}-after-quarantine"
+    probe_includes_container_runtime_effect "$repo" "${safe_label}-after-quarantine" \
+      || die "includes.container still breaks /bin/sh after quarantine. Review probe logs before continuing."
+  fi
+
+  podman_build_with_optional_no_cache "$label" "$repo" "$tag"
 }
 
 
