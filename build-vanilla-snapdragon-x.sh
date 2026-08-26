@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.7.sh
+# build-vanilla-arm64-release-v2.5.8.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.7
+# Version: 2.5.8
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,8 +29,9 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.7"
+SCRIPT_VERSION="2.5.8"
 SCRIPT_NAME="$(basename "$0")"
+VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
 
@@ -1630,6 +1631,108 @@ repair_known_vib_recipes() {
     [[ -d "$repo" ]] || continue
     repair_known_vib_recipe_yaml "$repo"
   done
+}
+
+
+recipe_declared_vibversion() {
+  # Extract the recipe's declared Vib version. The core-image recipe currently
+  # declares a `vibversion:` value. That value is useful provenance and a
+  # compatibility hint, but it should not be allowed to fail opaquely if the
+  # installed Vib binary itself cannot report a version.
+  local workdir="$1"
+  awk -F: '
+    /^[[:space:]]*vibversion[[:space:]]*:/ {
+      v=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      gsub(/^["'\'']|["'\'']$/, "", v)
+      print v
+      exit
+    }
+  ' "$workdir/recipe.yml" 2>/dev/null || true
+}
+
+installed_vib_version_string() {
+  # Vib has returned non-zero for --help/--version in some downloaded builds.
+  # Never let that behavior trigger set -e or pipefail. Return a semantic
+  # version-looking token if one appears, otherwise return empty.
+  local out
+  set +e
+  out="$(vib --version 2>&1)"
+  set -e
+  printf '%s\n' "$out" | awk '
+    {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^[0-9]+\.[0-9]+(\.[0-9]+)?/) {
+          print $i
+          exit
+        }
+      }
+    }
+  ' || true
+}
+
+validate_vib_version_matches_recipe() {
+  # Compatibility policy:
+  #   warn   = default. Record mismatch/unknown version, continue build.
+  #   strict = fail preflight on mismatch or unknown installed version.
+  #   ignore = record values but never warn/fail.
+  #
+  # Reason: upstream ARM recipes may declare older vibversion values while the
+  # latest downloaded Vib binary may not report a clean version string. Treating
+  # this as a hard failure blocked Stage 8 without proving it was the real build
+  # cause.
+  local workdir="$1"
+  local log="$2"
+  local declared installed policy
+
+  declared="$(recipe_declared_vibversion "$workdir")"
+  installed="$(installed_vib_version_string)"
+  policy="${VIB_VERSION_POLICY,,}"
+
+  {
+    printf '\n## Vib version compatibility\n'
+    printf 'policy: %s\n' "$policy"
+    printf 'recipe vibversion: %s\n' "${declared:-not-declared}"
+    printf 'installed vib version: %s\n' "${installed:-unknown}"
+    printf 'raw vib --version output:\n'
+    set +e
+    vib --version 2>&1
+    printf 'raw vib --version exit status: %s\n' "$?"
+    set -e
+  } >>"$log" 2>&1
+
+  case "$policy" in
+    ignore)
+      printf 'PASS vib-version-compatibility: ignored by policy\n' >>"$log"
+      return 0
+      ;;
+    warn|"")
+      if [[ -n "$declared" && -n "$installed" && "$declared" != "$installed" ]]; then
+        printf 'WARN vib-version-compatibility: recipe declares %s but installed vib appears to be %s; continuing by default.\n' "$declared" "$installed" >>"$log"
+      elif [[ -n "$declared" && -z "$installed" ]]; then
+        printf 'WARN vib-version-compatibility: recipe declares %s but installed vib version could not be parsed; continuing by default.\n' "$declared" >>"$log"
+      else
+        printf 'PASS vib-version-compatibility-or-warning-policy\n' >>"$log"
+      fi
+      return 0
+      ;;
+    strict)
+      if [[ -n "$declared" && -z "$installed" ]]; then
+        printf 'FAIL vib-version-compatibility: strict mode cannot verify installed Vib version.\n' >>"$log"
+        return 1
+      fi
+      if [[ -n "$declared" && -n "$installed" && "$declared" != "$installed" ]]; then
+        printf 'FAIL vib-version-compatibility: recipe declares %s but installed vib appears to be %s.\n' "$declared" "$installed" >>"$log"
+        return 1
+      fi
+      printf 'PASS vib-version-compatibility: strict mode satisfied\n' >>"$log"
+      return 0
+      ;;
+    *)
+      printf 'WARN vib-version-compatibility: unknown VIB_VERSION_POLICY=%s; treating as warn.\n' "$policy" >>"$log"
+      return 0
+      ;;
+  esac
 }
 
 
