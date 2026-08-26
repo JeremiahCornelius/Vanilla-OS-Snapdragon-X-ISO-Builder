@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.16.sh
+# build-vanilla-arm64-release-v2.7.17.sh
 #
 # Conception Vanilla ARM64 Release Builder
-# Version: 2.7.16
+# Version: 2.7.17
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.16"
+SCRIPT_VERSION="2.7.17"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -1718,7 +1718,7 @@ patch_live_iso_grub_for_custom_dtb() {
   # The upstream file may be minified onto one physical line, so line-oriented
   # sed insertion is deliberately avoided.
   #
-  # Boot strategy in v2.7.16:
+  # Boot strategy in v2.7.17:
   #   1. Preserve every existing menuentry and its proven kernel/initrd paths.
   #   2. Preserve the selected board DTB before every live initrd command.
   #   3. Make the first live entry diagnostic by removing quiet/splash and
@@ -1838,10 +1838,35 @@ if not live_entries:
 def rewrite_linux_args(block: str, desired: str) -> str:
     # Keep LINUX_LIVE and all upstream-required boot=live/config/user/findiso
     # tokens. Replace only presentation/debug tokens controlled by this builder.
-    linux_re = re.compile(r"(?m)(^[ \t]*linux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)(.*?)([ \t]+---[ \t]*$)")
+    # Match the live kernel command independent of physical line layout.
+    # Upstream templates may be conventionally multiline, folded, or minified
+    # onto one line. Bound the match at the first kernel-argument terminator
+    # (`---`) after LINUX_LIVE rather than requiring start/end-of-line anchors.
+    linux_re = re.compile(
+        r"(\blinux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)"
+        r"(.*?)"
+        r"([ \t]+---)"
+        r"(?=[ \t\r\n]*(?:#|devicetree\b|initrd(?:efi)?\b|\}))",
+        re.S,
+    )
     m = linux_re.search(block)
     if not m:
-        raise SystemExit("live menuentry lacks expected LINUX_LIVE ... --- command")
+        # Conservative fallback for templates where another harmless token or
+        # delimiter follows `---`. This still remains confined to the first
+        # LINUX_LIVE command inside the already identified live menuentry.
+        linux_re = re.compile(
+            r"(\blinux(?:efi)?[ \t]+LINUX_LIVE[ \t]+)"
+            r"(.*?)"
+            r"([ \t]+---)",
+            re.S,
+        )
+        m = linux_re.search(block)
+    if not m:
+        compact = " ".join(block.split())[:500]
+        raise SystemExit(
+            "live menuentry lacks a parseable LINUX_LIVE kernel command; "
+            f"entry excerpt: {compact}"
+        )
     args = m.group(2)
     controlled = {
         "quiet", "splash", "bgrt_disable", "nomodeset", "initcall_debug",
