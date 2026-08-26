@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# Constructive Vanilla ARM64 Release Builder
+# Version: 2.0.0
+#
+# Purpose:
+#   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
+#   Vanilla ARM GitHub sources, local board/kernel artifacts, optional /root
+#   overlay files, and optional Qualcomm GPU/display/video firmware retrieved
+#   at build time through alejandroqh/qcom-firmware-updater.
+#
+# Primary assumed environment:
+#   - Debian 13 build VM
+#   - Apple Silicon / M3 Macintosh host running a Linux VM
+#   - ARM64/aarch64 userspace preferred for native arm64 container builds
+#   - Target: HP Omnibook 5, UEFI firmware, Secure Boot disabled
+#
+# Design principles:
+#   - Git repositories are upstream build inputs.
+#   - Local artifact directories are first-class board/vendor inputs.
+#   - Every release gets a stamped filename, manifest, checksums, logs, and
+#     archived copies of the exact local inputs used.
+#   - Re-runs are idempotent: existing repositories are refreshed with git pull
+#     unless --skip-pull is used.
+#   - User prompts always echo default values and allow retry where paths or
+#     values are invalid.
+#
+# Important limitation:
+#   Vanilla ARM repository internals may change. This script injects artifacts
+#   through currently conventional includes.container / includes.chroot /
+#   includes.binary locations and appends clearly marked VIB recipe modules.
+#   Review generated modifications before relying on a release for production.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_VERSION="2.0.0"
+SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
+
+# -----------------------------
+# Exit code contract
+# -----------------------------
+EX_USAGE=2
+EX_DEPENDENCY=10
+EX_GIT=20
+EX_ARTIFACT=30
+EX_BUILD=40
+EX_ISO=50
+EX_VERIFY=60
+
+# -----------------------------
+# Defaults; all can be overridden by CLI or prompt.
+# -----------------------------
+WORKDIR="${WORKDIR:-$HOME/src/vanilla-arm64-build-system}"
+PROFILE="hp-omnibook-5"
+RELEASE_PREFIX="Constructive-VanillaOS-Orchid"
+ARCH="arm64"
+BASECODENAME="sid"
+CODENAME="orchid"
+VERSION="2"
+CHANNEL="stable"
+PACKAGE_LISTS_SUFFIX="vanilla-installer"
+SKIP_PULL=0
+DRY_RUN=0
+VERBOSE=0
+ENABLE_QCOM_FW=1
+ALLOW_DIRTY_REPOS=0
+CLEAN_STAGING=1
+
+# Repository defaults. These are intentionally centralized for traceability.
+CORE_REPO_URL="https://github.com/vanilla-arm/core-image"
+CORE_REPO_BRANCH="dev"
+DESKTOP_REPO_URL="https://github.com/vanilla-arm/desktop-image"
+DESKTOP_REPO_BRANCH="dev"
+LIVE_REPO_URL="https://github.com/vanilla-arm/live-iso"
+LIVE_REPO_BRANCH="orchid"
+PICO_REPO_URL="https://github.com/vanilla-arm/pico-image"
+PICO_REPO_BRANCH="main"
+QCOM_FW_REPO_URL="https://github.com/alejandroqh/qcom-firmware-updater"
+QCOM_FW_REPO_BRANCH="main"
+
+# HP Omnibook 5 default from qcom-firmware-updater supported-device table.
+QCOM_DEVICE_PATH="x1p42100/hp/omnibook-5"
+QCOM_DRIVER_ARCHIVE=""
+QCOM_DRIVER_URL=""
+
+ARTIFACT_DIR=""
+ROOT_OVERLAY_DIR=""
+CONTAINER_ENGINE=""
+
+# These are derived after prompts/CLI parsing.
+SOURCES_DIR=""
+OUTPUT_DIR=""
+RELEASES_DIR=""
+LOGS_DIR=""
+CACHE_DIR=""
+TMP_DIR=""
+CURRENT_RELEASE_DIR=""
+BUILD_ID=""
+BUILD_NUMBER=""
+BUILD_DATE_UTC=""
+LOG_FILE=""
+
+# -----------------------------
+# Console helpers
+# -----------------------------
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'; C_GRAY=$'\033[90m'
+else
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_GRAY=""
+fi
+
+log()   { printf '%s %s\n' "${C_BLUE}==>${C_RESET}" "$*" | tee -a "${LOG_FILE:-/dev/null}"; }
+ok()    { printf '%s %s\n' "${C_GREEN}OK ${C_RESET}" "$*" | tee -a "${LOG_FILE:-/dev/null}"; }
+warn()  { printf '%s %s\n' "${C_YELLOW}WARN${C_RESET}" "$*" | tee -a "${LOG_FILE:-/dev/null}"; }
+fail()  { printf '%s %s\n' "${C_RED}FAIL${C_RESET}" "$*" | tee -a "${LOG_FILE:-/dev/null}" >&2; }
+
+run() {
+  # Run a command with optional dry-run and logging support.
+  # Commands are printed before execution so logs remain self-explanatory.
+  printf '%s %q' "${C_GRAY}+${C_RESET}" "$1" | tee -a "${LOG_FILE:-/dev/null}"
+  shift || true
+  for arg in "$@"; do printf ' %q' "$arg" | tee -a "${LOG_FILE:-/dev/null}"; done
+  printf '\n' | tee -a "${LOG_FILE:-/dev/null}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  "$@" 2>&1 | tee -a "${LOG_FILE:-/dev/null}"
+}
+
+usage() {
+  cat <<USAGE
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Usage:
+  $0 [options]
+
+Options:
+  --workdir PATH             Build system root. Default: $WORKDIR
+  --artifacts PATH           Local directory containing custom *.deb and *.dtb files.
+                             Default prompt value: <workdir>/artifacts/$PROFILE
+  --root-overlay PATH        Local directory whose contents will populate /root.
+                             Default prompt value: <workdir>/root-overlay/$PROFILE
+  --profile NAME             Board/profile name. Default: $PROFILE
+  --release-prefix NAME      Release filename prefix. Default: $RELEASE_PREFIX
+  --qcom-device-path PATH    qcom-firmware-updater device path. Default: $QCOM_DEVICE_PATH
+  --qcom-driver-archive PATH Local Qualcomm Windows Graphics Driver ZIP/EXE.
+  --qcom-driver-url URL      Qualcomm Windows Graphics Driver direct URL.
+  --no-qcom-fw              Do not stage or execute qcom-firmware-updater.
+  --skip-pull               Do not refresh existing Git repositories.
+  --allow-dirty-repos       Continue if repository has uncommitted changes.
+  --dry-run                 Print plan and validations without modifying files.
+  --verbose                 More logging.
+  -h, --help                Show this help.
+
+Examples:
+  $0
+  $0 --workdir ~/src/vanilla-arm64-build-system --profile hp-omnibook-5
+  $0 --artifacts /opt/vanilla-arm-artifacts/hp-omnibook-5 --qcom-driver-archive ~/Downloads/Windows_Graphics_Driver.Core.zip
+USAGE
+}
+
+# -----------------------------
+# Input prompting helpers
+# -----------------------------
+prompt_value() {
+  local label="$1" default="$2" value=""
+  printf '\n%s\nDefault: %s\n' "$label" "$default"
+  read -r -p "$label [$default]: " value || true
+  if [[ -z "$value" ]]; then
+    value="$default"
+  fi
+  printf '%s' "$value"
+}
+
+prompt_yes_no() {
+  local label="$1" default="$2" reply=""
+  local suffix="[y/N]"
+  [[ "$default" =~ ^[Yy]$ ]] && suffix="[Y/n]"
+  while true; do
+    read -r -p "$label $suffix: " reply || true
+    reply="${reply:-$default}"
+    case "$reply" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      *) echo "Please answer yes or no." ;;
+    esac
+  done
+}
+
+prompt_existing_dir_or_create() {
+  # Forgiving directory prompt:
+  #   - accepts existing directories
+  #   - offers to create non-existing directories
+  #   - allows retry
+  #   - allows a temporary shell escape for manual preparation
+  local label="$1" default="$2" path="" choice=""
+  while true; do
+    path="$(prompt_value "$label" "$default")"
+    path="${path/#\~/$HOME}"
+    if [[ -d "$path" ]]; then
+      printf '%s' "$path"
+      return 0
+    fi
+    echo
+    warn "Directory does not exist: $path"
+    echo "Options:"
+    echo "  c = create it"
+    echo "  r = retry path"
+    echo "  s = shell escape to prepare files, then retry"
+    echo "  q = quit"
+    read -r -p "Choose [c/r/s/q]: " choice || true
+    case "$choice" in
+      c|C)
+        [[ "$DRY_RUN" -eq 1 ]] || mkdir -p "$path"
+        printf '%s' "$path"
+        return 0
+        ;;
+      s|S)
+        echo "Opening a temporary shell. Type 'exit' to return."
+        "${SHELL:-/bin/bash}" || true
+        ;;
+      q|Q)
+        fail "User cancelled while selecting directory."
+        exit "$EX_USAGE"
+        ;;
+      *) ;;
+    esac
+  done
+}
+
+prompt_file_optional() {
+  local label="$1" default="$2" path="" choice=""
+  while true; do
+    path="$(prompt_value "$label" "$default")"
+    path="${path/#\~/$HOME}"
+    if [[ -z "$path" ]]; then
+      printf ''
+      return 0
+    fi
+    if [[ -f "$path" ]]; then
+      printf '%s' "$path"
+      return 0
+    fi
+    warn "File does not exist: $path"
+    echo "Options: r = retry, s = shell escape, blank = skip"
+    read -r -p "Choose [r/s/skip]: " choice || true
+    case "$choice" in
+      s|S) "${SHELL:-/bin/bash}" || true ;;
+      r|R) ;;
+      *) printf ''; return 0 ;;
+    esac
+  done
+}
+
+# -----------------------------
+# CLI parsing
+# -----------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workdir) WORKDIR="$2"; shift 2 ;;
+    --artifacts) ARTIFACT_DIR="$2"; shift 2 ;;
+    --root-overlay) ROOT_OVERLAY_DIR="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --release-prefix) RELEASE_PREFIX="$2"; shift 2 ;;
+    --qcom-device-path) QCOM_DEVICE_PATH="$2"; shift 2 ;;
+    --qcom-driver-archive) QCOM_DRIVER_ARCHIVE="$2"; shift 2 ;;
+    --qcom-driver-url) QCOM_DRIVER_URL="$2"; shift 2 ;;
+    --no-qcom-fw) ENABLE_QCOM_FW=0; shift ;;
+    --skip-pull) SKIP_PULL=1; shift ;;
+    --allow-dirty-repos) ALLOW_DIRTY_REPOS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "Unknown option: $1"; usage; exit "$EX_USAGE" ;;
+  esac
+done
+
+WORKDIR="${WORKDIR/#\~/$HOME}"
+SOURCES_DIR="$WORKDIR/sources"
+OUTPUT_DIR="$WORKDIR/output"
+RELEASES_DIR="$OUTPUT_DIR/releases"
+LOGS_DIR="$OUTPUT_DIR/logs"
+CACHE_DIR="$WORKDIR/cache"
+TMP_DIR="$WORKDIR/tmp"
+
+mkdir -p "$LOGS_DIR" "$RELEASES_DIR" "$CACHE_DIR" "$TMP_DIR" 2>/dev/null || true
+LOG_FILE="$LOGS_DIR/builder-$(date -u +%Y%m%dT%H%M%SZ).log"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vanilla-arm64-builder-$$.log"
+
+trap 'fail "Build failed at line $LINENO. See log: $LOG_FILE"' ERR
+
+# -----------------------------
+# Intro and prompt phase
+# -----------------------------
+echo "${C_BOLD}$SCRIPT_NAME v$SCRIPT_VERSION${C_RESET}"
+echo "Primary target profile default: $PROFILE"
+echo "Primary host assumption: Debian 13 VM on Apple Silicon/M3"
+echo "Log file: $LOG_FILE"
+
+WORKDIR="$(prompt_value "Build work directory" "$WORKDIR")"
+WORKDIR="${WORKDIR/#\~/$HOME}"
+SOURCES_DIR="$WORKDIR/sources"
+OUTPUT_DIR="$WORKDIR/output"
+RELEASES_DIR="$OUTPUT_DIR/releases"
+LOGS_DIR="$OUTPUT_DIR/logs"
+CACHE_DIR="$WORKDIR/cache"
+TMP_DIR="$WORKDIR/tmp"
+mkdir -p "$SOURCES_DIR" "$RELEASES_DIR" "$LOGS_DIR" "$CACHE_DIR" "$TMP_DIR"
+
+PROFILE="$(prompt_value "Target profile name" "$PROFILE")"
+RELEASE_PREFIX="$(prompt_value "Release filename prefix" "$RELEASE_PREFIX")"
+
+if [[ -z "$ARTIFACT_DIR" ]]; then
+  ARTIFACT_DIR="$WORKDIR/artifacts/$PROFILE"
+fi
+ARTIFACT_DIR="$(prompt_existing_dir_or_create "Custom kernel/DTB artifact directory" "$ARTIFACT_DIR")"
+
+if [[ -z "$ROOT_OVERLAY_DIR" ]]; then
+  ROOT_OVERLAY_DIR="$WORKDIR/root-overlay/$PROFILE"
+fi
+ROOT_OVERLAY_DIR="$(prompt_existing_dir_or_create "Optional /root overlay directory" "$ROOT_OVERLAY_DIR")"
+
+if prompt_yes_no "Stage Qualcomm GPU/display/video firmware with qcom-firmware-updater?" "$([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo y || echo n)"; then
+  ENABLE_QCOM_FW=1
+  QCOM_DEVICE_PATH="$(prompt_value "qcom-firmware-updater device path" "$QCOM_DEVICE_PATH")"
+  echo
+  echo "Provide either a local Qualcomm Windows Graphics Driver ZIP/EXE or a direct --url."
+  echo "For repeatable builds, a local archive is preferred because it is copied into the release input archive."
+  if [[ -z "$QCOM_DRIVER_ARCHIVE" ]]; then
+    QCOM_DRIVER_ARCHIVE="$(prompt_file_optional "Local Qualcomm driver ZIP/EXE file, blank to skip" "")"
+  fi
+  if [[ -z "$QCOM_DRIVER_ARCHIVE" && -z "$QCOM_DRIVER_URL" ]]; then
+    QCOM_DRIVER_URL="$(prompt_value "Qualcomm driver direct URL, blank to skip updater execution" "")"
+  fi
+else
+  ENABLE_QCOM_FW=0
+fi
+
+if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+  if prompt_yes_no "Temporarily open a shell before staging qcom-firmware-updater so you can prepare/edit values?" "n"; then
+    echo "Opening temporary shell. Type 'exit' to return to the builder."
+    "${SHELL:-/bin/bash}" || true
+  fi
+fi
+
+BUILD_DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+BUILD_NUMBER_FILE="$WORKDIR/.build-number"
+if [[ -f "$BUILD_NUMBER_FILE" ]]; then
+  last_num="$(tr -dc '0-9' < "$BUILD_NUMBER_FILE" || true)"
+else
+  last_num="0"
+fi
+next_num=$((10#$last_num + 1))
+BUILD_NUMBER="$(printf 'r%04d' "$next_num")"
+BUILD_ID="$(date -u +%Y%m%d)-$BUILD_NUMBER-$PROFILE"
+CURRENT_RELEASE_DIR="$RELEASES_DIR/$BUILD_ID"
+
+log "Planned release: $BUILD_ID"
+log "Workdir: $WORKDIR"
+log "Artifacts: $ARTIFACT_DIR"
+log "Root overlay: $ROOT_OVERLAY_DIR"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  warn "Dry-run mode is enabled. No files should be modified beyond initial log/workdir creation."
+fi
+
+# -----------------------------
+# Dependency validation
+# -----------------------------
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || missing_cmds+=("$1")
+}
+
+log "Checking host dependencies."
+missing_cmds=()
+for c in git curl sed awk find sort sha256sum date tee stat cp mkdir rm chmod grep tar python3; do
+  need_cmd "$c"
+done
+if command -v podman >/dev/null 2>&1; then
+  CONTAINER_ENGINE="podman"
+elif command -v docker >/dev/null 2>&1; then
+  CONTAINER_ENGINE="docker"
+else
+  missing_cmds+=("podman-or-docker")
+fi
+if ! command -v vib >/dev/null 2>&1; then
+  missing_cmds+=("vib")
+fi
+if ! command -v isoinfo >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
+  missing_cmds+=("isoinfo-or-xorriso")
+fi
+
+if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+  fail "Missing required tools: ${missing_cmds[*]}"
+  cat <<'DEPS' | tee -a "$LOG_FILE"
+Suggested Debian 13 packages for common tools:
+  sudo apt update
+  sudo apt install -y git curl ca-certificates gawk coreutils findutils tar python3 podman docker.io xorriso genisoimage
+
+Additional builder requirement:
+  vib must be installed according to Vanilla OS build tooling instructions.
+
+Qualcomm firmware updater dependencies are installed inside generated image hooks/modules when enabled:
+  7zip msitools unzip curl ca-certificates
+DEPS
+  exit "$EX_DEPENDENCY"
+fi
+ok "Dependencies available. Container engine: $CONTAINER_ENGINE"
+
+# -----------------------------
+# Artifact validation
+# -----------------------------
+log "Validating local kernel and DTB artifacts."
+mapfile -t DEB_FILES < <(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' | sort)
+mapfile -t DTB_FILES < <(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.dtb' | sort)
+
+if [[ ${#DEB_FILES[@]} -lt 1 ]]; then
+  fail "No .deb files found in artifact directory: $ARTIFACT_DIR"
+  exit "$EX_ARTIFACT"
+fi
+if [[ ${#DTB_FILES[@]} -lt 1 ]]; then
+  fail "No .dtb files found in artifact directory: $ARTIFACT_DIR"
+  exit "$EX_ARTIFACT"
+fi
+ok "Found ${#DEB_FILES[@]} deb package(s) and ${#DTB_FILES[@]} DTB file(s)."
+
+for f in "${DEB_FILES[@]}" "${DTB_FILES[@]}"; do
+  if [[ ! -s "$f" ]]; then
+    fail "Artifact exists but is empty: $f"
+    exit "$EX_ARTIFACT"
+  fi
+done
+
+if [[ -n "$QCOM_DRIVER_ARCHIVE" && ! -s "$QCOM_DRIVER_ARCHIVE" ]]; then
+  fail "Qualcomm driver archive is missing or empty: $QCOM_DRIVER_ARCHIVE"
+  exit "$EX_ARTIFACT"
+fi
+
+# -----------------------------
+# Prepare release directory and archive local inputs
+# -----------------------------
+log "Preparing release workspace."
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$CURRENT_RELEASE_DIR/input-artifacts" "$CURRENT_RELEASE_DIR/root-overlay" "$CURRENT_RELEASE_DIR/manifests" "$CURRENT_RELEASE_DIR/logs"
+  cp -a "${DEB_FILES[@]}" "${DTB_FILES[@]}" "$CURRENT_RELEASE_DIR/input-artifacts/"
+  if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+    cp -a "$QCOM_DRIVER_ARCHIVE" "$CURRENT_RELEASE_DIR/input-artifacts/"
+  fi
+  if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
+    cp -a "$ROOT_OVERLAY_DIR"/. "$CURRENT_RELEASE_DIR/root-overlay/" 2>/dev/null || true
+  fi
+fi
+
+# -----------------------------
+# Git clone/pull helpers
+# -----------------------------
+repo_path() { printf '%s/%s' "$SOURCES_DIR" "$1"; }
+
+ensure_repo() {
+  local name="$1" url="$2" branch="$3" path
+  path="$(repo_path "$name")"
+  if [[ -d "$path/.git" ]]; then
+    log "Repository exists: $name"
+    if [[ "$ALLOW_DIRTY_REPOS" -eq 0 ]]; then
+      if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+        fail "Repository has local modifications: $path"
+        echo "Use --allow-dirty-repos if you intentionally want to keep local modifications." | tee -a "$LOG_FILE"
+        exit "$EX_GIT"
+      fi
+    fi
+    if [[ "$SKIP_PULL" -eq 0 ]]; then
+      run git -C "$path" fetch --all --prune || exit "$EX_GIT"
+      run git -C "$path" checkout "$branch" || exit "$EX_GIT"
+      run git -C "$path" pull --ff-only || exit "$EX_GIT"
+    else
+      warn "Skipping git pull for $name."
+    fi
+  else
+    log "Cloning repository: $name"
+    run git clone --branch "$branch" "$url" "$path" || exit "$EX_GIT"
+  fi
+}
+
+ensure_repo "pico-image" "$PICO_REPO_URL" "$PICO_REPO_BRANCH"
+ensure_repo "core-image" "$CORE_REPO_URL" "$CORE_REPO_BRANCH"
+ensure_repo "desktop-image" "$DESKTOP_REPO_URL" "$DESKTOP_REPO_BRANCH"
+ensure_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_REPO_BRANCH"
+if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+  ensure_repo "qcom-firmware-updater" "$QCOM_FW_REPO_URL" "$QCOM_FW_REPO_BRANCH"
+fi
+
+# -----------------------------
+# Source tree modification helpers
+# -----------------------------
+copy_artifacts_to_container_includes() {
+  local repo="$1" include_dir staging_dir root_dir
+  include_dir="$(repo_path "$repo")/includes.container"
+  staging_dir="$include_dir/opt/constructive-build/input-artifacts"
+  root_dir="$include_dir/root"
+  log "Staging artifacts into $repo container includes."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  mkdir -p "$staging_dir" "$root_dir"
+  rm -rf "$staging_dir"/*
+  cp -a "${DEB_FILES[@]}" "${DTB_FILES[@]}" "$staging_dir/"
+  if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
+    cp -a "$ROOT_OVERLAY_DIR"/. "$root_dir/" 2>/dev/null || true
+  fi
+  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+    mkdir -p "$include_dir/opt/constructive-build/qcom-firmware-updater"
+    cp -a "$(repo_path qcom-firmware-updater)"/. "$include_dir/opt/constructive-build/qcom-firmware-updater/"
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      cp -a "$QCOM_DRIVER_ARCHIVE" "$include_dir/opt/constructive-build/input-artifacts/"
+    fi
+  fi
+}
+
+copy_artifacts_to_live_iso() {
+  local live include_chroot include_binary chroot_staging binary_dtb root_dir
+  live="$(repo_path live-iso)"
+  include_chroot="$live/etc/config/includes.chroot"
+  include_binary="$live/etc/config/includes.binary"
+  chroot_staging="$include_chroot/opt/constructive-build/input-artifacts"
+  binary_dtb="$include_binary/boot/dtbs"
+  root_dir="$include_chroot/root"
+  log "Staging artifacts into live ISO chroot and binary includes."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  mkdir -p "$chroot_staging" "$binary_dtb" "$root_dir"
+  rm -rf "$chroot_staging"/* "$binary_dtb"/*
+  cp -a "${DEB_FILES[@]}" "${DTB_FILES[@]}" "$chroot_staging/"
+  cp -a "${DTB_FILES[@]}" "$binary_dtb/"
+  if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
+    cp -a "$ROOT_OVERLAY_DIR"/. "$root_dir/" 2>/dev/null || true
+  fi
+  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+    mkdir -p "$include_chroot/opt/constructive-build/qcom-firmware-updater"
+    cp -a "$(repo_path qcom-firmware-updater)"/. "$include_chroot/opt/constructive-build/qcom-firmware-updater/"
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      cp -a "$QCOM_DRIVER_ARCHIVE" "$chroot_staging/"
+    fi
+  fi
+}
+
+write_core_module_script() {
+  local repo="$1" module_path
+  module_path="$(repo_path "$repo")/modules/99-constructive-custom-arm64.yml"
+  log "Writing generated VIB module for $repo."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  mkdir -p "$(dirname "$module_path")"
+  cat > "$module_path" <<MODULE
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION
+# This module installs custom ARM64 kernel/headers/modules .deb files,
+# installs board DTBs, optionally runs qcom-firmware-updater, and refreshes
+# initramfs inside the image at build time.
+name: constructive-custom-arm64
+type: shell
+commands:
+  - apt update
+  - apt install -y ca-certificates curl unzip 7zip msitools
+  - mkdir -p /boot/dtbs /usr/lib/linux-image-custom /opt/constructive-build
+  - if ls /opt/constructive-build/input-artifacts/*.deb >/dev/null 2>&1; then dpkg -i /opt/constructive-build/input-artifacts/*.deb || apt -f install -y; fi
+  - if ls /opt/constructive-build/input-artifacts/*.dtb >/dev/null 2>&1; then cp -a /opt/constructive-build/input-artifacts/*.dtb /boot/dtbs/; cp -a /opt/constructive-build/input-artifacts/*.dtb /usr/lib/linux-image-custom/; fi
+MODULE
+  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+    local qarg=""
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      qarg="/opt/constructive-build/input-artifacts/$(basename "$QCOM_DRIVER_ARCHIVE")"
+    elif [[ -n "$QCOM_DRIVER_URL" ]]; then
+      qarg="--url '$QCOM_DRIVER_URL'"
+    fi
+    if [[ -n "$qarg" ]]; then
+      cat >> "$module_path" <<MODULE
+  - chmod +x /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh || true
+  - bash /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $qarg
+MODULE
+    else
+      cat >> "$module_path" <<MODULE
+  - echo 'qcom-firmware-updater staged but not executed: no local archive or URL was supplied.'
+MODULE
+    fi
+  fi
+  cat >> "$module_path" <<'MODULE'
+  - update-initramfs -c -k all || update-initramfs -u -k all || true
+  - update-grub || true
+MODULE
+}
+
+append_recipe_include() {
+  local repo="$1" recipe marker include_line
+  recipe="$(repo_path "$repo")/recipe.yml"
+  marker="# constructive-custom-arm64 module include"
+  include_line="  - modules/99-constructive-custom-arm64.yml"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  if [[ ! -f "$recipe" ]]; then
+    warn "No recipe.yml found in $repo; generated module will not be referenced automatically."
+    return 0
+  fi
+  if grep -q "99-constructive-custom-arm64.yml" "$recipe"; then
+    ok "$repo recipe already references generated module."
+    return 0
+  fi
+  cat >> "$recipe" <<RECIPE_APPEND
+
+$marker
+$include_line
+RECIPE_APPEND
+  warn "Appended generated module reference to $repo/recipe.yml. Review syntax if upstream recipe format changed."
+}
+
+write_live_hook() {
+  local hook
+  hook="$(repo_path live-iso)/etc/config/hooks/live/010-constructive-custom-arm64.chroot"
+  log "Writing live ISO chroot hook."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  mkdir -p "$(dirname "$hook")"
+  cat > "$hook" <<HOOK
+#!/bin/sh
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION
+# Installs custom kernel packages, DTBs, /root overlay, and optional Qualcomm firmware in live chroot.
+set -eu
+apt update
+apt install -y ca-certificates curl unzip 7zip msitools
+mkdir -p /boot/dtbs /usr/lib/linux-image-custom
+if ls /opt/constructive-build/input-artifacts/*.deb >/dev/null 2>&1; then
+  dpkg -i /opt/constructive-build/input-artifacts/*.deb || apt -f install -y
+fi
+if ls /opt/constructive-build/input-artifacts/*.dtb >/dev/null 2>&1; then
+  cp -a /opt/constructive-build/input-artifacts/*.dtb /boot/dtbs/
+  cp -a /opt/constructive-build/input-artifacts/*.dtb /usr/lib/linux-image-custom/
+fi
+HOOK
+  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
+    local qarg=""
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      qarg="/opt/constructive-build/input-artifacts/$(basename "$QCOM_DRIVER_ARCHIVE")"
+    elif [[ -n "$QCOM_DRIVER_URL" ]]; then
+      qarg="--url '$QCOM_DRIVER_URL'"
+    fi
+    if [[ -n "$qarg" ]]; then
+      cat >> "$hook" <<HOOK
+chmod +x /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh || true
+bash /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $qarg
+HOOK
+    else
+      cat >> "$hook" <<'HOOK'
+echo 'qcom-firmware-updater staged but not executed: no local archive or URL was supplied.'
+HOOK
+    fi
+  fi
+  cat >> "$hook" <<'HOOK'
+update-initramfs -c -k all || update-initramfs -u -k all || true
+update-grub || true
+HOOK
+  chmod +x "$hook"
+}
+
+write_grub_dtb_fragment() {
+  # Vanilla live-iso GRUB layout may vary. This writes a fragment and a note.
+  # It intentionally does not destructively rewrite upstream GRUB files.
+  local live fragment dtb_name
+  live="$(repo_path live-iso)"
+  dtb_name="$(basename "${DTB_FILES[0]}")"
+  fragment="$live/etc/config/includes.binary/boot/grub/constructive-custom-dtb.cfg"
+  log "Writing non-destructive GRUB DTB fragment for ISO review."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  mkdir -p "$(dirname "$fragment")"
+  cat > "$fragment" <<GRUB
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION
+# Review and merge into the active live ISO GRUB menu if upstream build files do not include this fragment.
+menuentry "Vanilla OS ARM64 - $PROFILE custom DTB" {
+    linux /live/vmlinuz boot=live components quiet splash
+    initrd /live/initrd.img
+    devicetree /boot/dtbs/$dtb_name
+}
+GRUB
+  warn "Generated GRUB DTB fragment: $fragment"
+  warn "Confirm upstream live-iso GRUB config includes or imports this fragment. If not, manually merge devicetree /boot/dtbs/$dtb_name into the active menuentry."
+}
+
+write_terraform_conf() {
+  local conf
+  conf="$(repo_path live-iso)/etc/terraform.conf"
+  log "Ensuring live ISO terraform.conf targets arm64."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  if [[ ! -f "$conf" ]]; then
+    fail "Missing terraform.conf at $conf"
+    exit "$EX_ISO"
+  fi
+  python3 - "$conf" <<PY
+from pathlib import Path
+p=Path('$conf')
+text=p.read_text()
+values={
+ 'ARCH':'$ARCH',
+ 'BASECODENAME':'$BASECODENAME',
+ 'CODENAME':'$CODENAME',
+ 'VERSION':'$VERSION',
+ 'CHANNEL':'$CHANNEL',
+ 'PACKAGE_LISTS_SUFFIX':'$PACKAGE_LISTS_SUFFIX',
+}
+for k,v in values.items():
+    import re
+    pattern=re.compile(rf'^{k}=.*$', re.M)
+    line=f'{k}="{v}"'
+    if pattern.search(text):
+        text=pattern.sub(line,text)
+    else:
+        text += '\n' + line + '\n'
+p.write_text(text)
+PY
+}
+
+# -----------------------------
+# Generate preliminary manifests embedded into ISO before build
+# -----------------------------
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n"))[1:-1])'; }
+sha_file() { sha256sum "$1" | awk '{print $1}'; }
+
+write_prebuild_manifest() {
+  local dest_live dest_core dest_desktop manifest
+  manifest="$TMP_DIR/BUILD-INFO.json"
+  log "Writing pre-build manifest for embedding."
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  {
+    echo "{"
+    echo "  \"script_name\": \"$SCRIPT_NAME\","
+    echo "  \"script_version\": \"$SCRIPT_VERSION\","
+    echo "  \"build_id\": \"$BUILD_ID\","
+    echo "  \"build_number\": \"$BUILD_NUMBER\","
+    echo "  \"build_date_utc\": \"$BUILD_DATE_UTC\","
+    echo "  \"profile\": \"$PROFILE\","
+    echo "  \"architecture\": \"$ARCH\","
+    echo "  \"release_prefix\": \"$RELEASE_PREFIX\","
+    echo "  \"qcom_firmware_enabled\": $([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo true || echo false),"
+    echo "  \"qcom_device_path\": \"$QCOM_DEVICE_PATH\","
+    echo "  \"local_artifacts\": ["
+    local first=1 f base sha size
+    for f in "${DEB_FILES[@]}" "${DTB_FILES[@]}"; do
+      base="$(basename "$f")"; sha="$(sha_file "$f")"; size="$(stat -c '%s' "$f")"
+      [[ $first -eq 0 ]] && echo ","
+      printf '    {"filename":"%s","source_path":"%s","sha256":"%s","size_bytes":%s}' "$(printf '%s' "$base" | json_escape)" "$(printf '%s' "$f" | json_escape)" "$sha" "$size"
+      first=0
+    done
+    echo
+    echo "  ],"
+    echo "  \"repositories\": {"
+    local comma=""
+    for r in pico-image core-image desktop-image live-iso qcom-firmware-updater; do
+      [[ "$r" == "qcom-firmware-updater" && "$ENABLE_QCOM_FW" -ne 1 ]] && continue
+      if [[ -d "$(repo_path "$r")/.git" ]]; then
+        printf '%s    "%s": {"commit":"%s","branch":"%s","url":"%s"}' "$comma" "$r" "$(git -C "$(repo_path "$r")" rev-parse HEAD)" "$(git -C "$(repo_path "$r")" rev-parse --abbrev-ref HEAD)" "$(git -C "$(repo_path "$r")" remote get-url origin)"
+        comma=",\n"
+      fi
+    done
+    echo
+    echo "  }"
+    echo "}"
+  } > "$manifest"
+
+  cat > "$TMP_DIR/BUILD-INFO.md" <<MD
+# $RELEASE_PREFIX $BUILD_ID
+
+- Builder: $SCRIPT_NAME v$SCRIPT_VERSION
+- Date UTC: $BUILD_DATE_UTC
+- Profile: $PROFILE
+- Architecture: $ARCH
+- Qualcomm firmware updater enabled: $ENABLE_QCOM_FW
+- Qualcomm device path: $QCOM_DEVICE_PATH
+
+This file was embedded before ISO creation. The release directory contains the final manifest with ISO checksum.
+MD
+
+  for dest in \
+    "$(repo_path live-iso)/etc/config/includes.binary" \
+    "$(repo_path live-iso)/etc/config/includes.chroot" \
+    "$(repo_path core-image)/includes.container" \
+    "$(repo_path desktop-image)/includes.container"; do
+    mkdir -p "$dest"
+    cp -a "$TMP_DIR/BUILD-INFO.json" "$TMP_DIR/BUILD-INFO.md" "$dest/"
+  done
+}
+
+# -----------------------------
+# Apply source modifications
+# -----------------------------
+copy_artifacts_to_container_includes "core-image"
+copy_artifacts_to_container_includes "desktop-image"
+copy_artifacts_to_live_iso
+write_core_module_script "core-image"
+write_core_module_script "desktop-image"
+append_recipe_include "core-image"
+append_recipe_include "desktop-image"
+write_live_hook
+write_grub_dtb_fragment
+write_terraform_conf
+write_prebuild_manifest
+
+# -----------------------------
+# Build phase
+# -----------------------------
+build_container_image() {
+  local repo="$1" tag="$2" path
+  path="$(repo_path "$repo")"
+  log "Building VIB image content for $repo."
+  if [[ ! -f "$path/recipe.yml" ]]; then
+    fail "Missing recipe.yml in $path"
+    exit "$EX_BUILD"
+  fi
+  ( cd "$path" && run vib build recipe.yml ) || exit "$EX_BUILD"
+  log "Building container image tag $tag from $repo."
+  ( cd "$path" && run "$CONTAINER_ENGINE" image build -t "$tag" . ) || exit "$EX_BUILD"
+}
+
+build_iso() {
+  local live
+  live="$(repo_path live-iso)"
+  log "Building live ISO."
+  if [[ ! -f "$live/build.sh" ]]; then
+    fail "Missing live-iso build.sh at $live/build.sh"
+    exit "$EX_ISO"
+  fi
+  if [[ "$CONTAINER_ENGINE" == "docker" ]]; then
+    ( cd "$live" && run docker run --privileged -i -v /proc:/proc -v "$live":/working_dir -w /working_dir ghcr.io/vanilla-os/pico:main /bin/bash -s etc/terraform.conf < build.sh ) || exit "$EX_ISO"
+  else
+    ( cd "$live" && run podman run --privileged -i -v /proc:/proc -v "$live":/working_dir:Z -w /working_dir ghcr.io/vanilla-os/pico:main /bin/bash -s etc/terraform.conf < build.sh ) || exit "$EX_ISO"
+  fi
+}
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  ok "Dry-run plan completed. Build would now run core-image, desktop-image, and live-iso."
+  echo "Resolved execution command for real build:" | tee -a "$LOG_FILE"
+  echo "  $0 --workdir '$WORKDIR' --profile '$PROFILE' --artifacts '$ARTIFACT_DIR' --root-overlay '$ROOT_OVERLAY_DIR' --release-prefix '$RELEASE_PREFIX' --qcom-device-path '$QCOM_DEVICE_PATH'" | tee -a "$LOG_FILE"
+  exit 0
+fi
+
+build_container_image "core-image" "ghcr.io/vanilla-os/core:$BUILD_ID"
+build_container_image "desktop-image" "ghcr.io/vanilla-os/desktop:$BUILD_ID"
+build_iso
+
+# -----------------------------
+# Locate, stamp, copy, and verify ISO
+# -----------------------------
+log "Locating generated ISO."
+mapfile -t ISO_CANDIDATES < <(find "$(repo_path live-iso)/builds" -type f \( -name '*.iso' -o -name '*.ISO' \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
+if [[ ${#ISO_CANDIDATES[@]} -lt 1 ]]; then
+  fail "No ISO found under live-iso/builds."
+  exit "$EX_ISO"
+fi
+SOURCE_ISO="${ISO_CANDIDATES[0]}"
+FINAL_ISO_NAME="$RELEASE_PREFIX-$ARCH-$BUILD_ID.iso"
+FINAL_ISO="$CURRENT_RELEASE_DIR/$FINAL_ISO_NAME"
+mkdir -p "$CURRENT_RELEASE_DIR"
+cp -a "$SOURCE_ISO" "$FINAL_ISO"
+ok "Stamped ISO: $FINAL_ISO"
+
+sha256sum "$FINAL_ISO" > "$CURRENT_RELEASE_DIR/$FINAL_ISO_NAME.sha256"
+sha256sum "$CURRENT_RELEASE_DIR/input-artifacts"/* > "$CURRENT_RELEASE_DIR/input-artifacts.sha256" 2>/dev/null || true
+cp -a "$LOG_FILE" "$CURRENT_RELEASE_DIR/logs/"
+
+log "Verifying ISO contents."
+VERIFY_FILE_LIST="$CURRENT_RELEASE_DIR/iso-file-list.txt"
+if command -v isoinfo >/dev/null 2>&1; then
+  isoinfo -i "$FINAL_ISO" -R -f > "$VERIFY_FILE_LIST" || true
+elif command -v xorriso >/dev/null 2>&1; then
+  xorriso -indev "$FINAL_ISO" -find / -type f > "$VERIFY_FILE_LIST" 2>/dev/null || true
+fi
+
+if [[ ! -s "$VERIFY_FILE_LIST" ]]; then
+  fail "Could not list ISO contents."
+  exit "$EX_VERIFY"
+fi
+
+grep -Ei 'EFI|BOOTAA64|grubaa64' "$VERIFY_FILE_LIST" >/dev/null || { fail "EFI ARM64 boot files not detected in ISO listing."; exit "$EX_VERIFY"; }
+grep -Ei '\.dtb$' "$VERIFY_FILE_LIST" >/dev/null || { fail "DTB files not detected in ISO listing."; exit "$EX_VERIFY"; }
+grep -E 'BUILD-INFO\.(json|md)' "$VERIFY_FILE_LIST" >/dev/null || warn "Embedded BUILD-INFO files not detected in ISO listing."
+ok "ISO verification completed."
+
+# -----------------------------
+# Final manifest and release notes
+# -----------------------------
+ISO_SHA="$(sha_file "$FINAL_ISO")"
+ISO_SIZE="$(stat -c '%s' "$FINAL_ISO")"
+FINAL_JSON="$CURRENT_RELEASE_DIR/$RELEASE_PREFIX-$ARCH-$BUILD_ID.build.json"
+FINAL_MD="$CURRENT_RELEASE_DIR/$RELEASE_PREFIX-$ARCH-$BUILD_ID.build.md"
+
+cp -a "$TMP_DIR/BUILD-INFO.json" "$FINAL_JSON.pre-iso.json" 2>/dev/null || true
+cat > "$FINAL_JSON" <<JSON
+{
+  "script_name": "$SCRIPT_NAME",
+  "script_version": "$SCRIPT_VERSION",
+  "build_id": "$BUILD_ID",
+  "build_number": "$BUILD_NUMBER",
+  "build_date_utc": "$BUILD_DATE_UTC",
+  "profile": "$PROFILE",
+  "architecture": "$ARCH",
+  "release_prefix": "$RELEASE_PREFIX",
+  "iso_filename": "$FINAL_ISO_NAME",
+  "iso_sha256": "$ISO_SHA",
+  "iso_size_bytes": $ISO_SIZE,
+  "artifact_directory": "$ARTIFACT_DIR",
+  "root_overlay_directory": "$ROOT_OVERLAY_DIR",
+  "qcom_firmware_enabled": $([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo true || echo false),
+  "qcom_device_path": "$QCOM_DEVICE_PATH",
+  "qcom_driver_archive": "${QCOM_DRIVER_ARCHIVE}",
+  "qcom_driver_url": "${QCOM_DRIVER_URL}",
+  "repositories": {
+    "pico-image": {"commit":"$(git -C "$(repo_path pico-image)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path pico-image)" rev-parse --abbrev-ref HEAD)"},
+    "core-image": {"commit":"$(git -C "$(repo_path core-image)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path core-image)" rev-parse --abbrev-ref HEAD)"},
+    "desktop-image": {"commit":"$(git -C "$(repo_path desktop-image)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path desktop-image)" rev-parse --abbrev-ref HEAD)"},
+    "live-iso": {"commit":"$(git -C "$(repo_path live-iso)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path live-iso)" rev-parse --abbrev-ref HEAD)"}
+  }
+}
+JSON
+
+cat > "$FINAL_MD" <<MD
+# $RELEASE_PREFIX $BUILD_ID
+
+## Result
+
+- Status: successful
+- ISO: \\`$FINAL_ISO_NAME\\`
+- SHA-256: \\`$ISO_SHA\\`
+- Size bytes: \\`$ISO_SIZE\\`
+
+## Build
+
+- Builder: $SCRIPT_NAME v$SCRIPT_VERSION
+- Date UTC: $BUILD_DATE_UTC
+- Profile: $PROFILE
+- Architecture: $ARCH
+- Workdir: \\`$WORKDIR\\`
+
+## Inputs
+
+- Artifact directory: \\`$ARTIFACT_DIR\\`
+- Root overlay directory: \\`$ROOT_OVERLAY_DIR\\`
+- Qualcomm firmware updater enabled: $ENABLE_QCOM_FW
+- Qualcomm device path: \\`$QCOM_DEVICE_PATH\\`
+
+## Repositories
+
+- pico-image: \\`$(git -C "$(repo_path pico-image)" rev-parse --short HEAD)\\`
+- core-image: \\`$(git -C "$(repo_path core-image)" rev-parse --short HEAD)\\`
+- desktop-image: \\`$(git -C "$(repo_path desktop-image)" rev-parse --short HEAD)\\`
+- live-iso: \\`$(git -C "$(repo_path live-iso)" rev-parse --short HEAD)\\`
+
+## Notes
+
+The release directory includes archived local input artifacts, root overlay contents, checksums, ISO file listing, logs, and JSON/Markdown build manifests.
+MD
+
+# Increment the persistent build number only after successful ISO generation and verification.
+printf '%04d\n' "$next_num" > "$BUILD_NUMBER_FILE"
+
+ok "Release complete: $CURRENT_RELEASE_DIR"
+ok "ISO SHA-256: $ISO_SHA"
+echo
+printf '%s\n' "${C_BOLD}Final ISO:${C_RESET} $FINAL_ISO"
+printf '%s\n' "${C_BOLD}Release manifest:${C_RESET} $FINAL_JSON"
+printf '%s\n' "${C_BOLD}Log:${C_RESET} $LOG_FILE"
