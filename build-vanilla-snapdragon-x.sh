@@ -2,13 +2,14 @@
 # shellcheck shell=bash
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.1.1
+# Version: 2.2.0
 #
 # Purpose:
 #   Build a stamped, repeatable Vanilla OS ARM64 UEFI installation ISO from
 #   Vanilla ARM GitHub sources, local board/kernel artifacts, optional /root
-#   overlay files, and optional Qualcomm GPU/display/video firmware retrieved
-#   at build time through alejandroqh/qcom-firmware-updater.
+#   overlay files, and optional Qualcomm GPU/display/video firmware extracted in an isolated
+#   disposable container from alejandroqh/qcom-firmware-updater. The updater
+#   is never allowed to install firmware onto the build host.
 #
 # Primary assumed environment:
 #   - Debian 13 build VM
@@ -35,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.2.0"
 SCRIPT_NAME="Constructive Vanilla ARM64 Release Builder"
 
 # -----------------------------
@@ -85,6 +86,8 @@ QCOM_FW_REPO_BRANCH="main"
 QCOM_DEVICE_PATH="x1p42100/hp/omnibook-5"
 QCOM_DRIVER_ARCHIVE=""
 QCOM_DRIVER_URL=""
+QCOM_PRESTAGED_DIR=""
+QCOM_STAGED_FIRMWARE_DIR=""
 
 ARTIFACT_DIR=""
 ROOT_OVERLAY_DIR=""
@@ -148,7 +151,8 @@ Options:
   --qcom-device-path PATH    qcom-firmware-updater device path. Default: $QCOM_DEVICE_PATH
   --qcom-driver-archive PATH Local Qualcomm Windows Graphics Driver ZIP/EXE.
   --qcom-driver-url URL      Qualcomm Windows Graphics Driver direct URL.
-  --no-qcom-fw              Do not stage or execute qcom-firmware-updater.
+  --qcom-prestaged-dir PATH  Directory already containing target /lib/firmware-style files.
+  --no-qcom-fw              Do not extract/stage Qualcomm firmware.
   --skip-pull               Do not refresh existing Git repositories.
   --allow-dirty-repos       Continue if repository has uncommitted changes.
   --dry-run                 Print plan and validations without modifying files.
@@ -445,6 +449,7 @@ while [[ $# -gt 0 ]]; do
     --qcom-device-path) QCOM_DEVICE_PATH="$2"; shift 2 ;;
     --qcom-driver-archive) QCOM_DRIVER_ARCHIVE="$2"; shift 2 ;;
     --qcom-driver-url) QCOM_DRIVER_URL="$2"; shift 2 ;;
+    --qcom-prestaged-dir) QCOM_PRESTAGED_DIR="$2"; shift 2 ;;
     --no-qcom-fw) ENABLE_QCOM_FW=0; shift ;;
     --skip-pull) SKIP_PULL=1; shift ;;
     --allow-dirty-repos) ALLOW_DIRTY_REPOS=1; shift ;;
@@ -512,26 +517,40 @@ if [[ -z "$ROOT_OVERLAY_DIR" ]]; then
 fi
 ROOT_OVERLAY_DIR="$(prompt_existing_dir_or_create "Optional /root overlay directory" "$ROOT_OVERLAY_DIR")"
 
-if prompt_yes_no "Stage Qualcomm GPU/display/video firmware with qcom-firmware-updater?" "$([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo y || echo n)"; then
+if prompt_yes_no "Extract Qualcomm firmware into a target-image staging area?" "$([[ "$ENABLE_QCOM_FW" -eq 1 ]] && echo y || echo n)"; then
   ENABLE_QCOM_FW=1
   QCOM_DEVICE_PATH="$(prompt_value "qcom-firmware-updater device path" "$QCOM_DEVICE_PATH")"
-  echo
-  echo "Provide either a local Qualcomm Windows Graphics Driver ZIP/EXE or a direct --url."
-  echo "For repeatable builds, a local archive is preferred because it is copied into the release input archive."
-  if [[ -z "$QCOM_DRIVER_ARCHIVE" ]]; then
+  cat >&2 <<'QCOMNOTE'
+
+Qualcomm firmware handling is intentionally isolated.
+The builder will NOT install firmware onto this Debian build host.
+
+Select one input method:
+  • Local Qualcomm Windows Graphics Driver ZIP/EXE: preferred for reproducible builds.
+  • Direct Qualcomm driver URL: accepted, but less reproducible unless archived later.
+  • Pre-staged firmware directory: use when you have already extracted the needed /lib/firmware tree.
+
+If no archive, URL, or pre-staged directory is supplied, Qualcomm firmware extraction is skipped.
+QCOMNOTE
+  if [[ -z "$QCOM_PRESTAGED_DIR" ]]; then
+    QCOM_PRESTAGED_DIR="$(prompt_existing_dir_or_create "Optional pre-staged Qualcomm firmware directory" "$WORKDIR/prestaged-firmware/$PROFILE")"
+  fi
+  if [[ -z "$(find "$QCOM_PRESTAGED_DIR" -type f 2>/dev/null | head -1 || true)" ]]; then
+    QCOM_PRESTAGED_DIR=""
+  fi
+  if [[ -z "$QCOM_PRESTAGED_DIR" && -z "$QCOM_DRIVER_ARCHIVE" ]]; then
     QCOM_DRIVER_ARCHIVE="$(prompt_file_optional "Local Qualcomm driver ZIP/EXE file, blank to skip" "")"
   fi
-  if [[ -z "$QCOM_DRIVER_ARCHIVE" && -z "$QCOM_DRIVER_URL" ]]; then
-    QCOM_DRIVER_URL="$(prompt_value "Qualcomm driver direct URL, blank to skip updater execution" "")"
+  if [[ -z "$QCOM_PRESTAGED_DIR" && -z "$QCOM_DRIVER_ARCHIVE" && -z "$QCOM_DRIVER_URL" ]]; then
+    QCOM_DRIVER_URL="$(prompt_value "Qualcomm driver direct URL, blank to skip extraction" "")"
   fi
 else
   ENABLE_QCOM_FW=0
 fi
 
 if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
-  if prompt_yes_no "Temporarily open a shell before staging qcom-firmware-updater so you can prepare/edit values?" "n"; then
-    echo "Opening temporary shell. Type 'exit' to return to the builder."
-    "${SHELL:-/bin/bash}" || true
+  if prompt_yes_no "Open a temporary shell before Qualcomm extraction so you can inspect/edit updater inputs?" "n"; then
+    open_interactive_shell "$WORKDIR"
   fi
 fi
 
@@ -594,8 +613,8 @@ Suggested Debian 13 packages for common tools:
 Additional builder requirement:
   vib must be installed according to Vanilla OS build tooling instructions.
 
-Qualcomm firmware updater dependencies are installed inside generated image hooks/modules when enabled:
-  7zip msitools unzip curl ca-certificates
+Qualcomm firmware extraction dependencies are installed only inside an isolated disposable container when enabled:
+  7zip msitools unzip curl ca-certificates zstd
 DEPS
   exit "$EX_DEPENDENCY"
 fi
@@ -683,6 +702,83 @@ if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
   ensure_repo "qcom-firmware-updater" "$QCOM_FW_REPO_URL" "$QCOM_FW_REPO_BRANCH"
 fi
 
+
+# -----------------------------
+# Qualcomm firmware isolated extraction
+# -----------------------------
+extract_qcom_firmware_isolated() {
+  # qcom-firmware-updater is useful, but its normal behavior is target-host
+  # installation into /lib/firmware. That must never be allowed to modify the
+  # Debian build VM. This function either copies a pre-staged firmware tree, or
+  # runs the updater inside a disposable container and copies only the resulting
+  # /lib/firmware payload out to a builder-controlled staging directory.
+  QCOM_STAGED_FIRMWARE_DIR="$WORKDIR/staged-firmware/qcom/$PROFILE"
+
+  [[ "$ENABLE_QCOM_FW" -eq 1 ]] || return 0
+
+  log "Preparing isolated Qualcomm firmware staging area."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+
+  rm -rf "$QCOM_STAGED_FIRMWARE_DIR"
+  mkdir -p "$QCOM_STAGED_FIRMWARE_DIR"
+
+  if [[ -n "$QCOM_PRESTAGED_DIR" ]]; then
+    log "Copying pre-staged Qualcomm firmware from: $QCOM_PRESTAGED_DIR"
+    cp -a "$QCOM_PRESTAGED_DIR"/. "$QCOM_STAGED_FIRMWARE_DIR"/ 2>/dev/null || true
+  elif [[ -n "$QCOM_DRIVER_ARCHIVE" || -n "$QCOM_DRIVER_URL" ]]; then
+    local cname archive_base run_args image
+    cname="qcom-fw-extract-${PROFILE}-$$"
+    image="debian:13"
+    run_args=""
+
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      archive_base="$(basename "$QCOM_DRIVER_ARCHIVE")"
+      run_args="/input/$archive_base"
+    else
+      run_args="--url '$QCOM_DRIVER_URL'"
+    fi
+
+    log "Running qcom-firmware-updater inside disposable container: $cname"
+    log "No firmware will be installed onto the build host. Only container /lib/firmware output will be copied out."
+
+    # Remove any stale container with the same generated name.
+    "$CONTAINER_ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+
+    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
+      "$CONTAINER_ENGINE" run --name "$cname" \
+        -v "$(repo_path qcom-firmware-updater):/updater:ro" \
+        -v "$QCOM_DRIVER_ARCHIVE:/input/$archive_base:ro" \
+        "$image" /bin/bash -lc "set -eux; apt update; apt install -y ca-certificates curl unzip 7zip msitools zstd bash; cd /updater; chmod +x ./qcom-firmware-updater.sh || true; ./qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $run_args" \
+        2>&1 | tee -a "$LOG_FILE"
+    else
+      "$CONTAINER_ENGINE" run --name "$cname" \
+        -v "$(repo_path qcom-firmware-updater):/updater:ro" \
+        "$image" /bin/bash -lc "set -eux; apt update; apt install -y ca-certificates curl unzip 7zip msitools zstd bash; cd /updater; chmod +x ./qcom-firmware-updater.sh || true; ./qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $run_args" \
+        2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    mkdir -p "$QCOM_STAGED_FIRMWARE_DIR"
+    "$CONTAINER_ENGINE" cp "$cname:/lib/firmware/." "$QCOM_STAGED_FIRMWARE_DIR"/ 2>&1 | tee -a "$LOG_FILE" || {
+      fail "Could not copy /lib/firmware from disposable Qualcomm extraction container."
+      "$CONTAINER_ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+      exit "$EX_ARTIFACT"
+    }
+    "$CONTAINER_ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+  else
+    warn "Qualcomm firmware enabled, but no pre-staged directory, local archive, or URL was supplied. Skipping firmware extraction."
+    return 0
+  fi
+
+  if [[ -z "$(find "$QCOM_STAGED_FIRMWARE_DIR" -type f 2>/dev/null | head -1 || true)" ]]; then
+    fail "Qualcomm firmware staging produced no files: $QCOM_STAGED_FIRMWARE_DIR"
+    exit "$EX_ARTIFACT"
+  fi
+
+  ok "Qualcomm firmware staged at: $QCOM_STAGED_FIRMWARE_DIR"
+}
+
 # -----------------------------
 # Source tree modification helpers
 # -----------------------------
@@ -699,12 +795,9 @@ copy_artifacts_to_container_includes() {
   if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
     cp -a "$ROOT_OVERLAY_DIR"/. "$root_dir/" 2>/dev/null || true
   fi
-  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
-    mkdir -p "$include_dir/opt/constructive-build/qcom-firmware-updater"
-    cp -a "$(repo_path qcom-firmware-updater)"/. "$include_dir/opt/constructive-build/qcom-firmware-updater/"
-    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
-      cp -a "$QCOM_DRIVER_ARCHIVE" "$include_dir/opt/constructive-build/input-artifacts/"
-    fi
+  if [[ "$ENABLE_QCOM_FW" -eq 1 && -n "$QCOM_STAGED_FIRMWARE_DIR" && -d "$QCOM_STAGED_FIRMWARE_DIR" ]]; then
+    mkdir -p "$include_dir/lib/firmware"
+    cp -a "$QCOM_STAGED_FIRMWARE_DIR"/. "$include_dir/lib/firmware/"
   fi
 }
 
@@ -725,12 +818,9 @@ copy_artifacts_to_live_iso() {
   if [[ -d "$ROOT_OVERLAY_DIR" ]]; then
     cp -a "$ROOT_OVERLAY_DIR"/. "$root_dir/" 2>/dev/null || true
   fi
-  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
-    mkdir -p "$include_chroot/opt/constructive-build/qcom-firmware-updater"
-    cp -a "$(repo_path qcom-firmware-updater)"/. "$include_chroot/opt/constructive-build/qcom-firmware-updater/"
-    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
-      cp -a "$QCOM_DRIVER_ARCHIVE" "$chroot_staging/"
-    fi
+  if [[ "$ENABLE_QCOM_FW" -eq 1 && -n "$QCOM_STAGED_FIRMWARE_DIR" && -d "$QCOM_STAGED_FIRMWARE_DIR" ]]; then
+    mkdir -p "$include_chroot/lib/firmware"
+    cp -a "$QCOM_STAGED_FIRMWARE_DIR"/. "$include_chroot/lib/firmware/"
   fi
 }
 
@@ -743,35 +833,15 @@ write_core_module_script() {
   cat > "$module_path" <<MODULE
 # Generated by $SCRIPT_NAME v$SCRIPT_VERSION
 # This module installs custom ARM64 kernel/headers/modules .deb files,
-# installs board DTBs, optionally runs qcom-firmware-updater, and refreshes
+# installs board DTBs, uses already staged firmware includes, and refreshes
 # initramfs inside the image at build time.
 name: constructive-custom-arm64
 type: shell
 commands:
-  - apt update
-  - apt install -y ca-certificates curl unzip 7zip msitools
   - mkdir -p /boot/dtbs /usr/lib/linux-image-custom /opt/constructive-build
   - if ls /opt/constructive-build/input-artifacts/*.deb >/dev/null 2>&1; then dpkg -i /opt/constructive-build/input-artifacts/*.deb || apt -f install -y; fi
   - if ls /opt/constructive-build/input-artifacts/*.dtb >/dev/null 2>&1; then cp -a /opt/constructive-build/input-artifacts/*.dtb /boot/dtbs/; cp -a /opt/constructive-build/input-artifacts/*.dtb /usr/lib/linux-image-custom/; fi
 MODULE
-  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
-    local qarg=""
-    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
-      qarg="/opt/constructive-build/input-artifacts/$(basename "$QCOM_DRIVER_ARCHIVE")"
-    elif [[ -n "$QCOM_DRIVER_URL" ]]; then
-      qarg="--url '$QCOM_DRIVER_URL'"
-    fi
-    if [[ -n "$qarg" ]]; then
-      cat >> "$module_path" <<MODULE
-  - chmod +x /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh || true
-  - bash /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $qarg
-MODULE
-    else
-      cat >> "$module_path" <<MODULE
-  - echo 'qcom-firmware-updater staged but not executed: no local archive or URL was supplied.'
-MODULE
-    fi
-  fi
   cat >> "$module_path" <<'MODULE'
   - update-initramfs -c -k all || update-initramfs -u -k all || true
   - update-grub || true
@@ -809,10 +879,8 @@ write_live_hook() {
   cat > "$hook" <<HOOK
 #!/bin/sh
 # Generated by $SCRIPT_NAME v$SCRIPT_VERSION
-# Installs custom kernel packages, DTBs, /root overlay, and optional Qualcomm firmware in live chroot.
+# Installs custom kernel packages and DTBs in live chroot; Qualcomm firmware is copied by live-build includes.
 set -eu
-apt update
-apt install -y ca-certificates curl unzip 7zip msitools
 mkdir -p /boot/dtbs /usr/lib/linux-image-custom
 if ls /opt/constructive-build/input-artifacts/*.deb >/dev/null 2>&1; then
   dpkg -i /opt/constructive-build/input-artifacts/*.deb || apt -f install -y
@@ -822,24 +890,6 @@ if ls /opt/constructive-build/input-artifacts/*.dtb >/dev/null 2>&1; then
   cp -a /opt/constructive-build/input-artifacts/*.dtb /usr/lib/linux-image-custom/
 fi
 HOOK
-  if [[ "$ENABLE_QCOM_FW" -eq 1 ]]; then
-    local qarg=""
-    if [[ -n "$QCOM_DRIVER_ARCHIVE" ]]; then
-      qarg="/opt/constructive-build/input-artifacts/$(basename "$QCOM_DRIVER_ARCHIVE")"
-    elif [[ -n "$QCOM_DRIVER_URL" ]]; then
-      qarg="--url '$QCOM_DRIVER_URL'"
-    fi
-    if [[ -n "$qarg" ]]; then
-      cat >> "$hook" <<HOOK
-chmod +x /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh || true
-bash /opt/constructive-build/qcom-firmware-updater/qcom-firmware-updater.sh --device-path '$QCOM_DEVICE_PATH' $qarg
-HOOK
-    else
-      cat >> "$hook" <<'HOOK'
-echo 'qcom-firmware-updater staged but not executed: no local archive or URL was supplied.'
-HOOK
-    fi
-  fi
   cat >> "$hook" <<'HOOK'
 update-initramfs -c -k all || update-initramfs -u -k all || true
 update-grub || true
@@ -976,6 +1026,12 @@ MD
 # -----------------------------
 # Apply source modifications
 # -----------------------------
+extract_qcom_firmware_isolated
+if [[ "$ENABLE_QCOM_FW" -eq 1 && -n "$QCOM_STAGED_FIRMWARE_DIR" && -d "$QCOM_STAGED_FIRMWARE_DIR" && "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$CURRENT_RELEASE_DIR/input-artifacts/qcom-firmware-staged"
+  cp -a "$QCOM_STAGED_FIRMWARE_DIR"/. "$CURRENT_RELEASE_DIR/input-artifacts/qcom-firmware-staged/"
+fi
+
 copy_artifacts_to_container_includes "core-image"
 copy_artifacts_to_container_includes "desktop-image"
 copy_artifacts_to_live_iso
@@ -1096,6 +1152,8 @@ cat > "$FINAL_JSON" <<JSON
   "qcom_device_path": "$QCOM_DEVICE_PATH",
   "qcom_driver_archive": "${QCOM_DRIVER_ARCHIVE}",
   "qcom_driver_url": "${QCOM_DRIVER_URL}",
+  "qcom_prestaged_dir": "${QCOM_PRESTAGED_DIR}",
+  "qcom_staged_firmware_dir": "${QCOM_STAGED_FIRMWARE_DIR}",
   "repositories": {
     "pico-image": {"commit":"$(git -C "$(repo_path pico-image)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path pico-image)" rev-parse --abbrev-ref HEAD)"},
     "core-image": {"commit":"$(git -C "$(repo_path core-image)" rev-parse HEAD)", "branch":"$(git -C "$(repo_path core-image)" rev-parse --abbrev-ref HEAD)"},
