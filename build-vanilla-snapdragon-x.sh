@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.8.sh
+# build-vanilla-arm64-release-v2.5.9.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.8
+# Version: 2.5.9
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.8"
+SCRIPT_VERSION="2.5.9"
 SCRIPT_NAME="$(basename "$0")"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
@@ -1840,6 +1840,154 @@ vib_deep_diagnostics() {
 }
 
 
+validate_recipe_yaml_parse() {
+  # Parse recipe.yml with PyYAML before invoking Vib. Vib can exit 1 without
+  # explaining YAML parser failures, so this preflight reports line/column and
+  # nearby source context directly in the command log.
+  local workdir="$1"
+  local log="$2"
+  local recipe="$workdir/recipe.yml"
+
+  {
+    printf '\n## YAML parse validation\n'
+    printf 'recipe: %s\n' "$recipe"
+  } >>"$log"
+
+  python3 - "$recipe" >>"$log" 2>&1 <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+def print_context(line_no, radius=6):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        print(f"YAML_CONTEXT_ERROR: could not read recipe for context: {exc}")
+        return
+    if not line_no:
+        print("YAML_CONTEXT: line number unavailable")
+        return
+    start = max(1, line_no - radius)
+    end = min(len(lines), line_no + radius)
+    print(f"YAML_CONTEXT: showing lines {start}-{end}")
+    for idx in range(start, end + 1):
+        marker = ">>" if idx == line_no else "  "
+        print(f"{marker} {idx:04d}: {lines[idx-1]}")
+
+try:
+    import yaml
+except Exception as exc:
+    print("YAML_VALIDATION_DEPENDENCY_ERROR:")
+    print(f"  Python could not import PyYAML module 'yaml': {exc}")
+    print("  Install Debian package: python3-yaml")
+    print("  Suggested command: apt-get update && apt-get install -y python3-yaml")
+    sys.exit(22)
+
+try:
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+except yaml.YAMLError as exc:
+    print("YAML_PARSE_ERROR:")
+    print(f"  {exc}")
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    if mark is not None:
+        line_no = int(mark.line) + 1
+        col_no = int(mark.column) + 1
+        print(f"YAML_ERROR_LOCATION: line {line_no}, column {col_no}")
+        print_context(line_no)
+    else:
+        print_context(None)
+    sys.exit(23)
+except Exception as exc:
+    print("YAML_PARSE_UNEXPECTED_ERROR:")
+    print(f"  {type(exc).__name__}: {exc}")
+    sys.exit(24)
+
+if not isinstance(data, dict):
+    print("YAML_STRUCTURE_ERROR: top-level recipe document is not a mapping")
+    sys.exit(25)
+
+required = ["name", "id", "vibversion", "stages"]
+missing = [k for k in required if k not in data]
+if missing:
+    print("YAML_STRUCTURE_ERROR: missing required top-level keys:", ", ".join(missing))
+    sys.exit(26)
+
+if not isinstance(data.get("stages"), list) or not data["stages"]:
+    print("YAML_STRUCTURE_ERROR: stages must be a non-empty list")
+    sys.exit(27)
+
+print("YAML_PARSE_OK")
+PY
+  return $?
+}
+
+validate_fsguard_plugin_abi() {
+  local workdir="$1"
+  local log="$2"
+  local plugin="$workdir/plugins/fsguard.so"
+  local status=0
+
+  if ! grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$workdir/recipe.yml"; then
+    return 0
+  fi
+
+  {
+    printf '\n## fsguard plugin ABI validation\n'
+    printf 'plugin: %s\n' "$plugin"
+
+    if [[ ! -s "$plugin" ]]; then
+      printf 'FSGUARD_PLUGIN_ERROR: missing or empty fsguard plugin\n'
+      exit 31
+    fi
+
+    if command -v file >/dev/null 2>&1; then
+      file "$plugin" || true
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+      printf '\nldd plugins/fsguard.so:\n'
+      ldd "$plugin" || exit 32
+    fi
+
+    if command -v nm >/dev/null 2>&1; then
+      printf '\nExported Vib plugin symbols:\n'
+      nm -D "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
+    elif command -v readelf >/dev/null 2>&1; then
+      printf '\nExported Vib plugin symbols:\n'
+      readelf -Ws "$plugin" 2>/dev/null | grep -E 'PlugInfo|BuildModule' || exit 33
+    else
+      printf 'WARN: neither nm nor readelf is available for symbol validation.\n'
+    fi
+
+    printf 'FSGUARD_PLUGIN_ABI_OK\n'
+  } >>"$log" 2>&1 || status=$?
+
+  return "$status"
+}
+
+validate_required_recipe_plugins() {
+  local workdir="$1"
+  local log="$2"
+
+  {
+    printf '\n## Required recipe plugin validation\n'
+    printf 'recipe plugin types:\n'
+    awk '
+      /^[[:space:]]*type:[[:space:]]*/ {
+        line=$0
+        gsub(/^[[:space:]]*type:[[:space:]]*/, "", line)
+        gsub(/[[:space:]]*$/, "", line)
+        print line
+      }
+    ' "$workdir/recipe.yml" | sort -u
+  } >>"$log" 2>&1 || true
+
+  validate_fsguard_plugin_abi "$workdir" "$log"
+}
+
+
 vib_preflight() {
   # Emit detailed, command-log-friendly Vib diagnostics before invoking
   # `vib build`. This version prints an explicit PASS/FAIL verdict for every
@@ -1975,6 +2123,9 @@ vib_preflight() {
     printf 'FAIL %s\n' "$failed_check" >>"$log"
     fail "Vib preflight failed: $failed_check"
     warn "This explains a silent 'vib build recipe.yml' exit."
+    warn "YAML parser details and source context are in the preflight log:"
+    warn "  $log"
+    grep -nE 'YAML_(VALIDATION_DEPENDENCY_ERROR|PARSE_ERROR|PARSE_UNEXPECTED_ERROR|ERROR_LOCATION|CONTEXT|STRUCTURE_ERROR)|^>> ' "$log" >&2 || true
     print_failure_tail "$log"
     return 1
   fi
