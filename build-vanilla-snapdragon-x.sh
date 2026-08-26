@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.12
+# Version 7.0.13
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,27 +13,26 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.12 corrections after the v7.0.11 ARM64 live-package field test:
-#   - Adds iucode-tool to the explicit ARM64 exclusion set. It is an Intel/x86
-#     microcode helper and has no candidate in the configured ARM64 snapshot.
-#   - Makes the actual source strategy explicit: custom-image uses main,
-#     live-iso uses orchid, and the published target/base containers use dev
-#     tags. The script does not claim that every Git source has a dev branch.
-#   - Records commit date, age, exact tags, and requested-ref kind for the
-#     custom-image and live-iso checkouts; an old live-iso date is reported as
-#     upstream repository state rather than a failed refresh.
-#   - Generates a complete derived ARM64 package inventory and runs an isolated
-#     candidate preflight against the configured mirror before live-build.
-#     Every remaining unavailable direct package is reported in one result.
-#   - Candidate preflight is diagnostic and fail-closed. It never silently
-#     removes packages beyond the explicit reviewed exclusion set.
-#   - Preserves all v7.0.11 source, Vib/FsGuard, firmware, DTB, target OCI,
-#     package receipt, package archive, graphical closure, and remaster guards.
+# v7.0.13 corrections after the v7.0.12 GRUB/DTB field test:
+#   - Fixes GRUB command parsing for the official live-iso template, which uses
+#     a tab between the `linux` command and KERNEL_LIVE. The previous parser
+#     accepted only a literal space, so it rewrote the kernel path but never
+#     inserted the selected devicetree directive.
+#   - Replaces the line-prefix heuristic with menuentry-aware parsing that
+#     accepts spaces or tabs after linux/linuxefi and initrd/initrdefi.
+#   - Inserts exactly one selected DTB directive immediately before each live
+#     initrd command, after removing only prior builder-managed DTB directives.
+#   - Validates every patched live menuentry before ISO creation and repeats the
+#     same kernel/initrd/DTB binding validation against the final ISO.
+#   - Records original and patched GRUB files, unified diffs, checksums, and a
+#     per-file entry-count manifest for release diagnostics.
+#   - Preserves all v7.0.12 source, package-candidate, Vib/FsGuard, firmware,
+#     DTB, target OCI, graphical closure, and boot-only remaster safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.12"
+SCRIPT_VERSION="7.0.13"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -151,6 +150,7 @@ LIVE_PACKAGE_LIST_EXCLUSION_MANIFEST=""
 LIVE_PACKAGE_LIST_PACKAGE_INVENTORY=""
 LIVE_PACKAGE_CANDIDATE_REPORT=""
 SOURCE_PROVENANCE_MANIFEST=""
+GRUB_PATCH_MANIFEST=""
 LIVE_SOURCE_COMMIT=""
 CUSTOM_SOURCE_COMMIT=""
 SOURCES_SYNCHRONIZED=0
@@ -465,7 +465,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.12-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.13-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -3363,33 +3363,360 @@ mount_chroot_filesystems() {
   mount --bind /run "$root/run"
 }
 
-patch_live_grub_file() {
+verify_live_grub_bindings() {
+  # Verify that every menuentry selecting the exact custom kernel also selects
+  # the exact custom initramfs and exactly one selected DTB before initrd.
+  #
+  # Print the number of validated live entries to stdout. Diagnostics go to
+  # stderr so callers may safely capture the count.
   local file="$1"
+  local release="$2"
+  local dtb="$3"
+
+  python3 - "$file" "$release" "$dtb" <<'VERIFY_GRUB_BINDINGS_PY'
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+release = sys.argv[2]
+dtb = sys.argv[3]
+data = path.read_text(encoding="utf-8", errors="strict")
+
+target_kernel = f"/live/vmlinuz-{release}"
+target_initrd = f"/live/initrd.img-{release}"
+target_dtb = f"/boot/dtbs/{dtb}"
+
+entry_start = re.compile(r'menuentry\s+(["\'])(.*?)\1\s*\{', re.S)
+linux_line = re.compile(
+    r"(?m)^[ \t]*linux(?:efi)?[ \t]+(?P<kernel>[^\s;{}]+)(?:[ \t]+.*)?$"
+)
+initrd_line = re.compile(
+    r"(?m)^[ \t]*initrd(?:efi)?[ \t]+(?P<initrd>[^\s;{}]+)(?:[ \t]+.*)?$"
+)
+dtb_line = re.compile(
+    r"(?m)^[ \t]*devicetree[ \t]+(?P<dtb>[^\s;{}]+)(?:[ \t]+.*)?$"
+)
+
+def menuentries(blob: str):
+    pos = 0
+    while True:
+        match = entry_start.search(blob, pos)
+        if not match:
+            return
+        depth = 1
+        index = match.end()
+        quote = None
+        escape = False
+        while index < len(blob) and depth:
+            char = blob[index]
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            index += 1
+        if depth:
+            raise SystemExit(f"{path}: unbalanced menuentry braces")
+        yield match.group(2), blob[match.start():index]
+        pos = index
+
+validated = 0
+for title, block in menuentries(data):
+    linux_matches = list(linux_line.finditer(block))
+    selected_linux = [m for m in linux_matches if m.group("kernel") == target_kernel]
+    if not selected_linux:
+        continue
+
+    if len(selected_linux) != 1:
+        raise SystemExit(
+            f"{path}: menuentry {title!r} has {len(selected_linux)} selected "
+            f"kernel commands; expected exactly one"
+        )
+
+    initrd_matches = [
+        m for m in initrd_line.finditer(block)
+        if m.group("initrd") == target_initrd
+    ]
+    if len(initrd_matches) != 1:
+        raise SystemExit(
+            f"{path}: menuentry {title!r} has {len(initrd_matches)} selected "
+            f"initrd commands; expected exactly one"
+        )
+
+    dtb_matches = [
+        m for m in dtb_line.finditer(block)
+        if m.group("dtb") == target_dtb
+    ]
+    if len(dtb_matches) != 1:
+        raise SystemExit(
+            f"{path}: menuentry {title!r} has {len(dtb_matches)} selected "
+            f"DTB directives; expected exactly one"
+        )
+
+    if dtb_matches[0].start() > initrd_matches[0].start():
+        raise SystemExit(
+            f"{path}: menuentry {title!r} places devicetree after initrd"
+        )
+
+    validated += 1
+
+if validated == 0:
+    raise SystemExit(
+        f"{path}: no menuentry selects the exact custom kernel {target_kernel}"
+    )
+
+print(validated)
+VERIFY_GRUB_BINDINGS_PY
+}
+
+patch_live_grub_file() {
+  # Patch one GRUB configuration in the extracted ISO tree.
+  #
+  # The official orchid template uses:
+  #   linux<TAB>KERNEL_LIVE APPEND_LIVE ---
+  # A literal-space startswith() test therefore misses the command. Parse
+  # complete menuentry blocks and accept all horizontal whitespace instead.
+  local file="$1"
+  local iso_root="$2"
   [[ -f "$file" ]] || return 0
 
-  sed -i -E \
-    -e "s#(/live/)?vmlinuz-[^[:space:]'\"]+#/live/vmlinuz-${KERNEL_RELEASE}#g" \
-    -e "s#(/live/)?initrd\.img-[^[:space:]'\"]+#/live/initrd.img-${KERNEL_RELEASE}#g" \
-    "$file"
+  local relative="${file#"$iso_root"/}"
+  local evidence_root="$TMP_ROOT/grub-patches"
+  local original_copy="$evidence_root/original/$relative"
+  local patched_copy="$evidence_root/patched/$relative"
+  local diff_file="$evidence_root/diffs/$relative.diff"
+  local temporary="$file.builder-patched.$$"
+  local metadata="$file.builder-metadata.$$"
+  local before_sha after_sha live_entries verified_entries rc
 
-  python3 - "$file" "$DTB_NAME" <<'PATCH_GRUB_PY'
-from pathlib import Path
+  mkdir -p \
+    "$(dirname "$original_copy")" \
+    "$(dirname "$patched_copy")" \
+    "$(dirname "$diff_file")"
+  cp -a "$file" "$original_copy"
+  before_sha="$(sha256sum "$file" | awk '{print $1}')"
+
+  set +e
+  python3 - "$file" "$temporary" "$metadata" "$KERNEL_RELEASE" "$DTB_NAME" <<'PATCH_GRUB_PY'
+from __future__ import annotations
+
+import re
 import sys
-path = Path(sys.argv[1])
-dtb = sys.argv[2]
-lines = path.read_text(errors="replace").splitlines()
-out = []
-for line in lines:
-    if "devicetree /boot/dtbs/" in line:
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+metadata = Path(sys.argv[3])
+release = sys.argv[4]
+dtb = sys.argv[5]
+
+data = source.read_text(encoding="utf-8", errors="strict")
+target_kernel = f"/live/vmlinuz-{release}"
+target_initrd = f"/live/initrd.img-{release}"
+target_dtb = f"/boot/dtbs/{dtb}"
+marker = "CONCEPTION_ARM64_DTB_MANAGED"
+
+entry_start = re.compile(r'menuentry\s+(["\'])(.*?)\1\s*\{', re.S)
+linux_line = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)"
+    r"(?P<command>linux(?:efi)?)(?P<separator>[ \t]+)"
+    r"(?P<kernel>KERNEL_LIVE|LINUX_LIVE|(?:/live/)?vmlinuz-[^\s;{}]+)"
+    r"(?P<rest>[^\r\n]*)$"
+)
+initrd_line = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)"
+    r"(?P<command>initrd(?:efi)?)(?P<separator>[ \t]+)"
+    r"(?P<initrd>INITRD_LIVE|(?:/live/)?initrd\.img-[^\s;{}]+)"
+    r"(?P<rest>[^\r\n]*)$"
+)
+managed_dtb = re.compile(
+    rf"(?m)^[ \t]*(?:#[ \t]*{re.escape(marker)}[ \t]*\r?\n)?"
+    r"[ \t]*devicetree[ \t]+/boot/dtbs/[^\s;{}]+"
+    rf"(?:[ \t]+#[ \t]*{re.escape(marker)})?[ \t]*\r?\n?"
+)
+
+def find_entries(blob: str):
+    entries = []
+    pos = 0
+    while True:
+        match = entry_start.search(blob, pos)
+        if not match:
+            break
+        depth = 1
+        index = match.end()
+        quote = None
+        escape = False
+        while index < len(blob) and depth:
+            char = blob[index]
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            index += 1
+        if depth:
+            raise SystemExit(f"{source}: unbalanced menuentry braces")
+        entries.append((match.start(), index, match.group(2)))
+        pos = index
+    return entries
+
+entries = find_entries(data)
+patches = []
+
+for start, end, title in entries:
+    block = data[start:end]
+    linux_match = linux_line.search(block)
+    initrd_match = initrd_line.search(block)
+    if not linux_match or not initrd_match:
         continue
-    out.append(line)
-    stripped = line.lstrip()
-    if stripped.startswith("linux ") or stripped.startswith("linuxefi "):
-        indent = line[:len(line)-len(stripped)]
-        out.append(f"{indent}devicetree /boot/dtbs/{dtb}")
-path.write_text("\n".join(out) + "\n")
+
+    # This is a live entry only when both commands use known live placeholders
+    # or concrete live kernel/initrd paths.
+    kernel_token = linux_match.group("kernel")
+    initrd_token = initrd_match.group("initrd")
+    kernel_is_live = (
+        kernel_token in {"KERNEL_LIVE", "LINUX_LIVE"}
+        or "vmlinuz-" in kernel_token
+    )
+    initrd_is_live = (
+        initrd_token == "INITRD_LIVE"
+        or "initrd.img-" in initrd_token
+    )
+    if not (kernel_is_live and initrd_is_live):
+        continue
+
+    # Remove only a previously builder-managed /boot/dtbs directive. Preserve
+    # unrelated GRUB commands and any non-builder device-tree handling.
+    block = managed_dtb.sub("", block)
+
+    linux_match = linux_line.search(block)
+    initrd_match = initrd_line.search(block)
+    if not linux_match or not initrd_match:
+        raise SystemExit(
+            f"{source}: live menuentry {title!r} became unparsable"
+        )
+
+    replacement_linux = (
+        f"{linux_match.group('indent')}"
+        f"{linux_match.group('command')}"
+        f"{linux_match.group('separator')}"
+        f"{target_kernel}"
+        f"{linux_match.group('rest')}"
+    )
+    block = (
+        block[:linux_match.start()]
+        + replacement_linux
+        + block[linux_match.end():]
+    )
+
+    # Re-search after the kernel replacement because string offsets changed.
+    initrd_match = initrd_line.search(block)
+    if not initrd_match:
+        raise SystemExit(
+            f"{source}: live menuentry {title!r} lacks initrd after rewrite"
+        )
+    replacement_initrd = (
+        f"{initrd_match.group('indent')}"
+        f"# {marker}\n"
+        f"{initrd_match.group('indent')}devicetree {target_dtb}\n"
+        f"{initrd_match.group('indent')}"
+        f"{initrd_match.group('command')}"
+        f"{initrd_match.group('separator')}"
+        f"{target_initrd}"
+        f"{initrd_match.group('rest')}"
+    )
+    block = (
+        block[:initrd_match.start()]
+        + replacement_initrd
+        + block[initrd_match.end():]
+    )
+
+    patches.append((start, end, block, title))
+
+# Files with no live menuentries are valid auxiliary GRUB snippets and remain
+# byte-identical. Files that contain a live kernel token but were not parsed are
+# rejected rather than silently skipped.
+if not patches:
+    suspicious = bool(
+        re.search(r"(?m)^[ \t]*linux(?:efi)?[ \t]+.*(?:KERNEL_LIVE|/live/vmlinuz-)", data)
+        or re.search(r"(?m)^[ \t]*initrd(?:efi)?[ \t]+.*(?:INITRD_LIVE|/live/initrd\.img-)", data)
+    )
+    if suspicious:
+        raise SystemExit(
+            f"{source}: live boot commands were detected but no complete "
+            "menuentry could be patched"
+        )
+    destination.write_text(data, encoding="utf-8")
+    metadata.write_text("0\n", encoding="utf-8")
+    raise SystemExit(0)
+
+for start, end, block, _title in reversed(patches):
+    data = data[:start] + block + data[end:]
+
+# Internal validation before writing the patched file.
+for _start, _end, _block, title in patches:
+    pass
+
+destination.write_text(data, encoding="utf-8")
+metadata.write_text(f"{len(patches)}\n", encoding="utf-8")
 PATCH_GRUB_PY
+  rc=$?
+  set -e
+
+  if (( rc != 0 )); then
+    rm -f "$temporary" "$metadata"
+    die "Unable to patch GRUB file for custom kernel/DTB binding: $relative"
+  fi
+
+  live_entries="$(cat "$metadata")"
+  rm -f "$metadata"
+  [[ "$live_entries" =~ ^[0-9]+$ ]] || \
+    die "Invalid GRUB patch metadata for $relative"
+
+  if (( live_entries == 0 )); then
+    rm -f "$temporary"
+    printf '%s\t0\t0\t%s\t%s\n' \
+      "$relative" "$before_sha" "$before_sha" "no live menuentries" \
+      >> "$GRUB_PATCH_MANIFEST"
+    return 0
+  fi
+
+  mv -f "$temporary" "$file"
+  verified_entries="$(verify_live_grub_bindings "$file" "$KERNEL_RELEASE" "$DTB_NAME")"
+  [[ "$verified_entries" == "$live_entries" ]] || \
+    die "GRUB patch verification count mismatch for $relative: patched=$live_entries verified=$verified_entries"
+
+  after_sha="$(sha256sum "$file" | awk '{print $1}')"
+  cp -a "$file" "$patched_copy"
+  diff -u "$original_copy" "$patched_copy" > "$diff_file" || true
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$relative" "$live_entries" "$verified_entries" \
+    "$before_sha" "$after_sha" "$diff_file" \
+    >> "$GRUB_PATCH_MANIFEST"
+
+  ok "Patched $live_entries live GRUB menuentry/entries in $relative with selected DTB."
 }
+
 
 remaster_boot_hardware_only() {
   local iso_tree="$TMP_ROOT/iso-tree"
@@ -3454,10 +3781,31 @@ remaster_boot_hardware_only() {
   cp -a "$UPSTREAM_MANIFEST" "$iso_tree/live/filesystem.packages"
   cp -a "$UPSTREAM_REMOVE_MANIFEST" "$iso_tree/live/filesystem.packages-remove"
 
+  GRUB_PATCH_MANIFEST="$TMP_ROOT/grub-patch-manifest.tsv"
+  printf 'grub_file\tlive_entries\tverified_entries\tbefore_sha256\tafter_sha256\tdiff_file\n' \
+    > "$GRUB_PATCH_MANIFEST"
+
   while IFS= read -r -d '' cfg; do
-    patch_live_grub_file "$cfg"
-  done < <(find "$iso_tree/boot/grub" "$iso_tree/EFI" -type f \
-    \( -name '*.cfg' -o -name 'grub.cfg' -o -name 'loopback.cfg' \) -print0 2>/dev/null)
+    patch_live_grub_file "$cfg" "$iso_tree"
+  done < <(
+    find -L "$iso_tree/boot/grub" "$iso_tree/EFI" -type f \
+      \( -name '*.cfg' -o -name 'grub.cfg' -o -name 'loopback.cfg' \) \
+      -print0 2>/dev/null
+  )
+
+  local grub_live_entries
+  grub_live_entries="$(
+    awk -F '\t' 'NR > 1 { total += $2 } END { print total + 0 }' \
+      "$GRUB_PATCH_MANIFEST"
+  )"
+  (( grub_live_entries > 0 )) ||     die "No live GRUB menuentries were patched in the extracted ISO tree."
+
+  awk -F '\t' '
+    NR > 1 && $1 == "boot/grub/grub.cfg" && $2 > 0 { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$GRUB_PATCH_MANIFEST" ||     die "Primary boot/grub/grub.cfg was not patched with a live kernel/DTB binding."
+
+  ok "Validated $grub_live_entries live GRUB menuentry binding(s) before ISO creation."
 
   rm -f "$new_squash"
   mksquashfs "$squash_root" "$new_squash" -noappend -comp "$compression" >/dev/null
@@ -3512,8 +3860,19 @@ verify_final_release() {
   [[ -s "$verify_dir/$DTB_NAME" ]] || die "Final ISO lacks the selected DTB."
 
   extract_iso_file "$FINAL_ISO" /boot/grub/grub.cfg "$verify_dir/grub.cfg"
-  grep -Fq "/live/vmlinuz-$KERNEL_RELEASE" "$verify_dir/grub.cfg" || die "Final GRUB config does not select the custom kernel."
-  grep -Fq "devicetree /boot/dtbs/$DTB_NAME" "$verify_dir/grub.cfg" || die "Final GRUB config lacks the selected DTB directive."
+  [[ -s "$verify_dir/grub.cfg" ]] || die "Final ISO lacks nonempty /boot/grub/grub.cfg."
+
+  local final_grub_entries
+  final_grub_entries="$(
+    verify_live_grub_bindings "$verify_dir/grub.cfg" "$KERNEL_RELEASE" "$DTB_NAME"
+  )"
+  (( final_grub_entries > 0 )) ||     die "Final GRUB config contains no validated custom kernel/initrd/DTB menuentry."
+
+  grep -Fq "/live/vmlinuz-$KERNEL_RELEASE" "$verify_dir/grub.cfg" ||     die "Final GRUB config does not select the custom kernel."
+  grep -Eq "^[[:space:]]*devicetree[[:space:]]+/boot/dtbs/${DTB_NAME//./\.}([[:space:]]|$)"     "$verify_dir/grub.cfg" ||     die "Final GRUB config lacks the selected DTB directive."
+
+  cp -a "$verify_dir/grub.cfg" "$RELEASE_DIR/final-grub.cfg"
+  ok "Final GRUB binding verification passed for $final_grub_entries live menuentry/entries."
 
   extract_iso_file "$FINAL_ISO" /live/filesystem.squashfs "$final_squash"
   unsquashfs -ll "$final_squash" > "$squash_listing"
@@ -3542,6 +3901,11 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/kernel-package-selection.tsv" "$RELEASE_DIR/"
+  [[ -n "$GRUB_PATCH_MANIFEST" && -f "$GRUB_PATCH_MANIFEST" ]] &&     cp -a "$GRUB_PATCH_MANIFEST" "$RELEASE_DIR/"
+  if [[ -d "$TMP_ROOT/grub-patches" ]]; then
+    mkdir -p "$RELEASE_DIR/grub-patches"
+    cp -a "$TMP_ROOT/grub-patches/." "$RELEASE_DIR/grub-patches/"
+  fi
   mkdir -p "$RELEASE_DIR/deb-listings"
   cp -a "$TMP_ROOT/deb-listings/." "$RELEASE_DIR/deb-listings/"
   [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
@@ -3584,6 +3948,7 @@ Installed package receipt:   /usr/lib/conception/target-installed-kernel-package
 Runtime dpkg-query required: no
 Live boot .debs:             ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
+GRUB binding evidence:       grub-patch-manifest.tsv and final-grub.cfg
 Firmware source:             ${FIRMWARE_SOURCE:-none}
 Target /root source:         ${ROOT_SOURCE:-none}
 Target OCI:                  $TARGET_IMAGE_REF
