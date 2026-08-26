@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v3.0.0.sh
+# build-vanilla-arm64-release-v4.0.0.sh
 #
 # Conception Vanilla ARM64 Installer ISO Builder
-# Version: 3.0.0
+# Version: 4.0.0
 #
 # Purpose:
 #   Deterministically build the upstream VanillaOS installer-only ARM64 UEFI ISO
-#   from Vanilla-OS/live-iso, local board-specific artifacts, and optional
+#   from the proven vanilla-arm/live-iso ARM64 fork, local board-specific artifacts, and optional
 #   staged Qualcomm firmware, while preserving release provenance.
 #
 # Primary build host:
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="4.0.0"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -59,6 +59,10 @@ BOOT_NORMAL_ARGS="${BOOT_NORMAL_ARGS:-quiet splash bgrt_disable}"
 BOOT_FIRMWARE_FB_ARGS="${BOOT_FIRMWARE_FB_ARGS:-console=tty0 keep_bootcon ignore_loglevel loglevel=7 systemd.show_status=1 rd.systemd.show_status=1 plymouth.enable=0 rd.plymouth=0 nomodeset}"
 INITRAMFS_MODULES_POLICY="${INITRAMFS_MODULES_POLICY:-most}"
 EXPECTED_CUSTOM_KERNEL_RELEASE="${EXPECTED_CUSTOM_KERNEL_RELEASE:-}"  # optional exact-release safety constraint; artifacts are authoritative by default
+VANILLA_ARM_DESKTOP_IMAGE="${VANILLA_ARM_DESKTOP_IMAGE:-ghcr.io/vanilla-arm/desktop:test}"
+INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
+FORCE_CLEAN_LIVE_BUILD="${FORCE_CLEAN_LIVE_BUILD:-1}"
+VERIFY_INSTALLER_RUNTIME_IN_ISO="${VERIFY_INSTALLER_RUNTIME_IN_ISO:-1}"
 
 # ----------------------------- UI helpers -----------------------------
 
@@ -2293,6 +2297,49 @@ verify_built_iso_custom_boot_artifacts() {
       fail "Generated ISO live filesystem does not contain custom kernel release $expected_kver."
       warn "Verification log: $log"
       return 1
+    fi
+
+
+    if [[ "$VERIFY_INSTALLER_RUNTIME_IN_ISO" == "1" ]]; then
+      local squash_listing="$work/squashfs-listing.txt"
+      unsquashfs -ll "$squashfs" >"$squash_listing" 2>>"$log" || {
+        fail "Unable to list filesystem.squashfs for installer-runtime verification."
+        return 1
+      }
+
+      for required_path in \
+        'usr/bin/vanilla-installer' \
+        'usr/bin/gnome-shell' \
+        'usr/local/bin/vanilla-installer-arm64' \
+        'etc/systemd/system/vanilla-installer.service.d/10-conception-arm64.conf' \
+        'etc/conception-vanilla-arm/installer.conf'; do
+        grep -Fq "$required_path" "$squash_listing" || {
+          fail "Generated ISO live filesystem is missing required installer runtime path: /$required_path"
+          warn "Verification log: $log"
+          return 1
+        }
+      done
+
+      if ! grep -Eq 'usr/lib/.*/libmutter-[^/]*\.so|usr/lib/.*/mutter-[^/]*' "$squash_listing"; then
+        fail "Generated ISO live filesystem lacks the Mutter runtime required by Vanilla Installer."
+        warn "Verification log: $log"
+        return 1
+      fi
+
+      if ! unsquashfs -cat "$squashfs" etc/systemd/system/vanilla-installer.service.d/10-conception-arm64.conf 2>>"$log" \
+          | grep -Fq "Environment=IGNORE_CPU=$INSTALLER_IGNORE_CPU"; then
+        fail "Generated ISO lacks the expected Vanilla Installer IGNORE_CPU service override."
+        warn "Verification log: $log"
+        return 1
+      fi
+
+      if ! unsquashfs -cat "$squashfs" etc/conception-vanilla-arm/installer.conf 2>>"$log" \
+          | grep -Fq "VANILLA_ARM_DESKTOP_IMAGE=$VANILLA_ARM_DESKTOP_IMAGE"; then
+        fail "Generated ISO does not record the expected ARM desktop OCI image."
+        warn "Verification log: $log"
+        return 1
+      fi
+      ok "Live installer runtime and ARM desktop OCI guidance verified in filesystem.squashfs."
     fi
   else
     warn "Could not inspect filesystem.squashfs; skipping kernel-content verification."
@@ -4884,50 +4931,49 @@ isolated to Stage 9." "1" \
 }
 
 
-prepare_live_iso_v3_tree() {
-  # Configure the upstream installer-only live-iso tree for ARM64. This keeps
-  # Vanilla's installer package-list model and avoids composing the separate
-  # core-image and desktop-image projects.
+prepare_live_iso_v4_tree() {
+  # Configure the proven vanilla-arm/live-iso fork for an ARM64 installer-only
+  # build. Preserve the fork's native architecture-aware build.sh behavior.
+  # The live medium remains an installer environment; the immutable installed
+  # system is selected through Vanilla Installer's Custom Image workflow.
   local live="$SOURCES_DIR/live-iso"
   local conf="$live/etc/terraform.conf"
   local build="$live/build.sh"
   local pkgdir="$live/etc/config/package-lists.vanilla-installer"
   local runtime_list="$pkgdir/zz-conception-installer-runtime.list.chroot"
+  local includes="$live/etc/config/includes.chroot"
+  local override="$includes/etc/systemd/system/vanilla-installer.service.d/10-conception-arm64.conf"
+  local user_override="$includes/etc/systemd/user/vanilla-installer.service.d/10-conception-arm64.conf"
+  local wrapper="$includes/usr/local/bin/vanilla-installer-arm64"
+  local profile="$includes/etc/profile.d/conception-vanilla-arm.sh"
+  local defaults="$includes/etc/conception-vanilla-arm/installer.conf"
+  local motd="$includes/etc/motd.d/90-conception-vanilla-arm"
 
   [[ -d "$live/.git" ]] || die "live-iso Git checkout is missing: $live"
   [[ -f "$conf" ]] || die "live-iso terraform.conf is missing: $conf"
   [[ -f "$build" ]] || die "live-iso build.sh is missing: $build"
 
-  # Architecture is selected by terraform.conf and passed through auto/config.
+  # The vanilla-arm fork supports arm64 natively and uses BUILD_ARCH in its
+  # temporary and output paths. Set the architecture explicitly and verify the
+  # native behavior rather than rewriting the fork back into an upstream shape.
   sed -i 's/^ARCH=.*/ARCH="arm64"/' "$conf"
   grep -q '^ARCH=' "$conf" || printf 'ARCH="arm64"\n' >>"$conf"
   sed -i 's/^PACKAGE_LISTS_SUFFIX=.*/PACKAGE_LISTS_SUFFIX="vanilla-installer"/' "$conf"
   grep -q '^PACKAGE_LISTS_SUFFIX=' "$conf" || printf 'PACKAGE_LISTS_SUFFIX="vanilla-installer"\n' >>"$conf"
 
-  # Upstream currently moves an amd64-named result regardless of BUILD_ARCH.
-  # Make the source and destination architecture-aware without changing the
-  # live-build logic itself.
-  python3 - "$build" <<'PYBUILD'
-from pathlib import Path
-import sys
-p=Path(sys.argv[1])
-s=p.read_text()
-s=s.replace('mv $BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso "$OUTPUT_DIR/${FNAME}.iso"',
-            'mv "$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"')
-s=s.replace('mv "$BASE_DIR/tmp/amd64/live-image-amd64.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"',
-            'mv "$BASE_DIR/tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso" "$OUTPUT_DIR/${FNAME}.iso"')
-if 'tmp/amd64/live-image-amd64.hybrid.iso' in s:
-    raise SystemExit('Unable to replace upstream hard-coded amd64 ISO output path')
-p.write_text(s)
-PYBUILD
+  grep -Fq 'tmp/$BUILD_ARCH/live-image-$BUILD_ARCH.hybrid.iso' "$build" || {
+    fail "The selected live-iso checkout lacks the vanilla-arm architecture-aware ISO output path."
+    fail "Expected build.sh to reference tmp/\$BUILD_ARCH/live-image-\$BUILD_ARCH.hybrid.iso"
+    return 1
+  }
 
-  # The live medium only needs the graphical runtime required to launch the
-  # installer. The installed immutable/A-B system remains repository-driven at
-  # install time. Keep this list separate and builder-managed.
+  # Keep the live package closure narrowly scoped to the graphical installer.
+  # The target desktop is not copied into filesystem.squashfs; it is installed
+  # from the ARM OCI image selected in Vanilla Installer.
   mkdir -p "$pkgdir"
   cat >"$runtime_list" <<'EOF_RUNTIME'
-# Installer-session runtime only; target-system packages are downloaded by
-# Vanilla Installer from the configured Vanilla repositories.
+# Graphical installer-session runtime only. The target immutable desktop is
+# deployed by Vanilla Installer from an OCI image.
 vanilla-installer
 gnome-shell
 gnome-session
@@ -4938,13 +4984,62 @@ gdm3
 xwayland
 network-manager
 sudo
+dbus-x11
 EOF_RUNTIME
+
+  # ARM64 CPU topology can omit socket information. The known Vanilla Installer
+  # workaround is IGNORE_CPU=1. Apply it only to the live installer service and
+  # provide a manual launcher with the same environment for recovery shells.
+  mkdir -p "$(dirname "$override")" "$(dirname "$user_override")" \
+           "$(dirname "$wrapper")" "$(dirname "$profile")" \
+           "$(dirname "$defaults")" "$(dirname "$motd")"
+
+  cat >"$override" <<EOF_OVERRIDE
+[Service]
+Environment=IGNORE_CPU=$INSTALLER_IGNORE_CPU
+Environment=VANILLA_ARM_DESKTOP_IMAGE=$VANILLA_ARM_DESKTOP_IMAGE
+EOF_OVERRIDE
+  cp -a "$override" "$user_override"
+
+  cat >"$wrapper" <<EOF_WRAPPER
+#!/bin/sh
+set -eu
+export IGNORE_CPU="$INSTALLER_IGNORE_CPU"
+export VANILLA_ARM_DESKTOP_IMAGE="$VANILLA_ARM_DESKTOP_IMAGE"
+exec vanilla-installer "\$@"
+EOF_WRAPPER
+  chmod 0755 "$wrapper"
+
+  cat >"$profile" <<EOF_PROFILE
+# Generated by $SCRIPT_NAME $SCRIPT_VERSION for the live installer session.
+export VANILLA_ARM_DESKTOP_IMAGE="$VANILLA_ARM_DESKTOP_IMAGE"
+EOF_PROFILE
+
+  cat >"$defaults" <<EOF_DEFAULTS
+# Supported ARM64 installed-system image for Vanilla Installer:
+VANILLA_ARM_DESKTOP_IMAGE=$VANILLA_ARM_DESKTOP_IMAGE
+# In Vanilla Installer select "Install Custom Image (Advanced)" and enter the
+# image above. This file is an operator-visible default; no unverified private
+# installer API is assumed.
+EOF_DEFAULTS
+
+  cat >"$motd" <<EOF_MOTD
+Conception Vanilla ARM64 installer
+
+If the graphical installer does not start automatically, run:
+  vanilla-installer-arm64
+
+In "Install Custom Image (Advanced)", use:
+  $VANILLA_ARM_DESKTOP_IMAGE
+EOF_MOTD
 
   grep -q '^ARCH="arm64"' "$conf" || die "Unable to set ARM64 in terraform.conf"
   grep -q '^PACKAGE_LISTS_SUFFIX="vanilla-installer"' "$conf" || die "Unable to select installer-only package lists"
-  grep -q 'live-image-\$BUILD_ARCH.hybrid.iso' "$build" || die "Unable to make build.sh output path architecture-aware"
   [[ -s "$runtime_list" ]] || die "Installer runtime package list was not created"
-  ok "Prepared upstream live-iso tree for ARM64 installer-only build."
+  grep -q '^Environment=IGNORE_CPU=' "$override" || die "Installer system-service CPU override was not created"
+  grep -q '^Environment=IGNORE_CPU=' "$user_override" || die "Installer user-service CPU override was not created"
+  grep -Fq "$VANILLA_ARM_DESKTOP_IMAGE" "$defaults" || die "ARM desktop image default was not recorded"
+  ok "Prepared vanilla-arm live-iso tree for ARM64 custom-image installation."
 }
 
 patch_live_conf() {
@@ -4955,6 +5050,21 @@ patch_live_conf() {
   grep -q '^ARCH=' "$conf" || printf 'ARCH="arm64"\n' >>"$conf"
 }
 
+
+clean_live_iso_build_outputs() {
+  # Prevent a prior ISO or cached live-build chroot from being mistaken for the
+  # current revision. This is especially important when package lists or
+  # includes.chroot content changes but an old builds/arm64 artifact remains.
+  local live="$1"
+  [[ "$FORCE_CLEAN_LIVE_BUILD" == "1" ]] || return 0
+  info "Removing stale ARM64 live-build workspace and prior ARM64 ISO outputs."
+  rm -rf "$live/tmp/arm64"
+  if [[ -d "$live/builds/arm64" ]]; then
+    find "$live/builds/arm64" -maxdepth 1 -type f \
+      \( -name '*.iso' -o -name '*.md5.txt' -o -name '*.sha256.txt' \) -delete
+  fi
+}
+
 build_iso() {
   local live="$SOURCES_DIR/live-iso"
   local runtime
@@ -4963,8 +5073,9 @@ build_iso() {
   local action
 
   [[ -d "$live" ]] || die "live-iso source missing."
-  prepare_live_iso_v3_tree
+  prepare_live_iso_v4_tree
   patch_live_conf
+  clean_live_iso_build_outputs "$live"
   preflight_live_iso_container "$live" || die "Live ISO container preflight failed. See log above."
 
   runtime="$(live_iso_runtime_cmd)"
@@ -5069,6 +5180,7 @@ write_manifest() {
     printf '  "primary_dtb": "%s",\n' "${PRIMARY_DTB:-}"
     printf '  "qcom_mode": "%s",\n' "${QCOM_MODE:-skip}"
     printf '  "qcom_device_path": "%s",\n' "${QCOM_DEVICE_PATH:-}"
+    printf '  "vanilla_arm_desktop_image": "%s",\n' "$VANILLA_ARM_DESKTOP_IMAGE"
     printf '  "repositories": {\n'
     printf '    "live_iso": "%s"\n' "$(git_commit_or_unknown "$SOURCES_DIR/live-iso")"
     printf '  }\n'
@@ -5082,6 +5194,7 @@ write_manifest() {
     printf 'Script version: `%s`\n\n' "$SCRIPT_VERSION"
     printf 'Primary DTB: `%s`\n\n' "${PRIMARY_DTB:-none}"
     printf 'Qualcomm firmware mode: `%s`\n\n' "${QCOM_MODE:-skip}"
+    printf 'ARM desktop OCI image: `%s`\n\n' "$VANILLA_ARM_DESKTOP_IMAGE"
     printf 'Log: `%s`\n\n' "$LOG_FILE"
   } >"$md"
 }
@@ -5201,7 +5314,7 @@ fi
 
 cat >&2 <<EOF
 
-Conception Vanilla ARM64 Installer ISO Builder
+Conception Vanilla ARM64 Custom-Image Installer ISO Builder
 Version: $SCRIPT_VERSION
 
 Primary host assumption:
@@ -5218,6 +5331,7 @@ Default directories:
   Downloads:     $DOWNLOADS_DIR
   Releases:      $RELEASES_DIR
   Repo policy:   $REPO_POLICY
+  Desktop image: $VANILLA_ARM_DESKTOP_IMAGE
 
 EOF
 
@@ -5238,8 +5352,8 @@ configure_qcom_firmware
 stage 5 9 "Staging Qualcomm firmware without modifying the build host."
 stage_qcom_firmware
 
-stage 6 9 "Preparing installer-only ARM64 live-iso source tree."
-prepare_live_iso_v3_tree
+stage 6 9 "Preparing proven vanilla-arm ARM64 installer source tree."
+prepare_live_iso_v4_tree
 release_id="$(next_release_id)"
 release_dir_preview="$RELEASES_DIR/${BUILD_DATE}-${release_id}-${PROFILE}"
 mkdir -p "$release_dir_preview/logs"
@@ -5253,6 +5367,8 @@ Profile: $PROFILE
 Architecture: $ARCH
 Live ISO repository: $LIVE_REPO_URL ($LIVE_BRANCH)
 Live package-list mode: vanilla-installer
+ARM desktop OCI image: $VANILLA_ARM_DESKTOP_IMAGE
+Installer CPU override: IGNORE_CPU=$INSTALLER_IGNORE_CPU
 Primary DTB: ${PRIMARY_DTB:-none selected}
 Artifact directory: $ARTIFACT_DIR
 Derived custom kernel release: $(resolve_custom_kernel_release)
@@ -5260,16 +5376,17 @@ Qualcomm firmware mode: ${QCOM_MODE:-skip}
 Container runtime: $LIVE_ISO_CONTAINER_RUNTIME
 Requested container platform: $LIVE_ISO_CONTAINER_PLATFORM
 
-The target immutable/A-B VanillaOS system is installed from configured package
-repositories. This ISO contains only the live installer environment plus the
-user-supplied ARM64 kernel, initramfs, DTB, and optional firmware.
+The target immutable/A-B VanillaOS system is installed through Vanilla Installer
+using the ARM desktop OCI image shown above. This ISO contains the live graphical
+installer environment plus the user-supplied ARM64 kernel, initramfs, DTB, and
+optional firmware.
 EOF
 ok "Prepared stamped release directory: $release_dir_preview"
 
-stage 7 9 "Staging custom kernel, DTB, firmware, installer runtime, and GRUB configuration."
+stage 7 9 "Staging custom kernel, DTB, firmware, graphical installer runtime, and GRUB configuration."
 stage_customizations
 
-stage 8 9 "Building the installer-only ARM64 live ISO."
+stage 8 9 "Building the vanilla-arm ARM64 custom-image installer ISO."
 build_iso
 
 stage 9 9 "Archiving and verifying the ISO release artifact."
