@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.0.4-r3
+# Version 8.0.4-r4
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -13,6 +13,29 @@
 #   - The live filesystem remaster includes boot-critical hardware content plus
 #     the profile-aware offline installer delivery overlay. Upstream package
 #     manifests remain byte-identical to the accepted ARM64 baseline.
+#
+# v8.0.4-r4 profile-driven firmware package and board-data contract:
+#   - Promotes the hardware profile to schema version 2 and replaces the
+#     single hard-coded firmware-qcom-soc input with firmware.packages[].
+#   - Discovers firmware .deb inputs by Debian Package and Architecture control
+#     fields rather than filenames; package version strings and local filenames
+#     are opaque, while source, SHA-256, and expected-version pins remain
+#     deterministic and fail closed.
+#   - Supports required and optional firmware package roles, including split
+#     package sets such as firmware-qcom-soc plus firmware-qcom-dsp, without
+#     installing foreign-distribution firmware packages into the target.
+#   - Moves device firmware acceptance into firmware.required_paths[] and moves
+#     ATH11K board-data behavior into firmware.board_data.policy. Profiles that
+#     do not need replacement board-2 data use policy=none and inherit no HP
+#     WCN6855 checksum or subsystem predicates.
+#   - Retains schema-1 profile compatibility through an explicit in-memory
+#     migration to schema 2; HP compatibility profiles preserve the accepted
+#     103c:8d9a board-data and Adreno X1-45 requirements.
+#   - Generates a machine-readable firmware package lock, package inventory,
+#     extraction provenance, and resolved profile. Plan mode carries observed
+#     package hashes into the exact execute command through a JSON override.
+#   - Preserves the r3 package-name-independent kernel intake and the r2
+#     upstream-compatible encrypted custom-layout storage guard unchanged.
 #
 # v8.0.4-r3 package-name-independent kernel intake:
 #   - Selects the kernel by Debian payload semantics rather than Jens Glathe,
@@ -81,8 +104,8 @@
 #     creating compatibility symlinks or editing generated modules.
 #   - Resolves symlinked script invocation to a stable absolute SCRIPT_PATH and
 #     prints that path in the exact plan-to-execute command.
-#   - Treats a pinned Debian Sid firmware-qcom-soc_*_all.deb as the provenance-
-#     preserving source of generic Qualcomm SoC firmware. The package is
+#   - Treats profile-declared, SHA-256-pinned Debian firmware .debs as provenance-
+#     preserving sources and extracts them without installing foreign packages. The package is
 #     extracted, never installed into the VanillaOS image as a Sid package.
 #   - Layers generic package firmware first, then profile-specific firmware,
 #     and rejects non-identical duplicate destinations instead of silently
@@ -163,7 +186,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.0.4-r3"
+SCRIPT_VERSION="8.0.4-r4"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -204,6 +227,7 @@ ENV_FIRMWARE_QCOM_SOC_DEB_SET="${FIRMWARE_QCOM_SOC_DEB+x}"
 ENV_FIRMWARE_QCOM_SOC_SHA256_SET="${FIRMWARE_QCOM_SOC_SHA256+x}"
 ENV_FIRMWARE_QCOM_SOC_VERSION_SET="${FIRMWARE_QCOM_SOC_EXPECTED_VERSION+x}"
 ENV_FIRMWARE_QCOM_SOC_POLICY_SET="${FIRMWARE_QCOM_SOC_POLICY+x}"
+ENV_FIRMWARE_PACKAGE_OVERRIDES_SET="${FIRMWARE_PACKAGE_OVERRIDES_JSON+x}"
 ENV_KERNEL_RELEASE_SET="${EXPECTED_CUSTOM_KERNEL_RELEASE+x}"
 ENV_KERNEL_RELEASE_POLICY_SET="${KERNEL_RELEASE_POLICY+x}"
 ENV_CUSTOM_IMAGE_BASE_SET="${CUSTOM_IMAGE_BASE+x}"
@@ -223,7 +247,7 @@ ENV_MIN_FREE_GIB_SET="${MIN_FREE_GIB+x}"
 WORKDIR="${WORKDIR:-$SCRIPT_DIR}"
 PROFILE="${PROFILE:-hp-omnibook-5}"
 PROFILE_FILE="${PROFILE_FILE:-}"
-PROFILE_SCHEMA_VERSION="${PROFILE_SCHEMA_VERSION:-1}"
+PROFILE_SCHEMA_VERSION="${PROFILE_SCHEMA_VERSION:-2}"
 PROFILE_DISPLAY_NAME="${PROFILE_DISPLAY_NAME:-}"
 PROFILE_ARCHITECTURE="${PROFILE_ARCHITECTURE:-arm64}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-}"
@@ -245,6 +269,25 @@ FIRMWARE_QCOM_SOC_ACTUAL_VERSION=""
 FIRMWARE_QCOM_SOC_ACTUAL_SHA256=""
 FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
 FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
+
+# Schema-v2 firmware package state. The legacy firmware-qcom-soc variables and
+# CLI flags remain supported as a compatibility override for that one package,
+# but all resolution and extraction is performed by the generic package engine.
+FIRMWARE_PACKAGE_OVERRIDES_JSON="${FIRMWARE_PACKAGE_OVERRIDES_JSON:-}"
+FIRMWARE_PACKAGE_SPECS_FILE=""
+FIRMWARE_PACKAGES_RESOLVED_FILE=""
+FIRMWARE_PACKAGE_INVENTORY_FILE=""
+FIRMWARE_PACKAGE_LOCK_FILE=""
+FIRMWARE_CHECKSUM_CANDIDATE=""
+FIRMWARE_CHECKSUM_SOURCE=""
+FIRMWARE_BOARD_POLICY="none"
+FIRMWARE_BOARD_RAW_PATH=""
+FIRMWARE_BOARD_COMPRESSED_PATH=""
+FIRMWARE_BOARD_SUBSYSTEM=""
+FIRMWARE_BOARD_MAGIC=""
+FIRMWARE_BOARD_RAW_SHA256=""
+FIRMWARE_BOARD_COMPRESSED_SHA256=""
+PROFILE_FILE_SOURCE=""
 
 # Known-good HP WCN6855 board-data pair previously acceptance-tested for the
 # QCNFA765 subsystem 103c:8d9a. These remain overridable only for deliberate
@@ -380,6 +423,7 @@ declare -a TARGET_EXCLUDED_KERNEL_DEBS=()
 declare -a LIVE_KERNEL_DEBS=()
 declare -a DTB_CANDIDATES=()
 declare -a PROFILE_FIRMWARE_PROBES=()
+declare -a PROFILE_FIRMWARE_REQUIRED_PATHS=()
 declare -a PROFILE_INITRAMFS_PROBES=()
 declare -a PROFILE_INSTALLED_PATH_PROBES=()
 declare -a PROFILE_KERNEL_CMDLINE_APPEND=()
@@ -643,7 +687,7 @@ Options:
   --root-source PATH              Directory copied into target OCI /root.
   --firmware-dir PATH             Profile-specific firmware tree; paths are
                                   relative to /usr/lib/firmware.
-  --qcom-soc-firmware-deb PATH    Pinned Debian firmware-qcom-soc_*_all.deb.
+  --qcom-soc-firmware-deb PATH    Legacy override for the firmware-qcom-soc package.
   --qcom-soc-firmware-sha256 HEX  Expected SHA-256 for that exact package.
   --qcom-soc-firmware-version VER Optional exact Debian package version.
   --qcom-soc-firmware-policy P    require, auto, or skip. Default: require.
@@ -721,8 +765,8 @@ Portable project root:
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
   ├── firmware-debs/
-  │   ├── firmware-qcom-soc_<version>_all.deb
-  │   └── firmware-qcom-soc_<version>_all.deb.sha256
+  │   ├── <arbitrary-firmware-package-name>.deb
+  │   └── <arbitrary-firmware-package-name>.deb.sha256
   ├── kernel-debs/
   │   ├── <any-name>.deb          # owns regular /boot/vmlinuz-<uname-r>
   │   ├── <any-name>.deb          # owns runtime .ko files for that uname-r
@@ -738,7 +782,7 @@ Kernel package filenames and Package fields are not selectors. The harness uses
 Debian control metadata, conventional payload paths, and local dependency
 relationships. --kernel-image-deb resolves duplicate image ownership explicitly.
 
-Generic X1-45 firmware is extracted from firmware-qcom-soc and must resolve to:
+Firmware package names are discovered by Debian control metadata. Profile-required paths for the HP X1-45 compatibility profile resolve to:
   qcom/gen71500_sqe.fw
   qcom/gen71500_gmu.bin
   qcom/x1p42100/gen71500_zap.mbn
@@ -845,7 +889,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v8.0.4-r3-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.4-r4-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -868,6 +912,10 @@ recompute_paths() {
   FIRMWARE_PROVENANCE_DIR="$TMP_ROOT/firmware-provenance"
   FIRMWARE_MERGE_REPORT="$FIRMWARE_PROVENANCE_DIR/firmware-merge.tsv"
   FIRMWARE_STAGED_INVENTORY="$FIRMWARE_PROVENANCE_DIR/staged-firmware.sha256"
+  FIRMWARE_PACKAGE_SPECS_FILE="$TMP_ROOT/firmware-package-specs.json"
+  FIRMWARE_PACKAGES_RESOLVED_FILE="$TMP_ROOT/firmware-packages.resolved.json"
+  FIRMWARE_PACKAGE_INVENTORY_FILE="$FIRMWARE_PROVENANCE_DIR/firmware-packages.tsv"
+  FIRMWARE_PACKAGE_LOCK_FILE="$FIRMWARE_PROVENANCE_DIR/firmware-package-lock.json"
   LIVE_KERNEL_CMDLINE_JSON="$TMP_ROOT/live-kernel-command-line.json"
   LIVE_KERNEL_CMDLINE_EVIDENCE="$TMP_ROOT/live-kernel-command-line-evidence.txt"
   KERNEL_PACKAGE_CLOSURE_JSON="$TMP_ROOT/kernel-package-closure.json"
@@ -927,26 +975,36 @@ validate_relative_firmware_probe() {
 }
 
 reconcile_profile_hardware_requirements() {
-  # v8 remains an HP-focused milestone, while the mechanism is profile-driven.
-  # The synthesized profile and any older persistent HP profile are upgraded in
-  # memory so an omitted probe cannot silently recreate the known GPU failure.
-  if [[ "$PROFILE" == "hp-omnibook-5" ]]; then
-    append_unique_values PROFILE_FIRMWARE_PROBES \
-      "ath11k/WCN6855/hw2.1/board-2.bin" \
-      "ath11k/WCN6855/hw2.1/board-2.bin.zst" \
-      "qcom/gen71500_sqe.fw" \
-      "qcom/gen71500_gmu.bin" \
-      "qcom/x1p42100/gen71500_zap.mbn"
+  # Schema-v2 profiles are authoritative. No vendor, GPU, wireless subsystem,
+  # or package path is inferred from PROFILE here. This prevents a generic,
+  # Lenovo, Dell, or future target from inheriting HP-only board-data rules.
+  local probe argument
 
-    append_unique_values PROFILE_KERNEL_CMDLINE_APPEND \
-      "clk_ignore_unused" \
-      "pd_ignore_unused" \
-      "cma=128M" \
-      "efi=noruntime" \
-      "console=tty0"
+  # required_paths is the schema-v2 spelling. PROFILE_FIRMWARE_PROBES remains
+  # as an internal compatibility array consumed by the established target and
+  # live-image validators.
+  PROFILE_FIRMWARE_PROBES=()
+  append_unique_values PROFILE_FIRMWARE_PROBES "${PROFILE_FIRMWARE_REQUIRED_PATHS[@]}"
+
+  case "$FIRMWARE_BOARD_POLICY" in
+    none) : ;;
+    optional|required) : ;;
+    *) die "Invalid firmware.board_data.policy: $FIRMWARE_BOARD_POLICY" ;;
+  esac
+
+  if [[ "$FIRMWARE_BOARD_POLICY" != "none" ]]; then
+    [[ -n "$FIRMWARE_BOARD_RAW_PATH" ]] || \
+      die "firmware.board_data.raw_path is required when policy=$FIRMWARE_BOARD_POLICY"
+    validate_relative_firmware_probe "$FIRMWARE_BOARD_RAW_PATH"
+    [[ -z "$FIRMWARE_BOARD_COMPRESSED_PATH" ]] || \
+      validate_relative_firmware_probe "$FIRMWARE_BOARD_COMPRESSED_PATH"
+    if [[ "$FIRMWARE_BOARD_POLICY" == "required" ]]; then
+      append_unique_values PROFILE_FIRMWARE_PROBES "$FIRMWARE_BOARD_RAW_PATH"
+      [[ -z "$FIRMWARE_BOARD_COMPRESSED_PATH" ]] || \
+        append_unique_values PROFILE_FIRMWARE_PROBES "$FIRMWARE_BOARD_COMPRESSED_PATH"
+    fi
   fi
 
-  local probe argument
   for probe in "${PROFILE_FIRMWARE_PROBES[@]}" "${PROFILE_INITRAMFS_PROBES[@]}"; do
     [[ -n "$probe" ]] || continue
     validate_relative_firmware_probe "$probe"
@@ -959,8 +1017,6 @@ reconcile_profile_hardware_requirements() {
       die "Kernel command-line addition contains a newline: $argument"
   done
 
-  # Generate a machine-readable input consumed by both the GRUB patcher and
-  # verifier. jq also gives us a second structural validation of the array.
   printf '%s\n' "${PROFILE_KERNEL_CMDLINE_APPEND[@]}" | \
     jq -Rsc 'split("\n") | map(select(length > 0)) | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)' \
     > "$LIVE_KERNEL_CMDLINE_JSON"
@@ -969,15 +1025,33 @@ reconcile_profile_hardware_requirements() {
 
 synthesize_compatibility_profile() {
   PROFILE_FILE_RESOLVED="$TMP_ROOT/profile.synthesized.json"
+  PROFILE_FILE_SOURCE="$PROFILE_FILE_RESOLVED"
 
-  local firmware_probes_json cmdline_json qcom_policy
-  firmware_probes_json='[]'
+  local required_paths_json cmdline_json packages_json board_json
+  required_paths_json='[]'
   cmdline_json='[]'
-  qcom_policy="$FIRMWARE_QCOM_SOC_POLICY"
+  packages_json='[
+    {
+      "package": "firmware-qcom-soc",
+      "architecture": "all",
+      "required": true,
+      "source": null,
+      "sha256": null,
+      "expected_version": null
+    },
+    {
+      "package": "firmware-qcom-dsp",
+      "architecture": "all",
+      "required": false,
+      "source": null,
+      "sha256": null,
+      "expected_version": null
+    }
+  ]'
+  board_json='{"policy":"none"}'
+
   if [[ "$PROFILE" == "hp-omnibook-5" ]]; then
-    firmware_probes_json='[
-      "ath11k/WCN6855/hw2.1/board-2.bin",
-      "ath11k/WCN6855/hw2.1/board-2.bin.zst",
+    required_paths_json='[
       "qcom/gen71500_sqe.fw",
       "qcom/gen71500_gmu.bin",
       "qcom/x1p42100/gen71500_zap.mbn"
@@ -989,6 +1063,14 @@ synthesize_compatibility_profile() {
       "efi=noruntime",
       "console=tty0"
     ]'
+    board_json="$(jq -n \
+      --arg raw 'ath11k/WCN6855/hw2.1/board-2.bin' \
+      --arg compressed 'ath11k/WCN6855/hw2.1/board-2.bin.zst' \
+      --arg subsystem '103c:8d9a' \
+      --arg magic 'QCA-ATH11K-BOARD' \
+      --arg raw_sha "$HP_ATH11K_BOARD_BIN_SHA256" \
+      --arg compressed_sha "$HP_ATH11K_BOARD_ZST_SHA256" \
+      '{policy:"required",raw_path:$raw,compressed_path:$compressed,subsystem:$subsystem,magic:$magic,raw_sha256:$raw_sha,compressed_sha256:$compressed_sha}')"
   fi
 
   jq -n \
@@ -1004,10 +1086,6 @@ synthesize_compatibility_profile() {
     --arg root "$ROOT_SOURCE" \
     --arg firmware "$FIRMWARE_SOURCE_OVERRIDE" \
     --arg qcom "$QCOM_DEVICE_PATH" \
-    --arg qcom_deb "$FIRMWARE_QCOM_SOC_DEB" \
-    --arg qcom_sha "$FIRMWARE_QCOM_SOC_SHA256" \
-    --arg qcom_version "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION" \
-    --arg qcom_policy "$qcom_policy" \
     --arg base "$CUSTOM_IMAGE_BASE" \
     --arg repo "$TARGET_IMAGE_REPOSITORY" \
     --arg abroot "$ABROOT_IMAGE_NAME" \
@@ -1015,10 +1093,12 @@ synthesize_compatibility_profile() {
     --arg registry "$REGISTRY_IMAGE_REF" \
     --arg delivery "$DELIVERY_MODE" \
     --argjson min_free "$MIN_FREE_GIB" \
-    --argjson probes "$firmware_probes_json" \
+    --argjson packages "$packages_json" \
+    --argjson required_paths "$required_paths_json" \
+    --argjson board_data "$board_json" \
     --argjson cmdline "$cmdline_json" \
     '{
-      schema_version: 1,
+      schema_version: 2,
       profile: $profile,
       display_name: $display,
       architecture: "arm64",
@@ -1042,13 +1122,9 @@ synthesize_compatibility_profile() {
         mode: (if $firmware == "" then "ask" else "prestaged" end),
         source: (if $firmware == "" then null else $firmware end),
         device_path: $qcom,
-        qcom_soc_package: {
-          policy: $qcom_policy,
-          source: (if $qcom_deb == "" then null else $qcom_deb end),
-          sha256: (if $qcom_sha == "" then null else $qcom_sha end),
-          expected_version: (if $qcom_version == "" then null else $qcom_version end)
-        },
-        probes: $probes,
+        packages: $packages,
+        required_paths: $required_paths,
+        board_data: $board_data,
         initramfs_probes: []
       },
       target_image: {
@@ -1070,7 +1146,138 @@ synthesize_compatibility_profile() {
         minimum_free_gib: $min_free
       }
     }' > "$PROFILE_FILE_RESOLVED"
-  warn "No profile manifest was found. A compatibility profile was synthesized: $PROFILE_FILE_RESOLVED"
+  warn "No profile manifest was found. A schema-v2 compatibility profile was synthesized: $PROFILE_FILE_RESOLVED"
+}
+
+firmware_package_required_flag() {
+  case "${1,,}" in
+    true|1|yes|required|require|strict) printf true ;;
+    false|0|no|optional|auto|'') printf false ;;
+    *) die "Invalid firmware package required value: $1" ;;
+  esac
+}
+
+apply_legacy_firmware_package_override() {
+  # The established qcom-soc CLI/environment interface remains a compatibility
+  # override. It modifies only the firmware-qcom-soc entry and does not prevent
+  # profiles from declaring other packages such as firmware-qcom-dsp.
+  if [[ -z "$ENV_FIRMWARE_QCOM_SOC_DEB_SET" &&
+        -z "$ENV_FIRMWARE_QCOM_SOC_SHA256_SET" &&
+        -z "$ENV_FIRMWARE_QCOM_SOC_VERSION_SET" &&
+        -z "$ENV_FIRMWARE_QCOM_SOC_POLICY_SET" ]]; then
+    return 0
+  fi
+
+  local required=true disabled=false
+  case "${FIRMWARE_QCOM_SOC_POLICY,,}" in
+    skip|none|disabled) required=false; disabled=true ;;
+    auto|optional) required=false ;;
+    require|required|strict|'') required=true ;;
+    *) die "Invalid Qualcomm SoC firmware compatibility policy: $FIRMWARE_QCOM_SOC_POLICY" ;;
+  esac
+
+  jq \
+    --arg source "$FIRMWARE_QCOM_SOC_DEB" \
+    --arg sha "${FIRMWARE_QCOM_SOC_SHA256,,}" \
+    --arg version "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION" \
+    --argjson required "$required" \
+    --argjson disabled "$disabled" \
+    '
+      map(select(.package != "firmware-qcom-soc" or (.architecture // "all") != "all"))
+      + (if $disabled then [] else [{
+          package:"firmware-qcom-soc",
+          architecture:"all",
+          required:$required,
+          source:(if $source=="" then null else $source end),
+          sha256:(if $sha=="" then null else $sha end),
+          expected_version:(if $version=="" then null else $version end)
+        }] end)
+    ' "$FIRMWARE_PACKAGE_SPECS_FILE" > "$FIRMWARE_PACKAGE_SPECS_FILE.tmp"
+  mv -f "$FIRMWARE_PACKAGE_SPECS_FILE.tmp" "$FIRMWARE_PACKAGE_SPECS_FILE"
+}
+
+apply_firmware_package_json_overrides() {
+  [[ -n "$FIRMWARE_PACKAGE_OVERRIDES_JSON" ]] || return 0
+  printf '%s' "$FIRMWARE_PACKAGE_OVERRIDES_JSON" | jq -e 'type=="array"' >/dev/null || \
+    die "FIRMWARE_PACKAGE_OVERRIDES_JSON must be a JSON array"
+  printf '%s' "$FIRMWARE_PACKAGE_OVERRIDES_JSON" > "$TMP_ROOT/firmware-package-overrides.json"
+  jq -s '
+    def key: (.package + "\u0000" + (.architecture // "all"));
+    reduce .[1][] as $override (.[0];
+      map(select(key != ($override | key))) + [$override]
+    )
+  ' "$FIRMWARE_PACKAGE_SPECS_FILE" "$TMP_ROOT/firmware-package-overrides.json" \
+    > "$FIRMWARE_PACKAGE_SPECS_FILE.tmp"
+  mv -f "$FIRMWARE_PACKAGE_SPECS_FILE.tmp" "$FIRMWARE_PACKAGE_SPECS_FILE"
+}
+
+validate_firmware_package_specs() {
+  jq -e '
+    type == "array" and
+    all(.[];
+      (type == "object") and
+      (.package | type == "string" and test("^[a-z0-9][a-z0-9+.-]+$")) and
+      ((.architecture // "all") | type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and
+      ((.required // false) | type == "boolean") and
+      ((.source // null) == null or (.source | type == "string" and length > 0)) and
+      ((.sha256 // null) == null or (.sha256 | type == "string" and test("^[0-9A-Fa-f]{64}$"))) and
+      ((.expected_version // null) == null or (.expected_version | type == "string" and length > 0))
+    ) and
+    (([.[] | (.package + "\u0000" + (.architecture // "all"))] | length) ==
+     ([.[] | (.package + "\u0000" + (.architecture // "all"))] | unique | length))
+  ' "$FIRMWARE_PACKAGE_SPECS_FILE" >/dev/null || \
+    die "firmware.packages contains an invalid or duplicate package declaration"
+}
+
+normalize_hardware_profile_schema() {
+  local input="$1" schema profile normalized
+  schema="$(jq -r '.schema_version // empty' "$input")"
+  profile="$(jq -r '.profile // empty' "$input")"
+
+  case "$schema" in
+    2)
+      PROFILE_FILE_RESOLVED="$input"
+      ;;
+    1)
+      normalized="$TMP_ROOT/profile.schema2.json"
+      jq \
+        --arg hp_raw_sha "$HP_ATH11K_BOARD_BIN_SHA256" \
+        --arg hp_zst_sha "$HP_ATH11K_BOARD_ZST_SHA256" \
+        '
+        .schema_version = 2
+        | .firmware = (.firmware // {})
+        | .firmware.packages = (
+            if (.firmware.qcom_soc_package? != null) then
+              if ((.firmware.qcom_soc_package.policy // "require") | IN("skip","none","disabled")) then []
+              else [{
+                package: "firmware-qcom-soc",
+                architecture: "all",
+                required: ((.firmware.qcom_soc_package.policy // "require") | IN("require","required","strict")),
+                source: (.firmware.qcom_soc_package.source // null),
+                sha256: (.firmware.qcom_soc_package.sha256 // null),
+                expected_version: (.firmware.qcom_soc_package.expected_version // null)
+              }] end
+            else [] end
+          )
+        | .firmware.required_paths = (.firmware.required_paths // .firmware.probes // [])
+        | .firmware.board_data = (
+            if .profile == "hp-omnibook-5" then {
+              policy: "required",
+              raw_path: "ath11k/WCN6855/hw2.1/board-2.bin",
+              compressed_path: "ath11k/WCN6855/hw2.1/board-2.bin.zst",
+              subsystem: "103c:8d9a",
+              magic: "QCA-ATH11K-BOARD",
+              raw_sha256: $hp_raw_sha,
+              compressed_sha256: $hp_zst_sha
+            } else {policy:"none"} end
+          )
+        | del(.firmware.qcom_soc_package, .firmware.probes)
+        ' "$input" > "$normalized"
+      PROFILE_FILE_RESOLVED="$normalized"
+      warn "Migrated schema-1 hardware profile '$profile' to schema 2 in memory: $normalized"
+      ;;
+    *) die "Unsupported hardware-profile schema version '$schema'; supported versions are 1 and 2" ;;
+  esac
 }
 
 load_hardware_profile() {
@@ -1095,10 +1302,11 @@ load_hardware_profile() {
 
   [[ -f "$PROFILE_FILE_RESOLVED" ]] || die "Hardware profile does not exist: $PROFILE_FILE_RESOLVED"
   jq -e . "$PROFILE_FILE_RESOLVED" >/dev/null || die "Hardware profile is not valid JSON: $PROFILE_FILE_RESOLVED"
-
+  PROFILE_FILE_SOURCE="$PROFILE_FILE_RESOLVED"
+  normalize_hardware_profile_schema "$PROFILE_FILE_RESOLVED"
   schema_version="$(jq -r '.schema_version // empty' "$PROFILE_FILE_RESOLVED")"
   [[ "$schema_version" == "$PROFILE_SCHEMA_VERSION" ]] || \
-    die "Unsupported hardware-profile schema version '$schema_version'; expected $PROFILE_SCHEMA_VERSION"
+    die "Internal profile migration did not produce schema version $PROFILE_SCHEMA_VERSION"
 
   profile_id="$(jq -r '.profile // empty' "$PROFILE_FILE_RESOLVED")"
   [[ "$profile_id" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || \
@@ -1153,23 +1361,6 @@ load_hardware_profile() {
     value="$(jq -r '.firmware.source // empty' "$PROFILE_FILE_RESOLVED")"
     [[ -z "$value" ]] || FIRMWARE_SOURCE_OVERRIDE="$(resolve_profile_path "$value")"
   fi
-  if [[ -z "$ENV_FIRMWARE_QCOM_SOC_DEB_SET" ]]; then
-    value="$(jq -r '.firmware.qcom_soc_package.source // empty' "$PROFILE_FILE_RESOLVED")"
-    [[ -z "$value" ]] || FIRMWARE_QCOM_SOC_DEB="$(resolve_profile_path "$value")"
-  fi
-  if [[ -z "$ENV_FIRMWARE_QCOM_SOC_SHA256_SET" ]]; then
-    value="$(jq -r '.firmware.qcom_soc_package.sha256 // empty' "$PROFILE_FILE_RESOLVED")"
-    [[ -z "$value" ]] || FIRMWARE_QCOM_SOC_SHA256="${value,,}"
-  fi
-  if [[ -z "$ENV_FIRMWARE_QCOM_SOC_VERSION_SET" ]]; then
-    value="$(jq -r '.firmware.qcom_soc_package.expected_version // empty' "$PROFILE_FILE_RESOLVED")"
-    [[ -z "$value" ]] || FIRMWARE_QCOM_SOC_EXPECTED_VERSION="$value"
-  fi
-  if [[ -z "$ENV_FIRMWARE_QCOM_SOC_POLICY_SET" ]]; then
-    value="$(jq -r '.firmware.qcom_soc_package.policy // empty' "$PROFILE_FILE_RESOLVED")"
-    [[ -z "$value" ]] || FIRMWARE_QCOM_SOC_POLICY="$value"
-  fi
-
   value="$(jq -r '.firmware.mode // empty' "$PROFILE_FILE_RESOLVED")"
   [[ -z "$value" || "$FIRMWARE_MODE" != "ask" ]] || FIRMWARE_MODE="$value"
   value="$(jq -r '.firmware.device_path // empty' "$PROFILE_FILE_RESOLVED")"
@@ -1217,10 +1408,25 @@ load_hardware_profile() {
     [[ -z "$value" ]] || MIN_FREE_GIB="$value"
   fi
 
-  mapfile -t PROFILE_FIRMWARE_PROBES < <(jq -r '.firmware.probes[]? // empty' "$PROFILE_FILE_RESOLVED")
+  mapfile -t PROFILE_FIRMWARE_REQUIRED_PATHS < <(jq -r '.firmware.required_paths[]? // empty' "$PROFILE_FILE_RESOLVED")
   mapfile -t PROFILE_INITRAMFS_PROBES < <(jq -r '.firmware.initramfs_probes[]? // empty' "$PROFILE_FILE_RESOLVED")
   mapfile -t PROFILE_INSTALLED_PATH_PROBES < <(jq -r '.validation.installed_paths[]? // empty' "$PROFILE_FILE_RESOLVED")
   mapfile -t PROFILE_KERNEL_CMDLINE_APPEND < <(jq -r '.kernel.command_line_append[]? // empty' "$PROFILE_FILE_RESOLVED")
+
+  FIRMWARE_BOARD_POLICY="$(jq -r '.firmware.board_data.policy // "none"' "$PROFILE_FILE_RESOLVED" | tr '[:upper:]' '[:lower:]')"
+  FIRMWARE_BOARD_RAW_PATH="$(jq -r '.firmware.board_data.raw_path // empty' "$PROFILE_FILE_RESOLVED")"
+  FIRMWARE_BOARD_COMPRESSED_PATH="$(jq -r '.firmware.board_data.compressed_path // empty' "$PROFILE_FILE_RESOLVED")"
+  FIRMWARE_BOARD_SUBSYSTEM="$(jq -r '.firmware.board_data.subsystem // empty' "$PROFILE_FILE_RESOLVED")"
+  FIRMWARE_BOARD_MAGIC="$(jq -r '.firmware.board_data.magic // empty' "$PROFILE_FILE_RESOLVED")"
+  FIRMWARE_BOARD_RAW_SHA256="$(jq -r '.firmware.board_data.raw_sha256 // empty' "$PROFILE_FILE_RESOLVED" | tr '[:upper:]' '[:lower:]')"
+  FIRMWARE_BOARD_COMPRESSED_SHA256="$(jq -r '.firmware.board_data.compressed_sha256 // empty' "$PROFILE_FILE_RESOLVED" | tr '[:upper:]' '[:lower:]')"
+
+  jq '.firmware.packages // []' "$PROFILE_FILE_RESOLVED" > "$FIRMWARE_PACKAGE_SPECS_FILE"
+  apply_legacy_firmware_package_override
+  apply_firmware_package_json_overrides
+  validate_firmware_package_specs
+  printf '[]
+' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
   reconcile_profile_hardware_requirements
 
   [[ "$ISO_IMAGE_LAYOUT_PATH" == /target-images/* ]] || \
@@ -1264,18 +1470,30 @@ load_hardware_profile() {
 }
 
 write_resolved_profile() {
-  local firmware_json initramfs_json installed_json cmdline_json
+  local firmware_json initramfs_json installed_json cmdline_json package_specs package_resolved board_json
   firmware_json="$(printf '%s\n' "${PROFILE_FIRMWARE_PROBES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   initramfs_json="$(printf '%s\n' "${PROFILE_INITRAMFS_PROBES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   installed_json="$(printf '%s\n' "${PROFILE_INSTALLED_PATH_PROBES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   cmdline_json="$(printf '%s\n' "${PROFILE_KERNEL_CMDLINE_APPEND[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  package_specs="$(cat "$FIRMWARE_PACKAGE_SPECS_FILE" 2>/dev/null || printf '[]')"
+  package_resolved="$(cat "$FIRMWARE_PACKAGES_RESOLVED_FILE" 2>/dev/null || printf '[]')"
+  board_json="$(jq -n \
+    --arg policy "$FIRMWARE_BOARD_POLICY" \
+    --arg raw "$FIRMWARE_BOARD_RAW_PATH" \
+    --arg compressed "$FIRMWARE_BOARD_COMPRESSED_PATH" \
+    --arg subsystem "$FIRMWARE_BOARD_SUBSYSTEM" \
+    --arg magic "$FIRMWARE_BOARD_MAGIC" \
+    --arg raw_sha "$FIRMWARE_BOARD_RAW_SHA256" \
+    --arg compressed_sha "$FIRMWARE_BOARD_COMPRESSED_SHA256" \
+    '{policy:$policy,raw_path:(if $raw=="" then null else $raw end),compressed_path:(if $compressed=="" then null else $compressed end),subsystem:(if $subsystem=="" then null else $subsystem end),magic:(if $magic=="" then null else $magic end),raw_sha256:(if $raw_sha=="" then null else $raw_sha end),compressed_sha256:(if $compressed_sha=="" then null else $compressed_sha end)}')"
 
   jq -n \
     --argjson schema "$PROFILE_SCHEMA_VERSION" \
     --arg profile "$PROFILE" \
     --arg display "$PROFILE_DISPLAY_NAME" \
     --arg architecture "$PROFILE_ARCHITECTURE" \
-    --arg source_profile "$PROFILE_FILE_RESOLVED" \
+    --arg source_profile "$PROFILE_FILE_SOURCE" \
+    --arg normalized_profile "$PROFILE_FILE_RESOLVED" \
     --arg artifact_dir "$ARTIFACT_DIR" \
     --arg kernel_dir "$KERNEL_DEB_DIR" \
     --arg kernel_image_deb "$KERNEL_IMAGE_DEB_OVERRIDE" \
@@ -1288,12 +1506,6 @@ write_resolved_profile() {
     --arg firmware_mode "$FIRMWARE_MODE" \
     --arg firmware_source "$FIRMWARE_SOURCE_OVERRIDE" \
     --arg device_path "$QCOM_DEVICE_PATH" \
-    --arg qcom_soc_policy "$FIRMWARE_QCOM_SOC_POLICY" \
-    --arg qcom_soc_deb "$FIRMWARE_QCOM_SOC_DEB" \
-    --arg qcom_soc_expected_sha "$FIRMWARE_QCOM_SOC_SHA256" \
-    --arg qcom_soc_actual_sha "$FIRMWARE_QCOM_SOC_ACTUAL_SHA256" \
-    --arg qcom_soc_expected_version "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION" \
-    --arg qcom_soc_actual_version "$FIRMWARE_QCOM_SOC_ACTUAL_VERSION" \
     --arg base "$CUSTOM_IMAGE_BASE" \
     --arg target_ref "$TARGET_IMAGE_REF" \
     --arg abroot "$ABROOT_IMAGE_NAME" \
@@ -1305,7 +1517,10 @@ write_resolved_profile() {
     --argjson ignore_cpu "$INSTALLER_IGNORE_CPU" \
     --argjson allow_custom "$INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE" \
     --argjson min_free "$MIN_FREE_GIB" \
+    --argjson firmware_packages "$package_specs" \
+    --argjson firmware_packages_resolved "$package_resolved" \
     --argjson firmware_probes "$firmware_json" \
+    --argjson board_data "$board_json" \
     --argjson initramfs_probes "$initramfs_json" \
     --argjson installed_paths "$installed_json" \
     --argjson cmdline "$cmdline_json" \
@@ -1315,6 +1530,7 @@ write_resolved_profile() {
       display_name: $display,
       architecture: $architecture,
       source_profile: $source_profile,
+      normalized_profile: $normalized_profile,
       resolved: {
         artifact_directory: $artifact_dir,
         kernel_deb_directory: $kernel_dir,
@@ -1328,15 +1544,10 @@ write_resolved_profile() {
         firmware_mode: $firmware_mode,
         firmware_source: (if $firmware_source == "" then null else $firmware_source end),
         firmware_device_path: $device_path,
-        qcom_soc_package: {
-          policy: $qcom_soc_policy,
-          source: (if $qcom_soc_deb == "" then null else $qcom_soc_deb end),
-          expected_sha256: (if $qcom_soc_expected_sha == "" then null else $qcom_soc_expected_sha end),
-          actual_sha256: (if $qcom_soc_actual_sha == "" then null else $qcom_soc_actual_sha end),
-          expected_version: (if $qcom_soc_expected_version == "" then null else $qcom_soc_expected_version end),
-          actual_version: (if $qcom_soc_actual_version == "" then null else $qcom_soc_actual_version end)
-        },
-        firmware_probes: $firmware_probes,
+        firmware_packages: $firmware_packages,
+        firmware_packages_resolved: $firmware_packages_resolved,
+        firmware_required_paths: $firmware_probes,
+        firmware_board_data: $board_data,
         initramfs_probes: $initramfs_probes,
         kernel_command_line_append: $cmdline,
         target_base: $base,
@@ -1366,9 +1577,10 @@ write_resolved_profile() {
     printf 'kernel_release_requested\t%s\t%s\n' "$([[ -n "$EXPECTED_CUSTOM_KERNEL_RELEASE" ]] && printf configured || printf auto)" "${EXPECTED_CUSTOM_KERNEL_RELEASE:-none}"
     printf 'kernel_release_selected\t%s\t%s\n' "$([[ -n "$KERNEL_RELEASE" ]] && printf resolved || printf pending)" "${KERNEL_RELEASE:-not-yet-discovered}"
     printf 'dtb_source\t%s\t%s\n' "$([[ -n "$DTB_FILE_OVERRIDE" ]] && printf resolved || printf discovery)" "${DTB_FILE_OVERRIDE:-deterministic discovery}"
-    printf 'qcom_soc_package_policy\tresolved\t%s\n' "$FIRMWARE_QCOM_SOC_POLICY"
-    printf 'qcom_soc_package\t%s\t%s\n' "$([[ -n "$FIRMWARE_QCOM_SOC_DEB" ]] && printf resolved || printf pending)" "${FIRMWARE_QCOM_SOC_DEB:-automatic discovery}"
-    printf 'qcom_soc_package_sha256\t%s\t%s\n' "$([[ -n "$FIRMWARE_QCOM_SOC_ACTUAL_SHA256" ]] && printf pass || printf pending)" "${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-not-yet-validated}"
+    printf 'firmware_package_specs\tpass\t%s declarations\n' "$(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    printf 'firmware_packages_resolved\t%s\t%s packages\n' "$([[ $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE") -gt 0 ]] && printf pass || printf pending)" "$(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+    printf 'firmware_required_paths\tpass\t%s\n' "${PROFILE_FIRMWARE_PROBES[*]:-none}"
+    printf 'firmware_board_data_policy\tpass\t%s\n' "$FIRMWARE_BOARD_POLICY"
     printf 'kernel_command_line\tresolved\t%s\n' "${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}"
     printf 'delivery_mode\tpass\t%s\n' "$DELIVERY_MODE"
     printf 'installer_storage_guard_policy\tpass\t%s\n' "$INSTALLER_STORAGE_GUARD_POLICY"
@@ -1642,7 +1854,8 @@ Version: $SCRIPT_VERSION
 
 Work directory:   $WORKDIR
 Profile:          $PROFILE ($PROFILE_DISPLAY_NAME)
-Profile file:     $PROFILE_FILE_RESOLVED
+Profile source:   $PROFILE_FILE_SOURCE
+Profile normalized:$PROFILE_FILE_RESOLVED
 Artifact default: $ARTIFACT_DIR
 Sources:          $SOURCES_DIR
 
@@ -2981,6 +3194,7 @@ sync_required_repositories() {
 # ------------------------- firmware staging ------------------------------
 
 normalize_qcom_soc_firmware_policy() {
+  # Compatibility-only normalization for the legacy CLI variables.
   case "${FIRMWARE_QCOM_SOC_POLICY,,}" in
     require|required|strict) FIRMWARE_QCOM_SOC_POLICY="require" ;;
     auto|optional) FIRMWARE_QCOM_SOC_POLICY="auto" ;;
@@ -2994,201 +3208,197 @@ sha256_is_valid() {
 }
 
 read_package_checksum_sidecar() {
-  # Resolve a previously pinned checksum from one of the accepted sidecar
-  # layouts. This function deliberately communicates through globals rather
-  # than stdout because command substitution would run it in a subshell and
-  # discard FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE evidence.
   local deb="$1" sidecar base hash
   base="$(basename "$deb")"
-  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
-  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
-
-  local -a sidecars=(
-    "$deb.sha256"
-    "${deb%.deb}.sha256"
-    "$(dirname "$deb")/SHA256SUMS"
-  )
-
+  FIRMWARE_CHECKSUM_CANDIDATE=""
+  FIRMWARE_CHECKSUM_SOURCE=""
+  local -a sidecars=("$deb.sha256" "${deb%.deb}.sha256" "$(dirname "$deb")/SHA256SUMS")
   for sidecar in "${sidecars[@]}"; do
     [[ -f "$sidecar" ]] || continue
     hash="$(awk -v base="$base" '
       $1 ~ /^[0-9A-Fa-f]{64}$/ {
-        name=$2
-        sub(/^\*/, "", name)
-        leaf=name
-        sub(/^.*\//, "", leaf)
-        if (name == base || name == "./" base || leaf == base) {
-          print tolower($1)
-          found=1
-          exit
-        }
+        name=$2; sub(/^\*/, "", name); leaf=name; sub(/^.*\//, "", leaf)
+        if (name == base || name == "./" base || leaf == base) { print tolower($1); found=1; exit }
         if (NF == 1 && fallback == "") fallback=tolower($1)
       }
       END { if (!found && fallback != "") print fallback }
     ' "$sidecar" | sed -n '1p')"
     if sha256_is_valid "$hash"; then
-      FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="${hash,,}"
-      FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="$sidecar"
+      FIRMWARE_CHECKSUM_CANDIDATE="${hash,,}"
+      FIRMWARE_CHECKSUM_SOURCE="$sidecar"
       return 0
     fi
   done
   return 1
 }
 
-write_qcom_soc_checksum_sidecar() {
-  # Atomically pin the exact package selected by the operator. The sidecar is
-  # placed beside the package so subsequent plan and non-interactive execute
-  # runs resolve the same immutable expectation without another prompt.
-  local deb="$1" actual="$2" sidecar tmp base
+write_firmware_package_checksum_sidecar() {
+  local deb="$1" actual="$2" package="$3" sidecar tmp base
   base="$(basename "$deb")"
   sidecar="$deb.sha256"
   tmp="$(mktemp "$(dirname "$sidecar")/.${base}.sha256.tmp.XXXXXX")"
   printf '%s  %s\n' "$actual" "$base" > "$tmp"
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$sidecar"
-
-  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="$actual"
-  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="$sidecar (created interactively)"
-  ok "Pinned firmware-qcom-soc checksum sidecar: $sidecar"
+  FIRMWARE_CHECKSUM_CANDIDATE="$actual"
+  FIRMWARE_CHECKSUM_SOURCE="$sidecar (created interactively)"
+  ok "Pinned $package checksum sidecar: $sidecar"
 }
 
-resolve_missing_qcom_soc_checksum() {
-  # Missing checksum policy is intentionally mode-sensitive:
-  #   * plan mode is read-only and carries the observed hash into the exact
-  #     printed execute command;
-  #   * interactive execute requires an explicit trust decision;
-  #   * non-interactive execute remains strictly fail-closed.
-  local deb="$1" actual="$2" version="$3" choice entered
-  FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE=""
-  FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE=""
-
+resolve_missing_firmware_package_checksum() {
+  local deb="$1" actual="$2" package="$3" version="$4" choice entered
+  FIRMWARE_CHECKSUM_CANDIDATE=""
+  FIRMWARE_CHECKSUM_SOURCE=""
   if (( PLAN_ONLY == 1 )); then
-    warn "No persistent SHA-256 pin exists for $(basename "$deb"). Plan mode will remain read-only and place the observed hash in the exact execute command."
-    FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="$actual"
-    FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="plan-observed SHA-256; not persisted"
+    warn "No persistent SHA-256 pin exists for $(basename "$deb"). Plan mode will carry the observed hash into the exact execute command."
+    FIRMWARE_CHECKSUM_CANDIDATE="$actual"
+    FIRMWARE_CHECKSUM_SOURCE="plan-observed SHA-256; not persisted"
     return 0
   fi
-
   is_interactive || return 1
-
-  printf '\nQualcomm SoC firmware package requires an explicit SHA-256 pin.\n' >&2
-  printf 'Package:      %s\n' "$deb" >&2
-  printf 'Version:      %s\n' "$version" >&2
+  printf '\nFirmware package requires an explicit SHA-256 pin.\n' >&2
+  printf 'Package:      %s (%s)\n' "$package" "$version" >&2
+  printf 'Artifact:     %s\n' "$deb" >&2
   printf 'Observed SHA: %s\n' "$actual" >&2
-  printf '%s\n' 'Compare this value with a trusted Debian package or snapshot record when available.' >&2
-
-  choice="$(menu "Pin Qualcomm SoC Firmware Package\n\nNo accepted checksum sidecar or command-line pin was found. The builder will not silently trust the package." "1" \
-    "1|Trust this local artifact and write its package-specific sidecar [RECOMMENDED FOR VERIFIED LOCAL INPUT]|Atomically create $(basename "$deb").sha256 beside the package, then continue." \
-    "2|Enter an independently obtained SHA-256|Continue only when the entered hash matches the local package." \
-    "3|Abort before firmware extraction|Leave the package and build outputs unchanged.")"
-
+  choice="$(menu "Pin Firmware Package\n\nThe builder will not silently trust this package." "1" \
+    "1|Trust this local artifact and write its sidecar|Atomically create $(basename "$deb").sha256 beside the package." \
+    "2|Enter an independently obtained SHA-256|Continue only if it matches." \
+    "3|Abort before firmware extraction|Leave package and outputs unchanged.")"
   case "$choice" in
-    1)
-      write_qcom_soc_checksum_sidecar "$deb" "$actual"
-      ;;
+    1) write_firmware_package_checksum_sidecar "$deb" "$actual" "$package" ;;
     2)
-      entered="$(prompt_text "Expected firmware-qcom-soc SHA-256" "")"
-      sha256_is_valid "$entered" || die "Entered firmware-qcom-soc SHA-256 is not a 64-character hexadecimal digest."
-      FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE="${entered,,}"
-      FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="interactive operator entry"
+      entered="$(prompt_text "Expected SHA-256 for $package" "")"
+      sha256_is_valid "$entered" || die "Entered SHA-256 is invalid for $package"
+      FIRMWARE_CHECKSUM_CANDIDATE="${entered,,}"
+      FIRMWARE_CHECKSUM_SOURCE="interactive operator entry"
       ;;
-    3)
-      die "Build aborted: firmware-qcom-soc package remains unpinned."
-      ;;
+    3) die "Build aborted: $package remains unpinned." ;;
   esac
 }
 
-resolve_qcom_soc_firmware_package() {
-  normalize_qcom_soc_firmware_policy
-  mkdir -p "$FIRMWARE_PROVENANCE_DIR"
+firmware_deb_candidates() {
+  local directory
+  for directory in "$ARTIFACT_DIR/firmware-debs" "$ARTIFACT_DIR" "$WORKDIR/firmware-debs"; do
+    [[ -d "$directory" ]] || continue
+    find "$directory" -maxdepth 1 -type f -name '*.deb' -print
+  done | LC_ALL=C sort -u
+}
 
-  if [[ "$FIRMWARE_QCOM_SOC_POLICY" == "skip" ]]; then
-    FIRMWARE_QCOM_SOC_DEB=""
-    FIRMWARE_QCOM_SOC_ACTUAL_SHA256=""
-    FIRMWARE_QCOM_SOC_ACTUAL_VERSION=""
-    warn "Qualcomm SoC firmware package extraction is explicitly disabled."
+resolve_firmware_packages() {
+  mkdir -p "$FIRMWARE_PROVENANCE_DIR"
+  validate_firmware_package_specs
+  printf 'package\tarchitecture\trequired\tversion\tsha256\tsource\tchecksum_source\n' > "$FIRMWARE_PACKAGE_INVENTORY_FILE"
+  printf '[]\n' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
+
+  local mandatory_count
+  mandatory_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+  if [[ "${FIRMWARE_MODE,,}" == "skip" ]]; then
+    if (( mandatory_count > 0 || ${#PROFILE_FIRMWARE_PROBES[@]} > 0 )) || [[ "$FIRMWARE_BOARD_POLICY" == "required" ]]; then
+      die "FIRMWARE_MODE=skip conflicts with mandatory firmware declarations."
+    fi
+    printf '[]\n' > "$FIRMWARE_PACKAGE_LOCK_FILE"
+    FIRMWARE_PACKAGE_OVERRIDES_JSON='[]'
+    info "Firmware package resolution skipped by profile/operator policy."
     return 0
   fi
 
-  if [[ -n "$FIRMWARE_QCOM_SOC_DEB" ]]; then
-    FIRMWARE_QCOM_SOC_DEB="$(resolve_profile_path "$FIRMWARE_QCOM_SOC_DEB")"
-  else
-    local -a candidates=()
-    mapfile -t candidates < <(
-      find \
-        "$ARTIFACT_DIR/firmware-debs" \
-        "$ARTIFACT_DIR" \
-        "$WORKDIR/firmware-debs" \
-        -maxdepth 1 -type f -name 'firmware-qcom-soc_*_all.deb' \
-        -print 2>/dev/null | LC_ALL=C sort -u
-    )
-    case "${#candidates[@]}" in
-      0)
-        if [[ "$FIRMWARE_QCOM_SOC_POLICY" == "require" ]]; then
-          die "No pinned firmware-qcom-soc_*_all.deb was found. Place it under $ARTIFACT_DIR/firmware-debs with a .sha256 sidecar or pass --qcom-soc-firmware-deb and --qcom-soc-firmware-sha256."
-        fi
-        warn "No firmware-qcom-soc package was found; auto policy will rely on the profile firmware tree."
-        return 0
-        ;;
-      1) FIRMWARE_QCOM_SOC_DEB="${candidates[0]}" ;;
-      *)
-        printf 'Multiple firmware-qcom-soc packages were discovered:\n' >&2
-        printf '  %s\n' "${candidates[@]}" >&2
-        die "Select one package explicitly with --qcom-soc-firmware-deb."
-        ;;
-    esac
-  fi
+  local count index package architecture required source expected_sha expected_version
+  local actual_package actual_arch actual_version actual_sha checksum_source
+  local -a candidates=() matching=()
+  count="$(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+  for ((index=0; index<count; index++)); do
+    package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    architecture="$(jq -r ".[$index].architecture // \"all\"" "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    required="$(jq -r ".[$index].required // false" "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    source="$(jq -r ".[$index].source // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    expected_sha="$(jq -r ".[$index].sha256 // empty" "$FIRMWARE_PACKAGE_SPECS_FILE" | tr '[:upper:]' '[:lower:]')"
+    expected_version="$(jq -r ".[$index].expected_version // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"
 
-  [[ -f "$FIRMWARE_QCOM_SOC_DEB" ]] || \
-    die "Qualcomm SoC firmware package does not exist: $FIRMWARE_QCOM_SOC_DEB"
+    if [[ -n "$source" ]]; then
+      source="$(resolve_profile_path "$source")"
+      [[ -f "$source" ]] || die "Firmware package source does not exist for $package: $source"
+    else
+      mapfile -t candidates < <(firmware_deb_candidates)
+      matching=()
+      local candidate candidate_pkg candidate_arch
+      for candidate in "${candidates[@]}"; do
+        candidate_pkg="$(package_field "$candidate" Package)"
+        candidate_arch="$(package_field "$candidate" Architecture)"
+        [[ "$candidate_pkg" == "$package" && "$candidate_arch" == "$architecture" ]] && matching+=("$candidate")
+      done
+      case "${#matching[@]}" in
+        0)
+          if [[ "$required" == true ]]; then
+            die "Required firmware package $package:$architecture was not found by Debian control metadata under the firmware artifact directories."
+          fi
+          info "Optional firmware package not supplied: $package:$architecture"
+          continue
+          ;;
+        1) source="${matching[0]}" ;;
+        *)
+          printf 'Multiple firmware artifacts match %s:%s:\n' "$package" "$architecture" >&2
+          printf '  %s\n' "${matching[@]}" >&2
+          die "Set firmware.packages[].source explicitly for $package:$architecture"
+          ;;
+      esac
+    fi
 
-  local package architecture version expected actual
-  package="$(dpkg-deb -f "$FIRMWARE_QCOM_SOC_DEB" Package 2>/dev/null || true)"
-  architecture="$(dpkg-deb -f "$FIRMWARE_QCOM_SOC_DEB" Architecture 2>/dev/null || true)"
-  version="$(dpkg-deb -f "$FIRMWARE_QCOM_SOC_DEB" Version 2>/dev/null || true)"
-  [[ "$package" == "firmware-qcom-soc" ]] || \
-    die "Unexpected package identity in $FIRMWARE_QCOM_SOC_DEB: ${package:-unreadable}"
-  [[ "$architecture" == "all" ]] || \
-    die "firmware-qcom-soc package must have Architecture: all; got ${architecture:-unreadable}"
-  [[ -n "$version" ]] || die "Unable to read firmware-qcom-soc package version"
-  if [[ -n "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION" && "$version" != "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION" ]]; then
-    die "firmware-qcom-soc version mismatch: expected=$FIRMWARE_QCOM_SOC_EXPECTED_VERSION actual=$version"
-  fi
+    actual_package="$(package_field "$source" Package)"
+    actual_arch="$(package_field "$source" Architecture)"
+    actual_version="$(package_field "$source" Version)"
+    [[ "$actual_package" == "$package" ]] || die "Firmware package identity mismatch: expected=$package actual=${actual_package:-unreadable} source=$source"
+    [[ "$actual_arch" == "$architecture" ]] || die "Firmware package architecture mismatch for $package: expected=$architecture actual=${actual_arch:-unreadable}"
+    [[ -n "$actual_version" ]] || die "Unable to read firmware package version: $source"
+    [[ -z "$expected_version" || "$actual_version" == "$expected_version" ]] || \
+      die "Firmware package version mismatch for $package: expected=$expected_version actual=$actual_version"
 
-  actual="$(sha256sum "$FIRMWARE_QCOM_SOC_DEB" | awk '{print tolower($1)}')"
-  expected="${FIRMWARE_QCOM_SOC_SHA256,,}"
-  if [[ -n "$expected" ]]; then
-    FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE="environment/profile/CLI"
-  elif read_package_checksum_sidecar "$FIRMWARE_QCOM_SOC_DEB"; then
-    expected="$FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE"
-  elif resolve_missing_qcom_soc_checksum \
-      "$FIRMWARE_QCOM_SOC_DEB" "$actual" "$version"; then
-    expected="$FIRMWARE_QCOM_SOC_CHECKSUM_CANDIDATE"
-  else
-    die "A valid pinned SHA-256 is required for $FIRMWARE_QCOM_SOC_DEB. Observed SHA-256: $actual. Create $FIRMWARE_QCOM_SOC_DEB.sha256 or pass --qcom-soc-firmware-sha256."
-  fi
+    actual_sha="$(sha256sum "$source" | awk '{print tolower($1)}')"
+    checksum_source=""
+    if [[ -n "$expected_sha" ]]; then
+      FIRMWARE_CHECKSUM_SOURCE="profile/environment override"
+    elif read_package_checksum_sidecar "$source"; then
+      expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"
+    elif resolve_missing_firmware_package_checksum "$source" "$actual_sha" "$package" "$actual_version"; then
+      expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"
+    else
+      die "A pinned SHA-256 is required for $package. Observed: $actual_sha"
+    fi
+    checksum_source="$FIRMWARE_CHECKSUM_SOURCE"
+    sha256_is_valid "$expected_sha" || die "Resolved firmware SHA-256 is invalid for $package"
+    [[ "$actual_sha" == "$expected_sha" ]] || die "Firmware checksum mismatch for $package: expected=$expected_sha actual=$actual_sha"
 
-  sha256_is_valid "$expected" || \
-    die "Resolved firmware-qcom-soc SHA-256 is invalid: ${expected:-empty}"
-  [[ "$actual" == "$expected" ]] || \
-    die "firmware-qcom-soc checksum mismatch: expected=$expected actual=$actual"
+    local safe package_info filelist copyright_path
+    safe="$(printf '%s_%s' "$package" "$architecture" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    dpkg-deb --info "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.package-info.txt"
+    dpkg-deb --contents "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.filelist.txt"
+    printf '%s  %s\n' "$actual_sha" "$(basename "$source")" > "$FIRMWARE_PROVENANCE_DIR/$safe.sha256"
+    printf '%s\n' "$checksum_source" > "$FIRMWARE_PROVENANCE_DIR/$safe.checksum-source.txt"
 
-  FIRMWARE_QCOM_SOC_SHA256="$expected"
-  FIRMWARE_QCOM_SOC_ACTUAL_SHA256="$actual"
-  FIRMWARE_QCOM_SOC_ACTUAL_VERSION="$version"
+    jq \
+      --arg package "$package" --arg architecture "$architecture" \
+      --argjson required "$required" --arg source "$source" \
+      --arg version "$actual_version" --arg sha "$actual_sha" \
+      --arg checksum_source "$checksum_source" \
+      '. + [{package:$package,architecture:$architecture,required:$required,source:$source,version:$version,sha256:$sha,checksum_source:$checksum_source}]' \
+      "$FIRMWARE_PACKAGES_RESOLVED_FILE" > "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp"
+    mv -f "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp" "$FIRMWARE_PACKAGES_RESOLVED_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$package" "$architecture" "$required" "$actual_version" "$actual_sha" "$source" "$checksum_source" >> "$FIRMWARE_PACKAGE_INVENTORY_FILE"
+    ok "Resolved firmware package by metadata: $package:$architecture $actual_version"
+  done
 
-  dpkg-deb --info "$FIRMWARE_QCOM_SOC_DEB" \
-    > "$FIRMWARE_PROVENANCE_DIR/firmware-qcom-soc.package-info.txt"
-  dpkg-deb --contents "$FIRMWARE_QCOM_SOC_DEB" \
-    > "$FIRMWARE_PROVENANCE_DIR/firmware-qcom-soc.filelist.txt"
-  printf '%s  %s\n' "$actual" "$(basename "$FIRMWARE_QCOM_SOC_DEB")" \
-    > "$FIRMWARE_PROVENANCE_DIR/firmware-qcom-soc.sha256"
-  printf '%s\n' "$FIRMWARE_QCOM_SOC_CHECKSUM_SOURCE" \
-    > "$FIRMWARE_PROVENANCE_DIR/firmware-qcom-soc.checksum-source.txt"
+  cp -a "$FIRMWARE_PACKAGES_RESOLVED_FILE" "$FIRMWARE_PACKAGE_LOCK_FILE"
+  FIRMWARE_PACKAGE_OVERRIDES_JSON="$(jq -c '[.[] | {package,architecture,required,source,sha256,expected_version:.version}]' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
 
-  ok "Pinned Qualcomm SoC firmware package: $(basename "$FIRMWARE_QCOM_SOC_DEB")"
-  ok "firmware-qcom-soc version: $version"
-  ok "firmware-qcom-soc SHA-256: $actual"
+  # Populate legacy evidence variables when the qcom-soc package is present.
+  FIRMWARE_QCOM_SOC_DEB="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .source' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
+  FIRMWARE_QCOM_SOC_ACTUAL_VERSION="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .version' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
+  FIRMWARE_QCOM_SOC_ACTUAL_SHA256="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .sha256' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
+  FIRMWARE_QCOM_SOC_SHA256="$FIRMWARE_QCOM_SOC_ACTUAL_SHA256"
+}
+
+# Compatibility entry point retained for callers and older tests.
+resolve_qcom_soc_firmware_package() {
+  resolve_firmware_packages
 }
 
 normalize_firmware_source_tree() {
@@ -3270,87 +3480,109 @@ merge_firmware_tree_fail_closed() {
   done < <(find "$src" -mindepth 1 -print0 | LC_ALL=C sort -z)
 }
 
-extract_qcom_soc_firmware_package_tree() {
-  local extract_root="$TMP_ROOT/firmware-qcom-soc-extract"
-  local normalized_root="$TMP_ROOT/firmware-qcom-soc-normalized"
-  rm -rf "$extract_root" "$normalized_root"
-  mkdir -p "$extract_root" "$normalized_root"
-
-  [[ -n "$FIRMWARE_QCOM_SOC_DEB" ]] || return 0
-  dpkg-deb --extract "$FIRMWARE_QCOM_SOC_DEB" "$extract_root"
-  [[ -d "$extract_root/usr/lib/firmware/qcom" ]] || \
-    die "firmware-qcom-soc package lacks /usr/lib/firmware/qcom"
-  normalize_firmware_source_tree "$extract_root/usr/lib/firmware" "$normalized_root"
-
-  if [[ -f "$extract_root/usr/share/doc/firmware-qcom-soc/copyright" ]]; then
-    cp -a "$extract_root/usr/share/doc/firmware-qcom-soc/copyright" \
-      "$FIRMWARE_PROVENANCE_DIR/firmware-qcom-soc.copyright"
-  fi
-  merge_firmware_tree_fail_closed "$normalized_root" "$STAGED_FIRMWARE_DIR" \
-    "firmware-qcom-soc:$FIRMWARE_QCOM_SOC_ACTUAL_VERSION"
+extract_resolved_firmware_package_trees() {
+  local count index package version source safe extract_root normalized_root firmware_root copyright_path
+  count="$(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+  for ((index=0; index<count; index++)); do
+    package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+    version="$(jq -r ".[$index].version" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+    source="$(jq -r ".[$index].source" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+    safe="$(printf '%s_%s' "$package" "$index" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    extract_root="$TMP_ROOT/firmware-package-$safe-extract"
+    normalized_root="$TMP_ROOT/firmware-package-$safe-normalized"
+    rm -rf "$extract_root" "$normalized_root"
+    mkdir -p "$extract_root" "$normalized_root"
+    dpkg-deb --extract "$source" "$extract_root"
+    if [[ -d "$extract_root/usr/lib/firmware" ]]; then
+      firmware_root="$extract_root/usr/lib/firmware"
+    elif [[ -d "$extract_root/lib/firmware" ]]; then
+      firmware_root="$extract_root/lib/firmware"
+    else
+      die "Declared firmware package $package contains neither /usr/lib/firmware nor /lib/firmware"
+    fi
+    normalize_firmware_source_tree "$firmware_root" "$normalized_root"
+    copyright_path="$extract_root/usr/share/doc/$package/copyright"
+    [[ ! -f "$copyright_path" ]] || cp -a "$copyright_path" "$FIRMWARE_PROVENANCE_DIR/$safe.copyright"
+    merge_firmware_tree_fail_closed "$normalized_root" "$STAGED_FIRMWARE_DIR" "$package:$version"
+  done
 }
 
-validate_hp_ath11k_board_data() {
-  [[ "$PROFILE" == "hp-omnibook-5" ]] || return 0
-  local board_dir="$STAGED_FIRMWARE_DIR/ath11k/WCN6855/hw2.1"
-  local raw="$board_dir/board-2.bin"
-  local compressed="$board_dir/board-2.bin.zst"
-  local raw_sha compressed_sha
+# Compatibility name retained for old source-based tests.
+extract_qcom_soc_firmware_package_tree() {
+  extract_resolved_firmware_package_trees
+}
+
+validate_profile_board_data() {
+  [[ "$FIRMWARE_BOARD_POLICY" != "none" ]] || {
+    info "Profile declares firmware.board_data.policy=none; no replacement ATH11K board data is required."
+    return 0
+  }
+
+  local raw="$STAGED_FIRMWARE_DIR/$FIRMWARE_BOARD_RAW_PATH"
+  local compressed=""
+  [[ -z "$FIRMWARE_BOARD_COMPRESSED_PATH" ]] || compressed="$STAGED_FIRMWARE_DIR/$FIRMWARE_BOARD_COMPRESSED_PATH"
+
+  if [[ "$FIRMWARE_BOARD_POLICY" == "optional" && ! -e "$raw" && ( -z "$compressed" || ! -e "$compressed" ) ]]; then
+    info "Optional board-data artifacts are not present; continuing without replacement board data."
+    return 0
+  fi
 
   [[ -f "$raw" && ! -L "$raw" && -s "$raw" ]] || \
-    die "Required HP ath11k board-2.bin is absent, empty, or a symlink: $raw"
-  [[ -f "$compressed" && ! -L "$compressed" && -s "$compressed" ]] || \
-    die "Required HP ath11k board-2.bin.zst is absent, empty, or a symlink: $compressed"
-  zstd --test "$compressed" >/dev/null
-  cmp -s <(zstd -dc "$compressed") "$raw" || \
-    die "board-2.bin does not equal the decompressed board-2.bin.zst"
+    die "Board-data raw file is absent, empty, or a symlink: $raw"
+  if [[ -n "$compressed" ]]; then
+    [[ -f "$compressed" && ! -L "$compressed" && -s "$compressed" ]] || \
+      die "Board-data compressed file is absent, empty, or a symlink: $compressed"
+    zstd --test "$compressed" >/dev/null
+    cmp -s <(zstd -dc "$compressed") "$raw" || \
+      die "Compressed board-data content does not equal the raw board-data file"
+  fi
 
-  raw_sha="$(sha256sum "$raw" | awk '{print $1}')"
-  compressed_sha="$(sha256sum "$compressed" | awk '{print $1}')"
-  [[ "$raw_sha" == "$HP_ATH11K_BOARD_BIN_SHA256" ]] || \
-    die "Unexpected HP board-2.bin checksum: $raw_sha"
-  [[ "$compressed_sha" == "$HP_ATH11K_BOARD_ZST_SHA256" ]] || \
-    die "Unexpected HP board-2.bin.zst checksum: $compressed_sha"
-  grep -aFq 'QCA-ATH11K-BOARD' "$raw" || \
-    die "HP board-2.bin lacks the ath11k API2 magic"
-  grep -aFq 'subsystem-vendor=103c,subsystem-device=8d9a' "$raw" || \
-    die "HP board-2.bin lacks the required HP 103c:8d9a subsystem record"
+  local raw_sha compressed_sha=""
+  raw_sha="$(sha256sum "$raw" | awk '{print tolower($1)}')"
+  [[ -z "$FIRMWARE_BOARD_RAW_SHA256" || "$raw_sha" == "$FIRMWARE_BOARD_RAW_SHA256" ]] || \
+    die "Board-data raw checksum mismatch: expected=$FIRMWARE_BOARD_RAW_SHA256 actual=$raw_sha"
+  if [[ -n "$compressed" ]]; then
+    compressed_sha="$(sha256sum "$compressed" | awk '{print tolower($1)}')"
+    [[ -z "$FIRMWARE_BOARD_COMPRESSED_SHA256" || "$compressed_sha" == "$FIRMWARE_BOARD_COMPRESSED_SHA256" ]] || \
+      die "Board-data compressed checksum mismatch: expected=$FIRMWARE_BOARD_COMPRESSED_SHA256 actual=$compressed_sha"
+  fi
+  [[ -z "$FIRMWARE_BOARD_MAGIC" ]] || grep -aFq "$FIRMWARE_BOARD_MAGIC" "$raw" || \
+    die "Board-data file lacks required magic string: $FIRMWARE_BOARD_MAGIC"
+  if [[ -n "$FIRMWARE_BOARD_SUBSYSTEM" ]]; then
+    local vendor="${FIRMWARE_BOARD_SUBSYSTEM%%:*}" device="${FIRMWARE_BOARD_SUBSYSTEM##*:}"
+    grep -aFq "subsystem-vendor=$vendor,subsystem-device=$device" "$raw" || \
+      die "Board-data file lacks required subsystem record: $FIRMWARE_BOARD_SUBSYSTEM"
+  fi
 
   {
-    printf '%s  %s\n' "$raw_sha" 'ath11k/WCN6855/hw2.1/board-2.bin'
-    printf '%s  %s\n' "$compressed_sha" 'ath11k/WCN6855/hw2.1/board-2.bin.zst'
-  } > "$FIRMWARE_PROVENANCE_DIR/hp-ath11k-board-data.sha256"
-  ok "Validated exact HP WCN6855 board-data pair."
+    printf '%s  %s\n' "$raw_sha" "$FIRMWARE_BOARD_RAW_PATH"
+    [[ -z "$compressed_sha" ]] || printf '%s  %s\n' "$compressed_sha" "$FIRMWARE_BOARD_COMPRESSED_PATH"
+  } > "$FIRMWARE_PROVENANCE_DIR/board-data.sha256"
+  ok "Validated profile-declared board data under policy=$FIRMWARE_BOARD_POLICY."
 }
 
-validate_adreno_x145_firmware_layout() {
-  local invalid
-  invalid="$(find "$STAGED_FIRMWARE_DIR/qcom" -path '*/x1p4200' -o -path '*/x1p4200/*' 2>/dev/null | sed -n '1p' || true)"
-  [[ -z "$invalid" ]] || die "Invalid Qualcomm SoC path spelling detected: $invalid (use x1p42100)"
+# Compatibility function name; behavior is now entirely profile-driven.
+validate_hp_ath11k_board_data() {
+  validate_profile_board_data
+}
 
-  local misplaced
-  for misplaced in \
-    "$STAGED_FIRMWARE_DIR/qcom/x1p42100/gen71500_sqe.fw" \
-    "$STAGED_FIRMWARE_DIR/qcom/x1p42100/gen71500_gmu.bin"; do
-    [[ ! -e "$misplaced" && ! -L "$misplaced" ]] || \
-      die "Misplaced Adreno firmware must be removed: $misplaced"
-  done
-
-  local -a required=(
-    "qcom/gen71500_sqe.fw"
-    "qcom/gen71500_gmu.bin"
-    "qcom/x1p42100/gen71500_zap.mbn"
-  )
-  local rel path
-  : > "$FIRMWARE_PROVENANCE_DIR/adreno-x145-firmware.sha256"
-  for rel in "${required[@]}"; do
-    path="$STAGED_FIRMWARE_DIR/$rel"
+validate_profile_firmware_layout() {
+  local probe path
+  : > "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"
+  for probe in "${PROFILE_FIRMWARE_PROBES[@]}"; do
+    [[ -n "$probe" ]] || continue
+    validate_relative_firmware_probe "$probe"
+    path="$STAGED_FIRMWARE_DIR/$probe"
     [[ -f "$path" && ! -L "$path" && -s "$path" ]] || \
-      die "Required Adreno X1-45 firmware is absent, empty, or a symlink: $path"
-    printf '%s  %s\n' "$(sha256sum "$path" | awk '{print $1}')" "$rel" \
-      >> "$FIRMWARE_PROVENANCE_DIR/adreno-x145-firmware.sha256"
+      die "Required profile firmware path is absent, empty, or a symlink: $path"
+    printf '%s  %s\n' "$(sha256sum "$path" | awk '{print $1}')" "$probe" >> "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"
   done
-  ok "Validated canonical Adreno X1-45 SQE, GMU, and ZAP firmware paths."
+  ok "Validated ${#PROFILE_FIRMWARE_PROBES[@]} profile-declared firmware paths."
+}
+
+# Compatibility name; no Adreno generation or path is globally assumed.
+validate_adreno_x145_firmware_layout() {
+  validate_profile_firmware_layout
 }
 
 validate_all_profile_firmware_probes() {
@@ -3536,76 +3768,57 @@ stage_firmware() {
   mkdir -p "$STAGED_FIRMWARE_DIR"
   printf 'source\taction\trelative_path\tdetail\n' > "$FIRMWARE_MERGE_REPORT"
 
+  local required_package_count
+  required_package_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
   case "${FIRMWARE_MODE,,}" in
     skip)
-      if [[ "$FIRMWARE_QCOM_SOC_POLICY" != "skip" || ${#PROFILE_FIRMWARE_PROBES[@]} -gt 0 ]]; then
-        die "FIRMWARE_MODE=skip is incompatible with the required Qualcomm/HP firmware probes for this profile."
+      if (( required_package_count > 0 || ${#PROFILE_FIRMWARE_PROBES[@]} > 0 )) || [[ "$FIRMWARE_BOARD_POLICY" == "required" ]]; then
+        die "FIRMWARE_MODE=skip is incompatible with required package, firmware-path, or board-data declarations."
       fi
       FIRMWARE_SOURCE=""
-      warn "Continuing without staged firmware under an explicitly probe-free profile."
+      warn "Continuing without staged firmware under an explicitly requirement-free profile."
       return
       ;;
-    archive|url)
-      extract_qcom_firmware_isolated
-      ;;
-    ask|auto|existing)
-      die "Firmware mode must be resolved before execution: $FIRMWARE_MODE"
-      ;;
-    prestaged)
-      :
-      ;;
+    archive|url) extract_qcom_firmware_isolated ;;
+    ask|auto|existing) die "Firmware mode must be resolved before execution: $FIRMWARE_MODE" ;;
+    prestaged) : ;;
     *) die "Unsupported firmware mode: $FIRMWARE_MODE" ;;
   esac
 
-  # Layer 1: generic Qualcomm SoC firmware from a pinned Debian package.
-  if [[ -n "$FIRMWARE_QCOM_SOC_DEB" ]]; then
-    extract_qcom_soc_firmware_package_tree
-  fi
+  # Package layers are generic and ordered exactly as declared in the profile.
+  extract_resolved_firmware_package_trees
 
-  # Layer 2: machine/profile-specific firmware. This includes WCN6855 board
-  # data and HP machine firmware. Duplicate package paths must be byte-identical.
+  # The profile-specific/pre-staged tree is the final layer. Duplicate paths
+  # must remain byte-identical; differing content fails rather than overriding.
   if [[ -n "$FIRMWARE_PRESTAGED" ]]; then
-    [[ -d "$FIRMWARE_PRESTAGED" ]] || \
-      die "Profile firmware source does not exist: $FIRMWARE_PRESTAGED"
+    [[ -d "$FIRMWARE_PRESTAGED" ]] || die "Profile firmware source does not exist: $FIRMWARE_PRESTAGED"
     local profile_normalized="$TMP_ROOT/profile-firmware-normalized"
     normalize_firmware_source_tree "$FIRMWARE_PRESTAGED" "$profile_normalized"
-    merge_firmware_tree_fail_closed "$profile_normalized" "$STAGED_FIRMWARE_DIR" \
-      "profile:$PROFILE"
+    merge_firmware_tree_fail_closed "$profile_normalized" "$STAGED_FIRMWARE_DIR" "profile:$PROFILE"
   fi
 
   if ! find "$STAGED_FIRMWARE_DIR" -type f -print -quit | grep -q .; then
+    if (( required_package_count == 0 && ${#PROFILE_FIRMWARE_PROBES[@]} == 0 )) && [[ "$FIRMWARE_BOARD_POLICY" != "required" ]]; then
+      warn "Firmware configuration produced no files, but the profile declares no mandatory firmware artifacts."
+      FIRMWARE_SOURCE=""
+      return
+    fi
     die "Firmware configuration produced no staged files under $STAGED_FIRMWARE_DIR."
   fi
 
-  validate_adreno_x145_firmware_layout
-  validate_hp_ath11k_board_data
-
-  # Machine DSP probes become mandatory whenever those artifacts were supplied.
-  if [[ "$PROFILE" == "hp-omnibook-5" ]]; then
-    local dsp_probe
-    for dsp_probe in \
-      "qcom/x1p42100/hp/omnibook-5/qcadsp8380.mbn" \
-      "qcom/x1p42100/hp/omnibook-5/qccdsp8380.mbn"; do
-      [[ -e "$STAGED_FIRMWARE_DIR/$dsp_probe" ]] && \
-        append_unique_values PROFILE_FIRMWARE_PROBES "$dsp_probe"
-    done
-  fi
-
+  validate_profile_firmware_layout
+  validate_profile_board_data
   validate_all_profile_firmware_probes
   write_staged_firmware_inventory
   FIRMWARE_SOURCE="$STAGED_FIRMWARE_DIR"
   FIRMWARE_PROBE_REL="$(printf '%s\n' "${PROFILE_FIRMWARE_PROBES[@]}" | sed '/^$/d' | sed -n '1p')"
-  [[ -n "$FIRMWARE_PROBE_REL" ]] || \
-    FIRMWARE_PROBE_REL="$(find "$FIRMWARE_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | sed -n '1p')"
+  [[ -n "$FIRMWARE_PROBE_REL" ]] || FIRMWARE_PROBE_REL="$(find "$FIRMWARE_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | sed -n '1p')"
 
-  # Refresh resolved evidence after optional supplied DSP paths are promoted to
-  # required probes and after package metadata/checksums become final.
-  reconcile_profile_hardware_requirements
   write_resolved_profile
-
   ok "Staged firmware root: $FIRMWARE_SOURCE"
+  ok "Resolved firmware packages: $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
   ok "Staged firmware files: $(wc -l < "$FIRMWARE_STAGED_INVENTORY")"
-  ok "Primary firmware probe: $FIRMWARE_PROBE_REL"
+  ok "Primary firmware probe: ${FIRMWARE_PROBE_REL:-none}"
 }
 
 # ---------------------------- build plan --------------------------------
@@ -3649,10 +3862,10 @@ Live extraction closure:    ${#LIVE_KERNEL_DEBS[@]}
 DTB:                        $DTB_FILE
 Firmware mode:              $FIRMWARE_MODE
 Firmware source:            ${FIRMWARE_SOURCE:-to be staged during execution}
-Qualcomm SoC FW policy:     $FIRMWARE_QCOM_SOC_POLICY
-Qualcomm SoC FW package:    ${FIRMWARE_QCOM_SOC_DEB:-none}
-Qualcomm SoC FW version:    ${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-pending}
-Qualcomm SoC FW SHA-256:    ${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-pending}
+Firmware package specs:     $(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")
+Firmware packages resolved: $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")
+Firmware required paths:    ${PROFILE_FIRMWARE_PROBES[*]:-none}
+Board-data policy:          $FIRMWARE_BOARD_POLICY
 Kernel command additions:   ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
 Target /root source:        ${ROOT_SOURCE:-none}
 Repository policy:          $REPO_POLICY
@@ -3675,7 +3888,8 @@ ISO OCI layout path:       $ISO_IMAGE_LAYOUT_PATH
 Logical registry host:      $LOCAL_REGISTRY_LOGICAL_HOST
 Physical registry endpoint: $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
 Registry fallback:         ${REGISTRY_IMAGE_REF:-none}
-Profile manifest:          $PROFILE_FILE_RESOLVED
+Profile source:            $PROFILE_FILE_SOURCE
+Profile normalized:        $PROFILE_FILE_RESOLVED
 Kernel package directory:  $KERNEL_DEB_DIR
 Push target OCI:            $PUSH_TARGET_IMAGE
 Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
@@ -3694,6 +3908,8 @@ Safety invariants:
     payloads and supplied local Depends/Pre-Depends form the install closure.
   - Duplicate image ownership, overlapping boot-critical payloads, mixed
     architectures, and conflicting package identities fail closed.
+  - Firmware package filenames are irrelevant; Package/Architecture metadata,
+    SHA-256 pins, required_paths, and board_data policy define acceptance.
   - Package registration is attested during the unlocked build stage; the final
     immutable target is not expected to retain apt, dpkg, or dpkg-query.
   - /lib/modules/<release>/build and source symlinks never qualify as modules.
@@ -3719,10 +3935,7 @@ Exact non-interactive execute command:
     KERNEL_RELEASE_POLICY=require \
     KERNEL_IMAGE_DEB_OVERRIDE=$(printf '%q' "$KERNEL_IMAGE_DEB") \
     FIRMWARE_MODE=$(printf '%q' "$FIRMWARE_MODE") FIRMWARE_PRESTAGED=$(printf '%q' "$FIRMWARE_PRESTAGED") \
-    FIRMWARE_QCOM_SOC_POLICY=$(printf '%q' "$FIRMWARE_QCOM_SOC_POLICY") \
-    FIRMWARE_QCOM_SOC_DEB=$(printf '%q' "$FIRMWARE_QCOM_SOC_DEB") \
-    FIRMWARE_QCOM_SOC_SHA256=$(printf '%q' "$FIRMWARE_QCOM_SOC_SHA256") \
-    FIRMWARE_QCOM_SOC_EXPECTED_VERSION=$(printf '%q' "$FIRMWARE_QCOM_SOC_EXPECTED_VERSION") \
+    FIRMWARE_PACKAGE_OVERRIDES_JSON=$(printf '%q' "$FIRMWARE_PACKAGE_OVERRIDES_JSON") \
     REPO_POLICY=$(printf '%q' "$REPO_POLICY") INSTALLER_STORAGE_GUARD_POLICY=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY") \
     TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") \
     ABROOT_IMAGE_NAME=$(printf '%q' "$ABROOT_IMAGE_NAME") \
@@ -4733,8 +4946,9 @@ stages:
       vanillaos-snapdragonx.kernel: $KERNEL_RELEASE
       vanillaos-snapdragonx.dtb: $DTB_NAME
       vanillaos-snapdragonx.builder-version: "$SCRIPT_VERSION"
-      vanillaos-snapdragonx.qcom-soc-firmware-version: "${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-prestaged}"
-      vanillaos-snapdragonx.qcom-soc-firmware-sha256: "${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-not-recorded}"
+      vanillaos-snapdragonx.firmware-package-count: "$(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+      vanillaos-snapdragonx.firmware-lock-sha256: "$(sha256sum "$FIRMWARE_PACKAGE_LOCK_FILE" | awk '{print $1}')"
+      vanillaos-snapdragonx.board-data-policy: "$FIRMWARE_BOARD_POLICY"
     args:
       DEBIAN_FRONTEND: noninteractive
     runs:
@@ -8292,9 +8506,10 @@ Kernel image source:      $KERNEL_IMAGE_DEB
 Kernel closure record:    kernel-package-closure.json
 DTB:                      $DTB_NAME
 Kernel command additions: ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
-Qualcomm FW package:      ${FIRMWARE_QCOM_SOC_DEB:-none}
-Qualcomm FW version:      ${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-none}
-Qualcomm FW SHA-256:      ${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-none}
+Firmware package lock:   firmware-provenance/firmware-package-lock.json
+Firmware packages:       $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")
+Firmware required paths: ${PROFILE_FIRMWARE_PROBES[*]:-none}
+Board-data policy:       $FIRMWARE_BOARD_POLICY
 Hardware diagnostics:    /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
 Boot evidence:           /var/log/vanillaos-snapdragonx/current
 Installer delivery:       $DELIVERY_MODE
@@ -8322,7 +8537,8 @@ Version:                     $SCRIPT_VERSION
 Release ID:                  $RELEASE_ID
 Profile:                     $PROFILE
 Profile display name:        $PROFILE_DISPLAY_NAME
-Profile source:              $PROFILE_FILE_RESOLVED
+Profile source:              $PROFILE_FILE_SOURCE
+Profile normalized:          $PROFILE_FILE_RESOLVED
 Profile resolved record:     profile.resolved.json
 Kernel package directory:    $KERNEL_DEB_DIR
 Kernel release:              $KERNEL_RELEASE
@@ -8339,9 +8555,10 @@ Live extraction closure:     ${#LIVE_KERNEL_DEBS[@]}
 DTB:                         $DTB_NAME
 GRUB binding evidence:       grub-patch-manifest.tsv and final-grub.cfg
 Firmware source:             ${FIRMWARE_SOURCE:-none}
-firmware-qcom-soc package:   ${FIRMWARE_QCOM_SOC_DEB:-none}
-firmware-qcom-soc version:   ${FIRMWARE_QCOM_SOC_ACTUAL_VERSION:-none}
-firmware-qcom-soc SHA-256:   ${FIRMWARE_QCOM_SOC_ACTUAL_SHA256:-none}
+Firmware package lock:       firmware-provenance/firmware-package-lock.json
+Firmware package count:      $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")
+Firmware required paths:     ${PROFILE_FIRMWARE_PROBES[*]:-none}
+Firmware board-data policy:  $FIRMWARE_BOARD_POLICY
 Kernel command additions:    ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
 Firmware provenance:         firmware-provenance/
 Target /root source:         ${ROOT_SOURCE:-none}
@@ -8432,7 +8649,7 @@ main() {
 
   stage "4/13 Resolving interactive build inputs and validating hardware artifacts"
   configure_build_inputs_interactively
-  resolve_qcom_soc_firmware_package
+  resolve_firmware_packages
   discover_kernel_and_dtb_inputs
   # Refresh resolved profile evidence with the deterministic discovered values.
   KERNEL_IMAGE_DEB_OVERRIDE="$KERNEL_IMAGE_DEB"
