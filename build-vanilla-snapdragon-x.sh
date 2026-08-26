@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.7.sh
+# build-vanilla-arm64-release-v2.6.8.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.7
+# Version: 2.6.8
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.7"
+SCRIPT_VERSION="2.6.8"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -38,6 +38,8 @@ DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CON
 PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE="${PODMAN_BUILD_NO_CACHE_AFTER_CONTEXT_CHANGE:-1}"
 RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK="${RECONSTRUCT_INCLUDES_CONTAINER_ON_RUNTIME_BREAK:-1}"
 PODMAN_BUILD_NETWORK="${PODMAN_BUILD_NETWORK:-host}"  # host|default|none|<podman-network-name>
+ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
+KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -392,6 +394,10 @@ run_logged() {
         warn "Primary Vib log was empty. Deep diagnostic log:"
         warn "  $LAST_DEEP_DIAGNOSTIC_LOG"
       fi
+    fi
+
+    if [[ "$label" == *"container image"* || "$*" == *"podman"* ]]; then
+      classify_container_build_failure "$log"
     fi
 
     action="$(command_failure_menu "$label" "$workdir" "$log" "$status")"
@@ -2425,6 +2431,107 @@ run_vib_build_with_diagnostics() {
   done
 }
 
+
+patch_known_unavailable_packages() {
+  # Patch known unavailable or transiently removed packages out of Vib-generated
+  # module files before the generated Containerfile is built.
+  #
+  # Current known failure:
+  #   network-manager-fortisslvpn has no installation candidate in the pinned
+  #   Vanilla repo snapshot used by ghcr.io/vanilla-os/pico:dev.
+  #
+  # This package is a NetworkManager VPN plugin, not required for baseline boot,
+  # Wi-Fi, kernel, DTB, Qualcomm firmware, or ISO generation. Treat it as
+  # optional by default and record the patch.
+  local repo="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-known-unavailable-package-patch-$(date -u +%H%M%S).log"
+  local pkg file backup tmp changed_any=0
+
+  [[ "$ALLOW_MISSING_OPTIONAL_PACKAGES" == "1" ]] || {
+    info "Optional package removal disabled: ALLOW_MISSING_OPTIONAL_PACKAGES=$ALLOW_MISSING_OPTIONAL_PACKAGES"
+    return 0
+  }
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  : > "$log"
+
+  printf 'Known unavailable package patch log\n' >>"$log"
+  printf 'Repository: %s\n' "$repo" >>"$log"
+  printf 'Packages: %s\n\n' "$KNOWN_UNAVAILABLE_PACKAGES" >>"$log"
+
+  for pkg in $KNOWN_UNAVAILABLE_PACKAGES; do
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      if grep -qw -- "$pkg" "$file"; then
+        changed_any=1
+        backup="$file.builder-backup-remove-${pkg//[^A-Za-z0-9_.-]/_}.$(date -u +%Y%m%d%H%M%S)"
+        tmp="$file.builder-patched.$$"
+        cp -a "$file" "$backup"
+
+        # Remove the exact package token while preserving the rest of the file.
+        # This handles both one-package-per-line YAML lists and inline generated
+        # apt-get command package lists.
+        python3 - "$file" "$tmp" "$pkg" <<'PY'
+import re, sys
+src, dst, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+pat_token = re.compile(r'(^|[\s"\'])' + re.escape(pkg) + r'($|[\s"\'])')
+out = []
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        original = line
+
+        # Remove YAML list item lines that contain only the package.
+        if re.match(r'^\s*-\s*["\']?' + re.escape(pkg) + r'["\']?\s*$', line):
+            continue
+
+        # Remove exact package tokens from inline command/package lists.
+        line = re.sub(r'(?<![A-Za-z0-9_.+-])' + re.escape(pkg) + r'(?![A-Za-z0-9_.+-])', '', line)
+        line = re.sub(r'[ \t]{2,}', ' ', line)
+        out.append(line)
+
+with open(dst, "w", encoding="utf-8") as f:
+    f.writelines(out)
+PY
+        mv "$tmp" "$file"
+        {
+          printf 'PATCHED package: %s\n' "$pkg"
+          printf 'File: %s\n' "$file"
+          printf 'Backup: %s\n' "$backup"
+          printf 'Diff:\n'
+          diff -u "$backup" "$file" || true
+          printf '\n'
+        } >>"$log"
+        warn "Removed optional unavailable package '$pkg' from $(realpath --relative-to="$repo" "$file" 2>/dev/null || printf '%s' "$file")"
+      fi
+    done < <(grep -RIl -- "$pkg" "$repo/modules" "$repo/sources" "$repo/recipe.yml" "$repo/Containerfile" "$repo/Dockerfile" 2>/dev/null || true)
+  done
+
+  if [[ "$changed_any" -eq 1 ]]; then
+    warn "Known unavailable package patch applied. Log: $log"
+  else
+    ok "No known unavailable package tokens found to patch for $label."
+  fi
+}
+
+classify_container_build_failure() {
+  # Provide concise classification for common generated-container failures.
+  local log="$1"
+
+  [[ -f "$log" ]] || return 0
+
+  if grep -q "has no installation candidate" "$log"; then
+    fail "Container build failed because an apt package has no installation candidate."
+    grep -nE "Package .* is not available|has no installation candidate|E: Package" "$log" >&2 || true
+    warn "If the package is optional, add it to KNOWN_UNAVAILABLE_PACKAGES and rerun."
+    warn "Current KNOWN_UNAVAILABLE_PACKAGES=$KNOWN_UNAVAILABLE_PACKAGES"
+  elif grep -q "Temporary failure resolving" "$log"; then
+    fail "Container build failed because DNS resolution failed inside the build container."
+    grep -n "Temporary failure resolving" "$log" >&2 || true
+    warn "Current PODMAN_BUILD_NETWORK=$PODMAN_BUILD_NETWORK"
+  fi
+}
+
 diagnose_generated_container_context() {
   # After Vib succeeds, it has generated the Dockerfile/Containerfile context
   # that podman will build. The observed failure:
@@ -2917,6 +3024,7 @@ build_container_image_with_context_workarounds() {
 
   safe_label="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9-]+/-/g')"
 
+  patch_known_unavailable_packages "$repo" "$safe_label"
   diagnose_generated_container_context "$repo" "$safe_label"
   maybe_disable_ld_so_preload_for_container_build "$repo"
 
