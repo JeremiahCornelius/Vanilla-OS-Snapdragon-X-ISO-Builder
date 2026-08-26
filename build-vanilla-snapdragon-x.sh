@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.5.2.sh
+# build-vanilla-arm64-release-v2.5.3.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.5.2
+# Version: 2.5.3
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.2"
+SCRIPT_VERSION="2.5.3"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -720,6 +720,147 @@ ensure_vib_plugins_for_image_repos() {
     fi
   done
 }
+
+
+recipe_uses_fsguard() {
+  local repo="$1"
+  [[ -f "$repo/recipe.yml" ]] || return 1
+  grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$repo/recipe.yml"
+}
+
+find_existing_fsguard_plugin() {
+  local dir="$1"
+  find "$dir" -maxdepth 3 -type f \( \
+      -iname 'fsguard.so' -o \
+      -iname '*fsguard*.so' -o \
+      -iname 'vib-fsguard*.so' \
+    \) 2>/dev/null | head -n1
+}
+
+install_fsguard_plugin_into_repo() {
+  # Recipes that contain `type: fsguard` require the separate compiled
+  # Vanilla-OS/vib-fsguard plugin. The generic plugins-arm64.tar.gz bundle may
+  # not include it.
+  local repo="$1"
+  local repo_name plugins_dir host_arch tmp release_json asset_url asset_name extract_dir found
+
+  repo_name="$(basename "$repo")"
+  plugins_dir="$repo/plugins"
+  host_arch="$(detect_arch)"
+
+  [[ -d "$repo" ]] || return 0
+  recipe_uses_fsguard "$repo" || return 0
+
+  mkdir -p "$plugins_dir"
+  found="$(find_existing_fsguard_plugin "$plugins_dir" || true)"
+  if [[ -n "$found" ]]; then
+    if [[ "$(basename "$found")" != "fsguard.so" ]]; then
+      cp -a "$found" "$plugins_dir/fsguard.so"
+    fi
+    ok "fsguard plugin present for $repo_name: $plugins_dir/fsguard.so"
+    return 0
+  fi
+
+  printf '\n' >&2
+  hr
+  printf 'Vib fsguard Plugin Required\n\n' >&2
+  printf 'Repository:\n  %s\n\n' "$repo_name" >&2
+  printf 'Reason:\n  recipe.yml contains: type: fsguard\n\n' >&2
+  printf 'Required destination:\n  %s/fsguard.so\n\n' "$plugins_dir" >&2
+  printf 'The builder will try to download the latest Vanilla-OS/vib-fsguard release asset for:\n  %s\n' "$host_arch" >&2
+  hr
+
+  tmp="$TMP_DIR/vib-fsguard-${repo_name}-$$"
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  release_json="$tmp/release.json"
+  extract_dir="$tmp/extract"
+  mkdir -p "$extract_dir"
+
+  info "Querying latest vib-fsguard release metadata."
+  curl -fsSL "https://api.github.com/repos/Vanilla-OS/vib-fsguard/releases/latest" -o "$release_json" \
+    || die "Unable to query latest vib-fsguard release metadata."
+
+  if have jq; then
+    asset_url="$(jq -r --arg arch "$host_arch" '
+      .assets[]
+      | select((.name | ascii_downcase | contains($arch))
+               and (.name | ascii_downcase | contains("fsguard"))
+               and (.name | test("\\.so$|\\.tar\\.gz$|\\.tgz$|\\.zip$"; "i")))
+      | .browser_download_url
+    ' "$release_json" | head -n1)"
+    asset_name="$(jq -r --arg url "$asset_url" '.assets[] | select(.browser_download_url==$url) | .name' "$release_json" | head -n1)"
+  else
+    asset_url="$(python3 - "$release_json" "$host_arch" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+arch=sys.argv[2].lower()
+for a in data.get("assets", []):
+    name=a.get("name","")
+    low=name.lower()
+    if arch in low and "fsguard" in low and (low.endswith(".so") or low.endswith(".tar.gz") or low.endswith(".tgz") or low.endswith(".zip")):
+        print(a.get("browser_download_url",""))
+        break
+PY
+)"
+    asset_name="$(basename "$asset_url")"
+  fi
+
+  if [[ -z "${asset_url:-}" || "$asset_url" == "null" ]]; then
+    fail "Could not identify a vib-fsguard release asset for architecture '$host_arch'."
+    warn "Manually place a compiled host-architecture fsguard plugin at:"
+    warn "  $plugins_dir/fsguard.so"
+    open_shell "$repo"
+    found="$(find_existing_fsguard_plugin "$plugins_dir" || true)"
+    if [[ -n "$found" ]]; then
+      cp -a "$found" "$plugins_dir/fsguard.so"
+      chmod 0755 "$plugins_dir/fsguard.so" || true
+      ok "Using manually supplied fsguard plugin: $plugins_dir/fsguard.so"
+      return 0
+    fi
+    die "Missing required fsguard plugin for $repo_name."
+  fi
+
+  info "Downloading vib-fsguard asset: $asset_name"
+  curl -fL "$asset_url" -o "$tmp/$asset_name" \
+    || die "Failed to download vib-fsguard asset: $asset_name"
+
+  case "$asset_name" in
+    *.so)
+      cp -a "$tmp/$asset_name" "$plugins_dir/fsguard.so"
+      ;;
+    *.tar.gz|*.tgz)
+      tar -xzf "$tmp/$asset_name" -C "$extract_dir" \
+        || die "Failed to extract vib-fsguard archive: $asset_name"
+      found="$(find_existing_fsguard_plugin "$extract_dir" || true)"
+      [[ -n "$found" ]] || die "vib-fsguard archive did not contain a recognizable fsguard .so"
+      cp -a "$found" "$plugins_dir/fsguard.so"
+      ;;
+    *.zip)
+      unzip -q "$tmp/$asset_name" -d "$extract_dir" \
+        || die "Failed to extract vib-fsguard zip: $asset_name"
+      found="$(find_existing_fsguard_plugin "$extract_dir" || true)"
+      [[ -n "$found" ]] || die "vib-fsguard zip did not contain a recognizable fsguard .so"
+      cp -a "$found" "$plugins_dir/fsguard.so"
+      ;;
+    *)
+      die "Unsupported vib-fsguard asset type: $asset_name"
+      ;;
+  esac
+
+  chmod 0755 "$plugins_dir/fsguard.so" || true
+  [[ -s "$plugins_dir/fsguard.so" ]] || die "Installed fsguard plugin is missing or empty: $plugins_dir/fsguard.so"
+  ok "Installed fsguard plugin for $repo_name: $plugins_dir/fsguard.so"
+}
+
+ensure_required_recipe_specific_plugins() {
+  local repo
+  for repo in "$SOURCES_DIR/core-image" "$SOURCES_DIR/desktop-image"; do
+    [[ -d "$repo" ]] || continue
+    install_fsguard_plugin_into_repo "$repo"
+  done
+}
+
 
 
 check_dependencies() {
@@ -1669,6 +1810,16 @@ vib_preflight() {
     return 1
   fi
 
+  if grep -Eq '^[[:space:]]*type:[[:space:]]*fsguard[[:space:]]*$' "$workdir/recipe.yml"; then
+    if [[ ! -s "$workdir/plugins/fsguard.so" ]]; then
+      fail "recipe.yml uses 'type: fsguard' but $workdir/plugins/fsguard.so is missing."
+      warn "The generic Vib plugin bundle is not sufficient for this recipe."
+      warn "See preflight log: $log"
+      print_failure_tail "$log"
+      return 1
+    fi
+  fi
+
   ok "Vib preflight completed for $label."
   return 0
 }
@@ -1930,6 +2081,8 @@ sync_repo "live-iso" "$LIVE_REPO_URL" "$LIVE_BRANCH" "$SOURCES_DIR/live-iso"
 
 info "Ensuring Vib plugin bundles are installed for image recipes."
 ensure_vib_plugins_for_image_repos
+info "Ensuring recipe-specific Vib plugins are installed."
+ensure_required_recipe_specific_plugins
 
 info "Checking and repairing known Vib recipe YAML indentation issues."
 repair_known_vib_recipes
