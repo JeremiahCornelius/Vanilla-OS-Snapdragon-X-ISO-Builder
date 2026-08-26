@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.7.10.sh
+# build-vanilla-arm64-release-v2.7.11.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.7.10
+# Version: 2.7.11
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.7.10"
+SCRIPT_VERSION="2.7.11"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
@@ -46,6 +46,8 @@ LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:de
 LIVE_ISO_CONTAINER_RUNTIME="${LIVE_ISO_CONTAINER_RUNTIME:-podman}"  # podman|docker
 LIVE_ISO_CONTAINER_FALLBACK_IMAGES="${LIVE_ISO_CONTAINER_FALLBACK_IMAGES:-ghcr.io/vanilla-os/pico:dev ghcr.io/vanilla-os/pico:latest debian:trixie}"
 VERIFY_CUSTOM_KERNEL_IN_ISO="${VERIFY_CUSTOM_KERNEL_IN_ISO:-1}"
+INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE:-0}"
+INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE="${INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE:-0}"
 ALLOW_MISSING_OPTIONAL_PACKAGES="${ALLOW_MISSING_OPTIONAL_PACKAGES:-1}"
 KNOWN_UNAVAILABLE_PACKAGES="${KNOWN_UNAVAILABLE_PACKAGES:-network-manager-fortisslvpn}"
 PATCH_KNOWN_DEBIAN_CHANGELOG_DATES="${PATCH_KNOWN_DEBIAN_CHANGELOG_DATES:-1}"
@@ -1820,6 +1822,21 @@ verify_live_iso_source_integration() {
     failed=1
   fi
 
+  if [[ "$INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE" != "1" ]] &&      find "$live/etc/config/packages.chroot" -maxdepth 1 -type f -name 'linux-headers-*.deb' | grep -q .; then
+    fail "Kernel headers were staged into the live chroot despite headers policy being disabled."
+    failed=1
+  fi
+
+  if [[ "$INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE" != "1" ]] &&      find "$live/etc/config/packages.chroot" -maxdepth 1 -type f \( -name 'linux-tools-*.deb' -o -name 'linux-*-tools-*.deb' \) | grep -q .; then
+    fail "Kernel tools were staged into the live chroot despite tools policy being disabled."
+    failed=1
+  fi
+
+  if grep -RqsE '^[[:space:]]*(linux-image-arm64|linux-headers-arm64)[[:space:]]*$' "$live/etc/config/package-lists" 2>/dev/null; then
+    fail "Standard Debian ARM64 kernel metapackage remains in live-build package lists."
+    failed=1
+  fi
+
   [[ -x "$live/etc/config/hooks/live/095-custom-arm64-kernel.chroot" ]] || {
     fail "Missing executable custom-kernel live-build hook."
     failed=1
@@ -1915,6 +1932,157 @@ verify_built_iso_custom_boot_artifacts() {
   printf 'ISO verification log:\n  %s\n' "$log" >&2
 }
 
+
+classify_kernel_deb_for_live() {
+  # Print one of:
+  #   boot      -> install into live chroot
+  #   headers   -> optional development package
+  #   tools     -> optional tooling package
+  #   metadata  -> do not install
+  #   other     -> do not install automatically
+  local deb="$1"
+  local pkg
+
+  pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+
+  case "$pkg" in
+    linux-image-*|linux-modules-*|linux-modules-extra-*)
+      printf '%s\n' "boot"
+      ;;
+    linux-headers-*|linux-*-headers-*)
+      printf '%s\n' "headers"
+      ;;
+    linux-tools-*|linux-*-tools-*)
+      printf '%s\n' "tools"
+      ;;
+    linux-buildinfo-*|*.buildinfo|*.changes)
+      printf '%s\n' "metadata"
+      ;;
+    *)
+      printf '%s\n' "other"
+      ;;
+  esac
+}
+
+stage_live_custom_kernel_packages() {
+  # Install only packages needed to boot the live ISO. Headers and tools are not
+  # boot dependencies and can introduce unavailable cross-distribution package
+  # dependencies such as linux-tools-common.
+  local live="$1"
+  local packages_dir="$live/etc/config/packages.chroot"
+  local archive_dir="$live/etc/config/includes.chroot/root/custom-kernel-packages"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-custom-kernel-package-selection-$(date -u +%H%M%S).log"
+  local deb class pkg boot_count=0
+
+  mkdir -p "$packages_dir" "$archive_dir" "$OUTPUT_DIR/logs"
+
+  # Remove packages staged by previous builder revisions.
+  find "$packages_dir" -maxdepth 1 -type f -name '*.deb' -delete 2>/dev/null || true
+  rm -rf "$archive_dir"
+  mkdir -p "$archive_dir"
+
+  {
+    printf '### Live custom-kernel package selection\n'
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'Headers in live: %s\n' "$INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE"
+    printf 'Tools in live: %s\n\n' "$INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE"
+  } >"$log"
+
+  for deb in "${KERNEL_DEBS[@]:-}"; do
+    [[ -f "$deb" ]] || continue
+    class="$(classify_kernel_deb_for_live "$deb")"
+    pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null || basename "$deb")"
+
+    printf '%s\t%s\t%s\n' "$class" "$pkg" "$deb" >>"$log"
+
+    # Preserve every supplied package as a reference artifact inside /root,
+    # but install only packages appropriate for the live boot environment.
+    cp -a "$deb" "$archive_dir/"
+
+    case "$class" in
+      boot)
+        cp -a "$deb" "$packages_dir/"
+        boot_count=$((boot_count + 1))
+        ;;
+      headers)
+        if [[ "$INSTALL_CUSTOM_KERNEL_HEADERS_IN_LIVE" == "1" ]]; then
+          cp -a "$deb" "$packages_dir/"
+        fi
+        ;;
+      tools)
+        if [[ "$INSTALL_CUSTOM_KERNEL_TOOLS_IN_LIVE" == "1" ]]; then
+          cp -a "$deb" "$packages_dir/"
+        fi
+        ;;
+      metadata|other)
+        ;;
+    esac
+  done
+
+  if [[ "$boot_count" -eq 0 ]]; then
+    fail "No boot-critical custom kernel packages were selected for the live ISO."
+    warn "Package selection log: $log"
+    return 1
+  fi
+
+  ok "Selected $boot_count boot-critical custom kernel package(s) for live ISO."
+  printf 'Kernel package selection log:\n  %s\n' "$log" >&2
+}
+
+remove_standard_kernel_metapackages_from_live() {
+  # The Vanilla live ISO package lists can select Debian's linux-image-arm64 and
+  # linux-headers-arm64 metapackages. Those conflict with the custom kernel and
+  # pull an unrelated standard kernel into the ISO.
+  local live="$1"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-live-standard-kernel-metapackage-removal-$(date -u +%H%M%S).log"
+  local file tmp changed=0
+
+  mkdir -p "$OUTPUT_DIR/logs"
+  : >"$log"
+
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    if grep -Eq '^[[:space:]]*(linux-image-arm64|linux-headers-arm64)[[:space:]]*$' "$file"; then
+      tmp="$file.builder-kernel-meta.$$"
+      awk '
+        !/^[[:space:]]*linux-image-arm64[[:space:]]*$/ &&
+        !/^[[:space:]]*linux-headers-arm64[[:space:]]*$/
+      ' "$file" >"$tmp"
+      cp -a "$file" "$file.builder-backup-kernel-meta.$(date -u +%Y%m%d%H%M%S)"
+      mv "$tmp" "$file"
+      printf 'PATCHED %s\n' "$file" >>"$log"
+      changed=1
+    fi
+  done < <(find "$live/etc/config" -type f \( -name '*.list.chroot' -o -name '*.list.binary' -o -name '*.list' \) 2>/dev/null | sort)
+
+  if [[ "$changed" -eq 1 ]]; then
+    warn "Removed standard ARM64 kernel metapackages from live-build package lists."
+    warn "Metapackage removal log: $log"
+  else
+    ok "No standard ARM64 kernel metapackages found in live-build package lists."
+  fi
+}
+
+write_live_custom_kernel_dependency_list() {
+  # Explicit runtime dependencies for the custom kernel and live environment.
+  # Do not include linux-tools-common: it is unavailable in the current Vanilla
+  # repository snapshot and is only required by optional tools packages.
+  local live="$1"
+  local list="$live/etc/config/package-lists/zz-custom-arm64-kernel.list.chroot"
+
+  mkdir -p "$(dirname "$list")"
+
+  cat >"$list" <<'EOF'
+linux-base
+initramfs-tools
+wireless-regdb
+rsync
+uuid-runtime
+EOF
+
+  ok "Wrote custom kernel dependency package list: $list"
+}
+
 # ------------------------- staging into repos --------------------------
 
 stage_customizations() {
@@ -1983,9 +2151,9 @@ EOF
     rm -f "$live/etc/config/hooks/live/010-custom-arm64-kernel.chroot"
     rm -f "$live/etc/config/includes.binary/boot/grub/custom-dtb.cfg"
 
-    for f in "${KERNEL_DEBS[@]:-}"; do
-      cp -a "$f" "$live/etc/config/packages.chroot/"
-    done
+    stage_live_custom_kernel_packages "$live"       || die "Unable to stage boot-critical custom kernel packages for live ISO."
+    remove_standard_kernel_metapackages_from_live "$live"
+    write_live_custom_kernel_dependency_list "$live"
 
     for f in "${DTB_FILES[@]:-}"; do
       cp -a "$f" "$live/etc/config/includes.chroot/boot/dtbs/"
