@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.1
+# Version 7.0.2
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,24 +11,23 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.1 corrections after the first v7.0.0 field test:
-#   - Restores the interactive configuration, repository-validation, firmware,
-#     dependency-safety, and confirmation menus from the mature builder line.
-#   - Does not require or install initramfs-tools on the host. The v7.0.0 host
-#     dependency check could remove dracut; initramfs generation belongs inside
-#     the ARM64 live squashfs, not on the build host.
-#   - Resolves the custom kernel release primarily from Debian package metadata,
-#     with complete archive-list fallbacks written to files. It never uses an
-#     early-exiting grep pipeline that can SIGPIPE dpkg-deb.
-#   - Supports the current input layout where target /root content is located at
-#     WORKDIR/artifacts/root, outside the hardware profile directory.
-#   - Preserves official custom-image cleanup, FsGuard, and ABRoot image-name
-#     configuration ordering.
+# v7.0.2 corrections after the v7.0.1 source-handling field test:
+#   - Repository policy selection is no longer deferred until after final build
+#     confirmation. In execute mode, the official repositories are checked,
+#     cloned/refreshed, validated, and retained in sources/ immediately after
+#     the host dependency preflight.
+#   - Empty sources/ is an explicit supported and tested condition.
+#   - Aborting after source validation preserves the synchronized repositories.
+#   - Plan mode remains non-mutating and clearly reports that it does not clone
+#     or refresh repositories.
+#   - Preserves the v7.0.1 interactive artifact, firmware, target-image, Git
+#     validation, package-removal safety, kernel metadata, Vib custom-image,
+#     and live graphical package-closure logic.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.1"
+SCRIPT_VERSION="7.0.2"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -120,6 +119,7 @@ UPSTREAM_MANIFEST=""
 UPSTREAM_REMOVE_MANIFEST=""
 LIVE_SOURCE_COMMIT=""
 CUSTOM_SOURCE_COMMIT=""
+SOURCES_SYNCHRONIZED=0
 
 # ----------------------------- presentation -----------------------------
 
@@ -239,14 +239,14 @@ prompt_path() {
 confirm_or_abort() {
   (( ASSUME_YES == 1 )) && return 0
   local choice
-  choice="$(menu "Build Confirmation\n\nReview the resolved plan above before allowing host package changes, Git operations, container builds, or ISO remastering." "1" \
+  choice="$(menu "Build Confirmation\n\nOfficial Git sources have already been synchronized and validated. Review the resolved plan before allowing firmware staging, container builds, and ISO remastering." "1" \
     "1|Proceed with the complete build|Execute the validated plan." \
     "2|Open a shell in the work directory|Inspect or change files, then return to this confirmation." \
-    "3|Abort without building|Leave source and artifact files untouched.")"
+    "3|Abort before build execution|Preserve validated source checkouts and leave artifacts untouched.")"
   case "$choice" in
     1) return 0 ;;
     2) open_shell "$WORKDIR"; confirm_or_abort ;;
-    3) die "Build aborted by operator." ;;
+    3) die "Build aborted by operator after source validation; synchronized repositories were preserved." ;;
   esac
 }
 
@@ -390,7 +390,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.1-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.2-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -434,7 +434,7 @@ choose_repo_policy() {
   normalize_repo_policy
   [[ "$REPO_POLICY" != "ask-once" ]] && { info "Repository policy supplied: $REPO_POLICY"; return; }
   local choice
-  choice="$(menu "Repository Source Validation Policy\n\nThe builder validates origin URL, requested ref, current commit, and dirty state for official source checkouts. Missing repositories are cloned." "1" \
+  choice="$(menu "Repository Source Validation and Synchronization\n\nIn execute mode, this selection is applied immediately after the host dependency preflight. The builder validates origin URL, requested ref, current commit, and dirty state. Missing repositories are cloned before the remaining build questions continue." "1" \
     "1|Refresh and validate official sources [RECOMMENDED]|Fetch/prune, use the requested ref, and require a clean checkout." \
     "2|Use existing validated sources without network refresh|Missing repositories are still cloned; existing refs must resolve locally." \
     "3|Prompt separately for each repository|Choose continue, refresh, reclone, shell, or abort for each checkout." \
@@ -659,7 +659,7 @@ choose_target_image() {
   [[ "$ABROOT_IMAGE_NAME" == */* ]] || warn "ABROOT_IMAGE_NAME normally has owner/image form: $ABROOT_IMAGE_NAME"
 }
 
-configure_interactively() {
+print_builder_banner() {
   cat >&2 <<EOF
 
 ${C_BOLD}Conception VanillaOS ARM64 Container-Model Builder${C_RESET}
@@ -670,11 +670,18 @@ Profile:          $PROFILE
 Artifact default: $ARTIFACT_DIR
 Sources:          $SOURCES_DIR
 
-v7.0.1 asks before source refresh, host package installation, firmware handling,
-and build execution. --execute does not suppress these questions.
+v7.0.2 applies the selected Git source action before the remaining artifact,
+firmware, target-image, and build-confirmation questions. --execute does not
+suppress interactive questions.
 EOF
+}
 
+configure_repository_interactively() {
+  print_builder_banner
   choose_repo_policy
+}
+
+configure_build_inputs_interactively() {
   choose_artifact_directory
   choose_root_overlay
   choose_firmware_source
@@ -1005,6 +1012,37 @@ checkout_requested_ref() {
   fi
 }
 
+check_git_remote_access() {
+  local name="$1" url="$2"
+  info "Checking remote access for $name: $url"
+  git ls-remote "$url" HEAD >/dev/null 2>&1 ||     die "Unable to access configured Git remote for $name: $url"
+  ok "$name remote is reachable."
+}
+
+verify_required_source_checkouts() {
+  [[ -d "$CUSTOM_IMAGE_SOURCE/.git" ]] ||     die "Required custom-image checkout is absent after synchronization: $CUSTOM_IMAGE_SOURCE"
+  [[ -d "$LIVE_ISO_SOURCE/.git" ]] ||     die "Required live-iso checkout is absent after synchronization: $LIVE_ISO_SOURCE"
+  [[ -n "$CUSTOM_SOURCE_COMMIT" ]] || die "custom-image source commit was not recorded."
+  [[ -n "$LIVE_SOURCE_COMMIT" ]] || die "live-iso source commit was not recorded."
+  [[ -z "$(git -C "$CUSTOM_IMAGE_SOURCE" status --porcelain)" ]] ||     die "custom-image checkout is dirty after synchronization."
+  [[ -z "$(git -C "$LIVE_ISO_SOURCE" status --porcelain)" ]] ||     die "live-iso checkout is dirty after synchronization."
+
+  SOURCES_SYNCHRONIZED=1
+  ok "Required source checkouts are present and clean."
+  info "custom-image: $CUSTOM_IMAGE_SOURCE @ $CUSTOM_SOURCE_COMMIT"
+  info "live-iso:     $LIVE_ISO_SOURCE @ $LIVE_SOURCE_COMMIT"
+}
+
+report_repository_plan_state() {
+  info "Plan mode is non-mutating: repositories will not be cloned, fetched, reset, or refreshed."
+  info "Selected execute-time repository policy: $REPO_POLICY"
+  info "custom-image current state: $(repo_state "$CUSTOM_IMAGE_SOURCE")"
+  info "live-iso current state:     $(repo_state "$LIVE_ISO_SOURCE")"
+  if [[ ! -d "$CUSTOM_IMAGE_SOURCE/.git" || ! -d "$LIVE_ISO_SOURCE/.git" ]]; then
+    warn "One or both required source checkouts are absent. Execute mode will create them using policy '$REPO_POLICY'."
+  fi
+}
+
 sync_repo() {
   local name="$1" url="$2" ref="$3" path="$4"
   mkdir -p "$(dirname "$path")"
@@ -1024,7 +1062,8 @@ sync_repo() {
   fi
 
   if [[ ! -d "$path/.git" ]]; then
-    info "Cloning $name from $url"
+    check_git_remote_access "$name" "$url"
+    info "Cloning $name from $url into $path"
     git clone "$url" "$path"
     git -C "$path" config --local advice.detachedHead false
     checkout_requested_ref "$path" "$ref" 1
@@ -1065,6 +1104,7 @@ sync_repo() {
         checkout_requested_ref "$path" "$ref" 0
         ;;
       refresh)
+        check_git_remote_access "$name" "$url"
         [[ -z "$(git -C "$path" status --porcelain)" ]] || {
           if ! is_interactive; then die "$name checkout is dirty: $path"; fi
           choice="$(menu "Dirty Git Checkout\n\n$name contains local changes:\n  $path" "2" \
@@ -1096,10 +1136,12 @@ sync_repo() {
 }
 
 sync_required_repositories() {
+  info "Beginning required official source synchronization."
   sync_repo "VanillaOS custom-image" "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" "$CUSTOM_IMAGE_SOURCE"
   sync_repo "VanillaOS live-iso" "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" "$LIVE_ISO_SOURCE"
   CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"
   LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"
+  verify_required_source_checkouts
 }
 
 # ------------------------- firmware staging ------------------------------
@@ -1333,8 +1375,11 @@ Firmware mode:              $FIRMWARE_MODE
 Firmware source:            ${FIRMWARE_SOURCE:-to be staged during execution}
 Target /root source:        ${ROOT_SOURCE:-none}
 Repository policy:          $REPO_POLICY
+Sources synchronized:       $SOURCES_SYNCHRONIZED
 custom-image source:        $CUSTOM_IMAGE_REPO_URL @ $CUSTOM_IMAGE_REF
+custom-image checkout:      $(repo_state "$CUSTOM_IMAGE_SOURCE")
 live-iso source:            $LIVE_ISO_REPO_URL @ $LIVE_ISO_REF
+live-iso checkout:          $(repo_state "$LIVE_ISO_SOURCE")
 Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
@@ -2019,29 +2064,36 @@ main() {
   setup_directories
   setup_logging
 
-  stage "1/12 Interactive configuration and safety choices"
-  configure_interactively
+  stage "1/12 Selecting the official Git source policy"
+  configure_repository_interactively
 
   stage "2/12 Checking host dependencies without changing initramfs implementation"
   install_host_dependencies_safely
   check_free_space
 
-  stage "3/12 Validating Debian package metadata, kernel release, DTB, and input layout"
+  stage "3/12 Applying and verifying the official Git source action"
+  if (( PLAN_ONLY == 1 )); then
+    report_repository_plan_state
+  else
+    sync_required_repositories
+  fi
+
+  stage "4/12 Resolving interactive build inputs and validating hardware artifacts"
+  configure_build_inputs_interactively
   discover_kernel_and_dtb_inputs
   print_plan
   if (( PLAN_ONLY == 1 )); then
-    ok "Plan mode complete. No Git checkout, container build, or ISO build was performed."
+    ok "Plan mode complete. No repository checkout, firmware staging, container build, or ISO build was performed."
     exit 0
   fi
+
+  (( SOURCES_SYNCHRONIZED == 1 )) ||     die "Internal guard: execute mode reached confirmation without synchronized official sources."
   confirm_or_abort
 
   RELEASE_ID="$(reserve_release_id)"
   RELEASE_DIR="$RELEASES_DIR/${BUILD_DATE}-${RELEASE_ID}-${PROFILE}"
   FINAL_ISO="$RELEASE_DIR/Conception-VanillaOS-Orchid-arm64-${BUILD_DATE}-${RELEASE_ID}-${PROFILE}.iso"
   mkdir -p "$RELEASE_DIR"
-
-  stage "4/12 Validating and synchronizing official Git sources"
-  sync_required_repositories
 
   stage "5/12 Staging Qualcomm firmware without modifying the build host"
   stage_firmware
