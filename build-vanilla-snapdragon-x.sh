@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.7
+# Version 7.0.8
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -11,27 +11,28 @@
 #   - Only boot-critical hardware content is remastered into the completed ISO:
 #     kernel, modules, initramfs, DTB, firmware, and GRUB references.
 #
-# v7.0.7 corrections after the v7.0.6 target-OCI package field test:
-#   - Restores the package-classification rule already proven in the v6 builder:
-#     only boot-critical image/module packages are installed into the immutable
-#     target OCI by default.
-#   - Headers, build metadata, development packages, and optional kernel tool
-#     packages are excluded from the target APT transaction. In particular,
-#     linux-qcom-*-tools-* is not installed because it can require
-#     linux-tools-common, which is unavailable in the VanillaOS snapshot.
-#   - Every supplied kernel-related .deb remains preserved inside the target
-#     image under /root/custom-kernel-packages with a selection manifest.
-#   - Target OCI verification checks every selected package with dpkg-query and
-#     verifies that the complete supplied package archive is present.
-#   - Plan and diagnostic output now distinguish supplied, target-installed,
-#     target-archived, target-excluded, and live-boot package counts.
-#   - Preserves all v7.0.6 Git, source-layout, Vib/FsGuard, firmware, DTB,
-#     /root-overlay, OCI, and live graphical package-closure safeguards.
+# v7.0.8 corrections after the v7.0.7 package-selection field test:
+#   - Fixes the payload fallback that incorrectly classified a linux-headers
+#     package as boot-critical merely because it contained the conventional
+#     /lib/modules/<release>/build symlink.
+#   - Header, tools, development, and metadata package classes are now rejected
+#     before any payload-based fallback is considered.
+#   - An unrecognized package is selected only when its complete dpkg archive
+#     listing contains a regular /boot/vmlinuz-<release> file or an actual
+#     regular kernel module object (*.ko, *.ko.gz, *.ko.xz, or *.ko.zst).
+#   - Adds a second fail-closed selection guard immediately before staging the
+#     target OCI package transaction.
+#   - Module verification no longer accepts directories or build/source
+#     symlinks as evidence of runtime kernel modules.
+#   - Adds an exact regression test for a headers package containing
+#     /lib/modules/<release>/build -> /usr/src/linux-headers-<release>.
+#   - Preserves all v7.0.7 source, Vib/FsGuard, firmware, DTB, package archive,
+#     target OCI, and live graphical package-closure safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.7"
+SCRIPT_VERSION="7.0.8"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- defaults ---------------------------------
@@ -417,7 +418,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.7-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v7.0.8-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -846,6 +847,41 @@ write_deb_content_listing() {
   dpkg-deb -c "$deb" > "$output"
 }
 
+deb_listing_has_regular_boot_kernel() {
+  # A boot kernel must be a regular archive member. Directories and symlinks do
+  # not qualify. dpkg-deb -c emits the Unix mode/type in field 1.
+  local listing="$1" release="$2"
+  awk -v release="$release" '
+    $1 ~ /^-/ {
+      path=$NF
+      sub(/^\.\//, "", path)
+      if (path == "boot/vmlinuz-" release) found=1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$listing"
+}
+
+deb_listing_has_runtime_module_object() {
+  # A headers package commonly contains:
+  #   /lib/modules/<release>/build -> /usr/src/linux-headers-<release>
+  # That symlink is not a runtime module payload. Require at least one regular
+  # kernel object, including the compressed forms used by Debian-family images.
+  local listing="$1" release="$2"
+  awk -v release="$release" '
+    $1 ~ /^-/ {
+      path=$NF
+      sub(/^\.\//, "", path)
+      prefix1="lib/modules/" release "/"
+      prefix2="usr/lib/modules/" release "/"
+      if ((index(path, prefix1) == 1 || index(path, prefix2) == 1) &&
+          path ~ /\.ko(\.(gz|xz|zst))?$/) {
+        found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$listing"
+}
+
 select_kernel_release_from_candidates() {
   local -a releases=("$@")
   mapfile -t releases < <(printf '%s\n' "${releases[@]}" | sed '/^$/d' | sort -u)
@@ -1001,35 +1037,81 @@ discover_kernel_and_dtb_inputs() {
         ;;
     esac
 
-    # Payload fallback for unusual local packages. grep reads the complete
-    # listing file, so dpkg-deb cannot be terminated by a closed pipe.
+    # Payload fallback for unusually named image packages. Only regular
+    # /boot/vmlinuz-* archive members qualify; symlinks and directories do not.
     while IFS= read -r rel; do
       [[ -n "$rel" ]] && release_candidates+=("$rel")
-    done < <(awk '{print $NF}' "$listing" | sed -n 's#^\./boot/vmlinuz-##p')
+    done < <(
+      awk '
+        $1 ~ /^-/ {
+          path=$NF
+          sub(/^\.\//, "", path)
+          if (path ~ /^boot\/vmlinuz-/) {
+            sub(/^boot\/vmlinuz-/, "", path)
+            print path
+          }
+        }
+      ' "$listing"
+    )
   done
 
   KERNEL_RELEASE="$(select_kernel_release_from_candidates "${release_candidates[@]}")"
 
+  local class selected_reason
   for deb in "${KERNEL_DEBS[@]}"; do
     pkg="$(package_field "$deb" Package)"
+    class="$(classify_kernel_deb_for_target "$deb")"
     listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
+    selected_reason=""
+
     case "$pkg" in
       linux-image-$KERNEL_RELEASE|linux-image-unsigned-$KERNEL_RELEASE|linux-image-$KERNEL_RELEASE-*|linux-image-unsigned-$KERNEL_RELEASE-*)
         LIVE_KERNEL_DEBS+=("$deb")
+        selected_reason="package name identifies selected kernel image"
         ;;
       linux-modules-$KERNEL_RELEASE|linux-modules-$KERNEL_RELEASE-*|linux-modules-extra-$KERNEL_RELEASE|linux-modules-extra-$KERNEL_RELEASE-*)
         LIVE_KERNEL_DEBS+=("$deb")
         module_pkg_count=$((module_pkg_count+1))
+        selected_reason="package name identifies selected runtime modules"
         ;;
       *)
-        if grep -Eq "\./(usr/)?lib/modules/${KERNEL_RELEASE}/" "$listing"; then
+        # Never allow known non-runtime classes to reach the payload fallback.
+        # In particular, linux-headers packages can contain the conventional
+        # /lib/modules/<release>/build symlink and must remain excluded.
+        case "$class" in
+          headers|tools|development|metadata)
+            continue
+            ;;
+        esac
+
+        if deb_listing_has_regular_boot_kernel "$listing" "$KERNEL_RELEASE"; then
+          LIVE_KERNEL_DEBS+=("$deb")
+          selected_reason="regular kernel image payload fallback"
+        elif deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
           LIVE_KERNEL_DEBS+=("$deb")
           module_pkg_count=$((module_pkg_count+1))
+          selected_reason="regular runtime module object payload fallback"
         fi
         ;;
     esac
+
+    if [[ -n "$selected_reason" ]]; then
+      info "Boot package selection: $pkg — $selected_reason"
+    fi
   done
   mapfile -t LIVE_KERNEL_DEBS < <(printf '%s\n' "${LIVE_KERNEL_DEBS[@]}" | sort -u)
+
+  # Fail closed if a known non-runtime class entered selection through any
+  # future rule change.
+  for deb in "${LIVE_KERNEL_DEBS[@]}"; do
+    class="$(classify_kernel_deb_for_target "$deb")"
+    pkg="$(package_field "$deb" Package)"
+    case "$class" in
+      headers|tools|development|metadata)
+        die "Internal package-selection guard rejected non-runtime package: $pkg ($class)"
+        ;;
+    esac
+  done
 
   # Install the same boot-critical image/module closure into the target OCI.
   # Optional headers, tools, development packages, and metadata remain archived
@@ -1054,9 +1136,11 @@ discover_kernel_and_dtb_inputs() {
     local has_modules=0
     for deb in "${LIVE_KERNEL_DEBS[@]}"; do
       listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
-      grep -Eq "\./(usr/)?lib/modules/${KERNEL_RELEASE}/" "$listing" && has_modules=1
+      if deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
+        has_modules=1
+      fi
     done
-    (( has_modules == 1 )) || die "No selected package contains or declares modules for $KERNEL_RELEASE."
+    (( has_modules == 1 )) ||       die "No selected package contains a regular runtime module object for $KERNEL_RELEASE."
   }
 
   mapfile -t DTB_CANDIDATES < <(
@@ -1632,7 +1716,9 @@ Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 Safety invariants:
   - No host initramfs implementation is installed or replaced.
   - dpkg-deb archive listings complete before any grep validation.
-  - Only boot-critical image/module .debs enter target or live APT transactions.
+  - Only named boot packages or packages with regular kernel/module objects
+    enter target or live package transactions.
+  - /lib/modules/<release>/build and source symlinks never qualify as modules.
   - Optional tools, headers, development, and metadata .debs are reference-only.
   - Official live package lists are never edited.
   - The pristine upstream graphical manifest is accepted before remastering.
@@ -2112,9 +2198,41 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/usr/local/sbin" \
     "$CUSTOM_PROJECT/modules"
 
-  local deb
+  local deb class pkg listing
   for deb in "${TARGET_KERNEL_DEBS[@]}"; do
+    class="$(classify_kernel_deb_for_target "$deb")"
+    pkg="$(package_field "$deb" Package)"
+    listing="$TMP_ROOT/deb-listings/$(basename "$deb").contents.txt"
+
+    case "$class" in
+      headers|tools|development|metadata)
+        die "Refusing to stage non-runtime target package: $pkg ($class)"
+        ;;
+    esac
+
+    case "$class" in
+      boot)
+        ;;
+      other)
+        if ! deb_listing_has_regular_boot_kernel "$listing" "$KERNEL_RELEASE" &&
+           ! deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
+          die "Unrecognized selected package lacks a regular boot payload: $pkg"
+        fi
+        ;;
+    esac
+
     cp -a "$deb" "$CUSTOM_PROJECT/includes.container/deb-pkgs/"
+  done
+
+  # Assert the staged transaction itself contains no known non-runtime package.
+  for deb in "$CUSTOM_PROJECT/includes.container/deb-pkgs/"*.deb; do
+    class="$(classify_kernel_deb_for_target "$deb")"
+    pkg="$(package_field "$deb" Package)"
+    case "$class" in
+      headers|tools|development|metadata)
+        die "Staged target transaction contains forbidden package: $pkg ($class)"
+        ;;
+    esac
   done
 
   if [[ -n "$FIRMWARE_SOURCE" ]]; then
@@ -2675,6 +2793,8 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/kernel-package-selection.tsv" "$RELEASE_DIR/"
+  mkdir -p "$RELEASE_DIR/deb-listings"
+  cp -a "$TMP_ROOT/deb-listings/." "$RELEASE_DIR/deb-listings/"
   [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-checksums.sha256" ]] && cp -a "$TMP_ROOT/vib-plugin-checksums.sha256" "$RELEASE_DIR/"
   [[ -n "$FSGUARD_PLUGIN_RELEASE_METADATA" && -f "$FSGUARD_PLUGIN_RELEASE_METADATA" ]] && \
