@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.3.2.sh
+# build-vanilla-arm64-release-v2.4.0.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.3.2
+# Version: 2.4.0
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,7 +29,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.3.2"
+SCRIPT_VERSION="2.4.0"
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------- UI helpers -----------------------------
@@ -605,6 +605,32 @@ Choose how the target firmware should be staged for the image build." "1" \
   fi
 }
 
+qcom_container_network_menu() {
+  # Return a podman network argument string on stdout.
+  # We default to host networking on Debian/Podman VMs because rootful Podman
+  # containers can sometimes pull images successfully but fail DNS resolution
+  # inside the running container when using the default bridge/slirp network.
+  local choice
+  choice="$(menu "Qualcomm Extraction Container Network
+
+The firmware extractor runs inside a disposable Debian container.
+It must have DNS/network access only to install temporary extraction tools
+inside that container. Nothing is installed onto the build host.
+
+If earlier attempts showed 'Temporary failure resolving deb.debian.org',
+choose host networking." "1" \
+    "1|Use host networking for the disposable extraction container|Recommended when Podman containers cannot resolve deb.debian.org." \
+    "2|Use Podman's default container networking|Use this if default container DNS is known to work." \
+    "3|Open an interactive shell before continuing|Inspect Podman/DNS configuration manually, then resume." \
+    "4|Skip Qualcomm firmware extraction|Continue the build without staged Qualcomm firmware.")"
+  case "$choice" in
+    1) printf '%s' '--network=host' ;;
+    2) printf '%s' '' ;;
+    3) open_shell "$WORKDIR"; qcom_container_network_menu ;;
+    4) printf '%s' 'SKIP' ;;
+  esac
+}
+
 stage_qcom_firmware() {
   rm -rf "$STAGED_QCOM_DIR"
   mkdir -p "$STAGED_QCOM_DIR"
@@ -632,50 +658,146 @@ stage_qcom_firmware() {
       mkdir -p "$work/out" "$work/input"
 
       if [[ "$QCOM_MODE" == "archive" ]]; then
-        cp -a "$QCOM_ARCHIVE" "$work/input/driver$(basename "$QCOM_ARCHIVE" | sed 's/.*\(\.zip\|\.exe\)$/\1/I')"
+        # Preserve the original archive extension. The updater may branch on it.
+        cp -a "$QCOM_ARCHIVE" "$work/input/$(basename "$QCOM_ARCHIVE")"
       fi
 
-      # This container deliberately acts as the disposable "host".
-      # If the updater writes to /lib/firmware, it writes inside the container.
-      # We then copy the resulting firmware tree out of the mounted /out path
-      # where possible. This may need future updater-specific refinement.
       local run_script="$work/run-qcom-extract.sh"
       cat >"$run_script" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-apt update
-apt install -y curl ca-certificates unzip p7zip-full zstd rsync bash coreutils findutils
+
+log() { printf 'qcom-container: %s\n' "$*"; }
+
+log "Disposable extraction environment started."
+log "This container may write to its own /lib/firmware, not to the build host."
+
+# Fail early with a clear diagnostic instead of allowing apt-get to continue
+# with stale/empty indexes and then produce misleading package errors.
+if ! getent hosts deb.debian.org >/dev/null 2>&1; then
+  log "DNS preflight failed: deb.debian.org does not resolve inside this container."
+  log "Retry with host networking, or use a pre-staged firmware directory."
+  exit 70
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl unzip p7zip-full zstd rsync bash coreutils findutils file
+
 mkdir -p /out/lib/firmware /work
 cp -a /updater /work/qcom-firmware-updater
 cd /work/qcom-firmware-updater
 
-echo "Running qcom-firmware-updater in disposable container."
-echo "No firmware will be installed on the build host."
+log "Running qcom-firmware-updater in disposable container."
+log "Device path: ${QCOM_DEVICE_PATH:-unset}"
 
 if [[ -n "${QCOM_URL:-}" ]]; then
   bash ./qcom-firmware-updater.sh --url "$QCOM_URL" "$QCOM_DEVICE_PATH" || true
 elif compgen -G "/input/*" >/dev/null; then
-  # Updater CLI may change. Try the local archive path first, then open a shell-like diagnostic if it fails.
-  local_file="$(find /input -maxdepth 1 -type f | head -n1)"
+  local_file="$(find /input -maxdepth 1 -type f | sort | head -n1)"
+  log "Using local driver archive: $local_file"
   bash ./qcom-firmware-updater.sh "$local_file" "$QCOM_DEVICE_PATH" || true
+else
+  log "No local archive or URL was supplied to the container."
 fi
 
-# Capture any firmware that was installed inside the disposable container.
+# Capture any firmware installed inside the disposable container.
 if [[ -d /lib/firmware ]]; then
   rsync -a /lib/firmware/ /out/lib/firmware/
+fi
+
+# Some updater versions may leave extracted material in the working tree.
+# Preserve that too for inspection, without assuming it is already suitable
+# for direct injection.
+mkdir -p /out/updater-workdir
+rsync -a /work/qcom-firmware-updater/ /out/updater-workdir/ || true
+
+if find /out/lib/firmware -type f | grep -q .; then
+  log "Captured firmware files under /out/lib/firmware."
+else
+  log "No firmware files captured under /out/lib/firmware."
 fi
 EOS
       chmod +x "$run_script"
 
-      podman run --rm --privileged \
-        -e QCOM_URL="${QCOM_URL:-}" \
-        -e QCOM_DEVICE_PATH="$QCOM_DEVICE_PATH" \
-        -v "$updater_dir:/updater:ro" \
-        -v "$work/input:/input:ro" \
-        -v "$work/out:/out" \
-        -v "$run_script:/run-qcom-extract.sh:ro" \
-        debian:13 \
-        /bin/bash /run-qcom-extract.sh || warn "Containerized qcom extraction returned non-zero."
+      local net_arg container_rc choice
+      net_arg="$(qcom_container_network_menu)"
+      if [[ "$net_arg" == "SKIP" ]]; then
+        warn "Qualcomm firmware staging skipped by operator."
+        return 0
+      fi
+
+      # Run the disposable container. Do not use host mounts for /lib/firmware.
+      # The only writable output is $work/out, which is later copied into the
+      # target-image staging directory.
+      set +e
+      if [[ -n "$net_arg" ]]; then
+        podman run --rm --privileged $net_arg \
+          -e QCOM_URL="${QCOM_URL:-}" \
+          -e QCOM_DEVICE_PATH="$QCOM_DEVICE_PATH" \
+          -v "$updater_dir:/updater:ro" \
+          -v "$work/input:/input:ro" \
+          -v "$work/out:/out" \
+          -v "$run_script:/run-qcom-extract.sh:ro" \
+          debian:13 \
+          /bin/bash /run-qcom-extract.sh
+      else
+        podman run --rm --privileged \
+          -e QCOM_URL="${QCOM_URL:-}" \
+          -e QCOM_DEVICE_PATH="$QCOM_DEVICE_PATH" \
+          -v "$updater_dir:/updater:ro" \
+          -v "$work/input:/input:ro" \
+          -v "$work/out:/out" \
+          -v "$run_script:/run-qcom-extract.sh:ro" \
+          debian:13 \
+          /bin/bash /run-qcom-extract.sh
+      fi
+      container_rc=$?
+      set -e
+
+      if [[ "$container_rc" -eq 70 ]]; then
+        warn "Container DNS preflight failed."
+        choice="$(menu "Qualcomm Container DNS Failure
+
+The Debian extraction container could not resolve deb.debian.org.
+The build host was not modified.
+
+Most likely causes:
+  • Podman container DNS/network configuration problem
+  • VM DNS problem
+  • Temporary upstream DNS/network outage
+
+Recommended next attempt: host networking." "1" \
+          "1|Retry extraction with host networking|Run the same disposable container with --network=host." \
+          "2|Open shell to inspect extraction workspace|Review scripts, input archive, and Podman/DNS state." \
+          "3|Use pre-staged firmware instead|Return to configuration and select an already extracted firmware tree." \
+          "4|Continue without staged Qualcomm firmware|Build may boot but target may lack required firmware." \
+          "5|Abort build|Stop immediately.")"
+        case "$choice" in
+          1)
+            net_arg='--network=host'
+            set +e
+            podman run --rm --privileged $net_arg \
+              -e QCOM_URL="${QCOM_URL:-}" \
+              -e QCOM_DEVICE_PATH="$QCOM_DEVICE_PATH" \
+              -v "$updater_dir:/updater:ro" \
+              -v "$work/input:/input:ro" \
+              -v "$work/out:/out" \
+              -v "$run_script:/run-qcom-extract.sh:ro" \
+              debian:13 \
+              /bin/bash /run-qcom-extract.sh
+            container_rc=$?
+            set -e
+            ;;
+          2) open_shell "$work" ;;
+          3) QCOM_MODE="prestaged"; QCOM_PRESTAGED="$(prompt_path "Pre-staged Qualcomm firmware directory" "$PRESTAGED_QCOM_DIR")"; [[ -d "$QCOM_PRESTAGED" ]] || die "Pre-staged firmware directory does not exist: $QCOM_PRESTAGED"; rsync -a "$QCOM_PRESTAGED"/ "$STAGED_QCOM_DIR"/; return 0 ;;
+          4) warn "Continuing without staged Qualcomm firmware."; return 0 ;;
+          5) die "Qualcomm firmware extraction aborted." ;;
+        esac
+      elif [[ "$container_rc" -ne 0 ]]; then
+        warn "Containerized qcom extraction returned non-zero exit code: $container_rc"
+      fi
 
       if [[ -d "$work/out/lib/firmware" ]]; then
         rsync -a "$work/out/lib/firmware"/ "$STAGED_QCOM_DIR"/
@@ -683,16 +805,25 @@ EOS
 
       if ! find "$STAGED_QCOM_DIR" -type f | grep -q .; then
         warn "No Qualcomm firmware files were captured."
-        warn "Open the temporary directory to inspect updater behavior if needed: $work"
+        warn "Extraction workspace preserved for inspection: $work"
         local c
-        c="$(menu "Qualcomm Firmware Capture Empty" "1" \
+        c="$(menu "Qualcomm Firmware Capture Empty
+
+The extractor completed or partially completed, but no files were captured
+under the staged target firmware directory:
+  $STAGED_QCOM_DIR
+
+This can happen if the updater's CLI changed, the supplied archive is not
+the expected Qualcomm package, or additional manual interaction is required." "1" \
           "1|Continue without staged Qualcomm firmware|Build will proceed, but target may lack required firmware." \
-          "2|Open shell to inspect extraction workspace|Inspect files, copy staged firmware manually, then resume." \
-          "3|Abort build|Stop immediately.")"
+          "2|Open shell to inspect extraction workspace|Inspect files, copy staged firmware manually into $STAGED_QCOM_DIR, then resume." \
+          "3|Use pre-staged firmware directory instead|Select an already extracted firmware tree and copy it into staging." \
+          "4|Abort build|Stop immediately.")"
         case "$c" in
           1) ;;
-          2) open_shell "$work"; rsync -a "$work/out/lib/firmware"/ "$STAGED_QCOM_DIR"/ 2>/dev/null || true ;;
-          3) die "Qualcomm firmware staging failed." ;;
+          2) open_shell "$work" ;;
+          3) QCOM_PRESTAGED="$(prompt_path "Pre-staged Qualcomm firmware directory" "$PRESTAGED_QCOM_DIR")"; [[ -d "$QCOM_PRESTAGED" ]] || die "Pre-staged firmware directory does not exist: $QCOM_PRESTAGED"; rsync -a "$QCOM_PRESTAGED"/ "$STAGED_QCOM_DIR"/ ;;
+          4) die "Qualcomm firmware staging failed." ;;
         esac
       fi
       ;;
