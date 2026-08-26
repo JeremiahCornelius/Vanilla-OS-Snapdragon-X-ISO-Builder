@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-vanilla-arm64-release-v2.6.3.sh
+# build-vanilla-arm64-release-v2.6.4.sh
 #
 # Constructive Vanilla ARM64 Release Builder
-# Version: 2.6.3
+# Version: 2.6.4
 #
 # Purpose:
 #   Deterministically build a VanillaOS ARM64 UEFI installation ISO from
@@ -29,11 +29,12 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.3"
+SCRIPT_VERSION="2.6.4"
 SCRIPT_NAME="$(basename "$0")"
 LAST_DEEP_DIAGNOSTIC_LOG=""
 VIB_RUN_USER="${VIB_RUN_USER:-vanillabuilder}"
 VIB_ALLOW_ROOT="${VIB_ALLOW_ROOT:-0}"
+DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD="${DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD:-auto}"  # auto|1|0
 VIB_VERSION_POLICY="${VIB_VERSION_POLICY:-warn}"  # warn|strict|ignore
 
 # ----------------------------- UI helpers -----------------------------
@@ -2421,6 +2422,160 @@ run_vib_build_with_diagnostics() {
   done
 }
 
+diagnose_generated_container_context() {
+  # After Vib succeeds, it has generated the Dockerfile/Containerfile context
+  # that podman will build. The observed failure:
+  #   exec container process (missing dynamic library?) `/bin/sh`: No such file or directory
+  # immediately after:
+  #   ADD includes.container /
+  # points at /etc/ld.so.preload or another dynamic-linker-affecting file inside
+  # includes.container. This diagnostic emits the high-risk files before the
+  # container build starts.
+  local repo="$1"
+  local label="$2"
+  local log="$OUTPUT_DIR/logs/${BUILD_DATE}-${label}-container-context-diagnostics-$(date -u +%H%M%S).log"
+
+  mkdir -p "$OUTPUT_DIR/logs"
+
+  {
+    printf '### Container context diagnostics for %s\n' "$label"
+    printf '### UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '### PWD: %s\n\n' "$repo"
+
+    cd "$repo" || exit 0
+
+    printf '## Build file candidates\n'
+    ls -l Containerfile Dockerfile 2>/dev/null || true
+    printf '\n'
+
+    printf '## High-risk includes.container files\n'
+    find includes.container -maxdepth 4 \( \
+      -path '*/ld.so.preload' -o \
+      -path '*/ld-linux*' -o \
+      -path '*/ld.so*' -o \
+      -path '*/libc.so*' -o \
+      -path '*/libpthread.so*' \
+    \) -print -exec ls -l {} \; 2>/dev/null || true
+    printf '\n'
+
+    if [[ -f includes.container/ld.so.preload ]]; then
+      printf '## includes.container/ld.so.preload content\n'
+      sed -n '1,120p' includes.container/ld.so.preload || true
+      printf '\n'
+      printf '## Referenced preload files and whether they exist in build context\n'
+      while IFS= read -r preload; do
+        preload="${preload%%#*}"
+        preload="$(printf '%s' "$preload" | xargs 2>/dev/null || true)"
+        [[ -z "$preload" ]] && continue
+        printf 'preload entry: %s\n' "$preload"
+        if [[ -e "includes.container/$preload" ]]; then
+          printf '  exists in includes.container: includes.container/%s\n' "$preload"
+        else
+          printf '  missing from includes.container: includes.container/%s\n' "$preload"
+        fi
+      done < includes.container/ld.so.preload
+    fi
+  } >"$log" 2>&1
+
+  printf 'Container context diagnostic log:\n  %s\n' "$log" >&2
+}
+
+maybe_disable_ld_so_preload_for_container_build() {
+  # Workaround for the observed generated container failure.
+  #
+  # Rationale:
+  #   The upstream core image ships includes.container/ld.so.preload. Vib's
+  #   generated Dockerfile applies includes.container early:
+  #      ADD includes.container /
+  #   If /etc/ld.so.preload references a library that is not yet present or is
+  #   wrong for the build stage, subsequent RUN commands can fail before /bin/sh
+  #   starts, producing the misleading runtime message:
+  #      exec container process (missing dynamic library?) `/bin/sh`: No such file or directory
+  #
+  # Policy:
+  #   auto = disable only when includes.container/ld.so.preload exists and a
+  #          referenced absolute preload path is not present in includes.container.
+  #   1    = always disable for the container build.
+  #   0    = never disable.
+  #
+  # This function renames the file before podman build and leaves a note beside
+  # it. It is intentionally reversible and only affects the build context.
+  local repo="$1"
+  local preload="$repo/includes.container/ld.so.preload"
+  local disabled="$repo/includes.container/ld.so.preload.builder-disabled"
+  local note="$repo/includes.container/ld.so.preload.builder-note.txt"
+  local policy="$DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD"
+  local should_disable=0
+  local entry trimmed
+
+  [[ -f "$preload" ]] || return 0
+
+  case "$policy" in
+    1|yes|true|always)
+      should_disable=1
+      ;;
+    0|no|false|never)
+      should_disable=0
+      ;;
+    auto|"")
+      while IFS= read -r entry; do
+        trimmed="${entry%%#*}"
+        trimmed="$(printf '%s' "$trimmed" | xargs 2>/dev/null || true)"
+        [[ -z "$trimmed" ]] && continue
+        # Only reason about absolute paths. Relative preload entries are rare
+        # and should not be guessed.
+        if [[ "$trimmed" == /* && ! -e "$repo/includes.container/$trimmed" ]]; then
+          should_disable=1
+          break
+        fi
+      done < "$preload"
+      ;;
+    *)
+      warn "Unknown DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD=$policy; using auto."
+      ;;
+  esac
+
+  if [[ "$should_disable" -eq 1 ]]; then
+    warn "Disabling includes.container/ld.so.preload for container build context."
+    warn "Reason: it can break /bin/sh execution immediately after ADD includes.container /."
+    if [[ -f "$disabled" ]]; then
+      rm -f "$preload"
+    else
+      mv "$preload" "$disabled"
+    fi
+    cat > "$note" <<EOF
+This file was generated by $SCRIPT_NAME $SCRIPT_VERSION.
+
+The original includes.container/ld.so.preload was moved to:
+  includes.container/ld.so.preload.builder-disabled
+
+Reason:
+  The generated container build applies includes.container early. If ld.so.preload
+  references a library that is not available at that moment, /bin/sh can fail
+  before the RUN command starts with:
+    exec container process (missing dynamic library?) /bin/sh: No such file or directory
+
+Policy:
+  DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD=$DISABLE_LD_SO_PRELOAD_DURING_CONTAINER_BUILD
+
+Review whether the preload file is required in the final image before release.
+EOF
+  else
+    ok "Leaving includes.container/ld.so.preload enabled for container build."
+  fi
+}
+
+build_container_image_with_context_workarounds() {
+  local label="$1"
+  local repo="$2"
+  local tag="$3"
+
+  diagnose_generated_container_context "$repo" "$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]-')"
+  maybe_disable_ld_so_preload_for_container_build "$repo"
+  run_logged "$label" "$repo" podman image build -t "$tag" .
+}
+
+
 build_images() {
   ensure_vib_run_user
   local core="$SOURCES_DIR/core-image"
@@ -2428,14 +2583,14 @@ build_images() {
 
   if [[ -d "$core" ]]; then
     run_vib_build_with_diagnostics "core image" "$core"
-    run_logged "Build local core container image" "$core" podman image build -t "local/vanilla-core:$PROFILE-$BUILD_DATE" .
+    build_container_image_with_context_workarounds "Build local core container image" "$core" "local/vanilla-core:$PROFILE-$BUILD_DATE"
   else
     warn "core-image source directory is missing; skipping core image build."
   fi
 
   if [[ -d "$desktop" ]]; then
     run_vib_build_with_diagnostics "desktop image" "$desktop"
-    run_logged "Build local desktop container image" "$desktop" podman image build -t "local/vanilla-desktop:$PROFILE-$BUILD_DATE" .
+    build_container_image_with_context_workarounds "Build local desktop container image" "$desktop" "local/vanilla-desktop:$PROFILE-$BUILD_DATE"
   else
     warn "desktop-image source directory is missing; skipping desktop image build."
   fi
