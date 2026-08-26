@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Conception VanillaOS ARM64 Builder
-# Version 7.0.13
+# Version 8.0.0
 #
 # Architecture:
 #   - The installed system is a Vib custom OCI image layered on
@@ -10,38 +10,71 @@
 #   - Upstream package-list source files remain byte-identical. A derived ARM64
 #     projection removes only explicitly approved snapshot-incompatible x86
 #     support packages; GNOME and installer package closure is preserved.
-#   - Only boot-critical hardware content is remastered into the completed ISO:
-#     kernel, modules, initramfs, DTB, firmware, and GRUB references.
+#   - The live filesystem remaster includes boot-critical hardware content plus
+#     the profile-aware offline installer delivery overlay. Upstream package
+#     manifests remain byte-identical to the accepted ARM64 baseline.
 #
-# v7.0.13 corrections after the v7.0.12 GRUB/DTB field test:
-#   - Fixes GRUB command parsing for the official live-iso template, which uses
-#     a tab between the `linux` command and KERNEL_LIVE. The previous parser
-#     accepted only a literal space, so it rewrote the kernel path but never
-#     inserted the selected devicetree directive.
-#   - Replaces the line-prefix heuristic with menuentry-aware parsing that
-#     accepts spaces or tabs after linux/linuxefi and initrd/initrdefi.
-#   - Inserts exactly one selected DTB directive immediately before each live
-#     initrd command, after removing only prior builder-managed DTB directives.
-#   - Validates every patched live menuentry before ISO creation and repeats the
-#     same kernel/initrd/DTB binding validation against the final ISO.
-#   - Records original and patched GRUB files, unified diffs, checksums, and a
-#     per-file entry-count manifest for release diagnostics.
-#   - Preserves all v7.0.12 source, package-candidate, Vib/FsGuard, firmware,
-#     DTB, target OCI, graphical closure, and boot-only remaster safeguards.
+# v8.0.0 installed-image architecture:
+#   - Freezes v7.0.13 as the proven bootable live-environment milestone and
+#     extends it without modifying the frozen milestone artifact.
+#   - Loads hardware-specific kernel, DTB, firmware, overlay, image, installer,
+#     and validation settings from a declarative JSON hardware profile. CLI and
+#     environment values override the profile; ambiguous discovery fails closed.
+#   - Exports the verified custom target image to an OCI image layout and embeds
+#     that layout on the installation ISO beneath /target-images/<profile>/.
+#   - Provides an offline loopback registry bridge over the embedded OCI layout,
+#     allowing the unmodified Albius OCI pull path to consume the ISO-local image
+#     without external network or registry access.
+#   - Installs a profile-specific Vanilla Installer recipe and autostart wrapper.
+#     The embedded hardware image is the default; IGNORE_CPU=1 is applied by the
+#     wrapper and the custom-image screen remains available as an override.
+#   - Patches the live installer processor so installed ABRoot state uses the
+#     explicit conception kernel/DTB/profile markers rather than module-directory
+#     sort order, copies the selected DTB into the A/B init-volume layout, writes
+#     a DTB-aware A-state abroot.cfg, and validates installed boot artifacts.
+#   - Preserves the v7.0.13 graphical closure, source provenance, ARM64 package
+#     candidate preflight, Vib/FsGuard, target receipt, and live GRUB safeguards.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="7.0.13"
+SCRIPT_VERSION="8.0.0"
 SCRIPT_NAME="$(basename "$0")"
+
+# Record whether profile-resolvable values were explicitly supplied through the
+# environment. The profile loader may replace ordinary defaults, but never an
+# explicit environment value. Full CLI parsing occurs after profile loading and
+# therefore has the highest precedence.
+ENV_PROFILE_SET="${PROFILE+x}"
+ENV_ARTIFACT_DIR_SET="${ARTIFACT_DIR+x}"
+ENV_KERNEL_DEB_DIR_SET="${KERNEL_DEB_DIR+x}"
+ENV_ROOT_SOURCE_SET="${ROOT_SOURCE+x}"
+ENV_DTB_FILE_SET="${DTB_FILE_OVERRIDE+x}"
+ENV_DTB_NAME_SET="${DTB_INSTALLED_NAME_OVERRIDE+x}"
+ENV_FIRMWARE_SOURCE_SET="${FIRMWARE_SOURCE_OVERRIDE+x}"
+ENV_KERNEL_RELEASE_SET="${EXPECTED_CUSTOM_KERNEL_RELEASE+x}"
+ENV_CUSTOM_IMAGE_BASE_SET="${CUSTOM_IMAGE_BASE+x}"
+ENV_TARGET_IMAGE_SET="${TARGET_IMAGE_REF+x}"
+ENV_TARGET_REPOSITORY_SET="${TARGET_IMAGE_REPOSITORY+x}"
+ENV_ABROOT_IMAGE_SET="${ABROOT_IMAGE_NAME+x}"
+ENV_DELIVERY_MODE_SET="${DELIVERY_MODE+x}"
+ENV_REGISTRY_IMAGE_SET="${REGISTRY_IMAGE_REF+x}"
+ENV_ISO_LAYOUT_PATH_SET="${ISO_IMAGE_LAYOUT_PATH+x}"
+ENV_MIN_FREE_GIB_SET="${MIN_FREE_GIB+x}"
 
 # ----------------------------- defaults ---------------------------------
 
 WORKDIR="${WORKDIR:-$HOME/src/vanilla-arm64-build-system}"
 PROFILE="${PROFILE:-hp-omnibook-5}"
+PROFILE_FILE="${PROFILE_FILE:-}"
+PROFILE_SCHEMA_VERSION="${PROFILE_SCHEMA_VERSION:-1}"
+PROFILE_DISPLAY_NAME="${PROFILE_DISPLAY_NAME:-}"
+PROFILE_ARCHITECTURE="${PROFILE_ARCHITECTURE:-arm64}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-}"
+KERNEL_DEB_DIR="${KERNEL_DEB_DIR:-}"
 ROOT_SOURCE="${ROOT_SOURCE:-}"
 DTB_FILE_OVERRIDE="${DTB_FILE_OVERRIDE:-}"
+DTB_INSTALLED_NAME_OVERRIDE="${DTB_INSTALLED_NAME_OVERRIDE:-}"
 FIRMWARE_SOURCE_OVERRIDE="${FIRMWARE_SOURCE_OVERRIDE:-}"
 EXPECTED_CUSTOM_KERNEL_RELEASE="${EXPECTED_CUSTOM_KERNEL_RELEASE:-}"
 
@@ -70,9 +103,22 @@ QCOM_DEVICE_PATH="${QCOM_DEVICE_PATH:-$QCOM_DEVICE_PATH_DEFAULT}"
 
 OCI_RUNTIME="${OCI_RUNTIME:-podman}"
 OCI_BUILD_NETWORK="${OCI_BUILD_NETWORK:-host}"
+TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-}"
 TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-}"
 ABROOT_IMAGE_NAME="${ABROOT_IMAGE_NAME:-}"
 PUSH_TARGET_IMAGE="${PUSH_TARGET_IMAGE:-0}"
+
+# Installed-image delivery. iso-oci embeds the verified OCI layout and serves it
+# through a loopback-only registry bridge. registry uses REGISTRY_IMAGE_REF.
+DELIVERY_MODE="${DELIVERY_MODE:-}"
+REGISTRY_IMAGE_REF="${REGISTRY_IMAGE_REF:-}"
+ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-}"
+EMBEDDED_IMAGE_TAG="${EMBEDDED_IMAGE_TAG:-}"
+LOCAL_REGISTRY_HOST="${LOCAL_REGISTRY_HOST:-127.0.0.1}"
+LOCAL_REGISTRY_PORT="${LOCAL_REGISTRY_PORT:-5000}"
+INSTALLER_AUTOSTART="${INSTALLER_AUTOSTART:-1}"
+INSTALLER_IGNORE_CPU="${INSTALLER_IGNORE_CPU:-1}"
+INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="${INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE:-1}"
 
 VIB_VERSION="${VIB_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
@@ -99,6 +145,8 @@ PLAN_ONLY=0
 KEEP_TMP=0
 INTERACTIVE_MODE="auto"
 ASSUME_YES=0
+PROFILE_SELECTOR_EXPLICIT=0
+[[ -n "$ENV_PROFILE_SET" ]] && PROFILE_SELECTOR_EXPLICIT=1
 
 CURRENT_STAGE="initialization"
 CURRENT_LOG=""
@@ -127,6 +175,18 @@ QCOM_UPDATER_DIR=""
 STAGED_FIRMWARE_DIR=""
 FINAL_ISO=""
 BUILD_COUNTER_FILE=""
+PROFILE_FILE_RESOLVED=""
+PROFILE_RESOLVED_JSON=""
+PROFILE_VALIDATION_REPORT=""
+ROOT_OVERLAY_INVENTORY=""
+EMBEDDED_OCI_LAYOUT=""
+EMBEDDED_OCI_INVENTORY=""
+EMBEDDED_OCI_TREE_HASH=""
+TARGET_IMAGE_MANIFEST_DIGEST=""
+LOCAL_INSTALL_IMAGE_REF=""
+INSTALLER_DEFAULT_IMAGE_REF=""
+INSTALLER_PATCH_MANIFEST=""
+INSTALLED_BOOT_EXPECTED_JSON=""
 
 # Discovered inputs.
 declare -a KERNEL_DEBS=()
@@ -134,6 +194,10 @@ declare -a TARGET_KERNEL_DEBS=()
 declare -a TARGET_EXCLUDED_KERNEL_DEBS=()
 declare -a LIVE_KERNEL_DEBS=()
 declare -a DTB_CANDIDATES=()
+declare -a PROFILE_FIRMWARE_PROBES=()
+declare -a PROFILE_INITRAMFS_PROBES=()
+declare -a PROFILE_INSTALLED_PATH_PROBES=()
+declare -a PROFILE_KERNEL_CMDLINE_APPEND=()
 KERNEL_RELEASE=""
 DTB_FILE=""
 DTB_NAME=""
@@ -365,14 +429,23 @@ Options:
   --yes                           Accept final confirmation and safe installs.
   --keep-tmp                      Preserve remaster and diagnostic work trees.
   --workdir PATH                  Build-system root.
-  --profile NAME                  Hardware profile.
-  --artifact-dir PATH             Profile kernel/DTB input directory.
+  --profile NAME                  Hardware profile identifier.
+  --profile-file PATH             Hardware-profile JSON manifest.
+  --artifact-dir PATH             Profile artifact directory.
+  --kernel-deb-dir PATH           Kernel Debian-package directory.
+  --kernel-release RELEASE        Expected exact custom kernel release.
+  --dtb-file PATH                 Exact DTB source file.
+  --dtb-name NAME                 Installed DTB filename.
   --root-source PATH              Directory copied into target OCI /root.
   --firmware-dir PATH             Existing firmware tree; paths relative to
                                   /usr/lib/firmware.
   --repo-policy POLICY            ask-once, prompt, refresh, continue, reclone.
   --target-image REF              Full target OCI build/push reference.
   --abroot-image NAME             ABRoot image name, normally owner/image.
+  --delivery-mode MODE            iso-oci or registry.
+  --registry-image REF            Registry source used in registry mode.
+  --iso-image-path PATH           ISO path for the embedded OCI layout.
+  --local-registry-port PORT      Loopback registry bridge port.
   --live-ref REF                  live-iso branch, tag, or commit.
   --custom-image-ref REF          custom-image branch, tag, or commit.
   --push-target-image             Push target OCI after local verification.
@@ -407,6 +480,15 @@ ARM64 live-ISO package projection:
   Every remaining direct package name is candidate-checked against the selected
   ARM64 snapshot before the expensive live-build starts.
 
+Hardware profile lookup order:
+  --profile-file PATH
+  WORKDIR/profiles/$PROFILE/profile.json
+  WORKDIR/profiles/$PROFILE.json
+  synthesized compatibility profile when neither file exists
+
+Profile precedence:
+  CLI option > environment variable > profile manifest > deterministic discovery
+
 Preferred input layout:
   WORKDIR/artifacts/$PROFILE/
   ├── kernel-debs/
@@ -429,6 +511,38 @@ Compatibility paths:
 EOF
 }
 
+preparse_profile_args() {
+  # Resolve only values required to locate the profile before applying it. The
+  # complete parser runs later and retains authoritative CLI precedence.
+  local -a args=("$@")
+  local i=0
+  while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
+      --workdir)
+        (( i + 1 < ${#args[@]} )) || die "--workdir requires a path"
+        WORKDIR="$(normalize_path_input "${args[$((i+1))]}")"
+        i=$((i+2))
+        ;;
+      --profile)
+        (( i + 1 < ${#args[@]} )) || die "--profile requires a value"
+        PROFILE="${args[$((i+1))]}"
+        PROFILE_SELECTOR_EXPLICIT=1
+        i=$((i+2))
+        ;;
+      --profile-file)
+        (( i + 1 < ${#args[@]} )) || die "--profile-file requires a path"
+        PROFILE_FILE="$(normalize_path_input "${args[$((i+1))]}")"
+        i=$((i+2))
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *) i=$((i+1)) ;;
+    esac
+  done
+}
+
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -438,13 +552,22 @@ parse_args() {
       --yes) ASSUME_YES=1; shift ;;
       --keep-tmp) KEEP_TMP=1; shift ;;
       --workdir) [[ $# -ge 2 ]] || die "--workdir requires a path"; WORKDIR="$(normalize_path_input "$2")"; shift 2 ;;
-      --profile) [[ $# -ge 2 ]] || die "--profile requires a value"; PROFILE="$2"; shift 2 ;;
+      --profile) [[ $# -ge 2 ]] || die "--profile requires a value"; PROFILE="$2"; PROFILE_SELECTOR_EXPLICIT=1; shift 2 ;;
+      --profile-file) [[ $# -ge 2 ]] || die "--profile-file requires a path"; PROFILE_FILE="$(normalize_path_input "$2")"; shift 2 ;;
       --artifact-dir) [[ $# -ge 2 ]] || die "--artifact-dir requires a path"; ARTIFACT_DIR="$(normalize_path_input "$2")"; shift 2 ;;
+      --kernel-deb-dir) [[ $# -ge 2 ]] || die "--kernel-deb-dir requires a path"; KERNEL_DEB_DIR="$(normalize_path_input "$2")"; shift 2 ;;
+      --kernel-release) [[ $# -ge 2 ]] || die "--kernel-release requires a value"; EXPECTED_CUSTOM_KERNEL_RELEASE="$2"; shift 2 ;;
+      --dtb-file) [[ $# -ge 2 ]] || die "--dtb-file requires a path"; DTB_FILE_OVERRIDE="$(normalize_path_input "$2")"; shift 2 ;;
+      --dtb-name) [[ $# -ge 2 ]] || die "--dtb-name requires a value"; DTB_INSTALLED_NAME_OVERRIDE="$2"; shift 2 ;;
       --root-source) [[ $# -ge 2 ]] || die "--root-source requires a path"; ROOT_SOURCE="$(normalize_path_input "$2")"; shift 2 ;;
       --firmware-dir) [[ $# -ge 2 ]] || die "--firmware-dir requires a path"; FIRMWARE_SOURCE_OVERRIDE="$(normalize_path_input "$2")"; FIRMWARE_MODE="prestaged"; shift 2 ;;
       --repo-policy) [[ $# -ge 2 ]] || die "--repo-policy requires a value"; REPO_POLICY="$2"; shift 2 ;;
       --target-image) [[ $# -ge 2 ]] || die "--target-image requires a value"; TARGET_IMAGE_REF="$2"; shift 2 ;;
       --abroot-image) [[ $# -ge 2 ]] || die "--abroot-image requires a value"; ABROOT_IMAGE_NAME="$2"; shift 2 ;;
+      --delivery-mode) [[ $# -ge 2 ]] || die "--delivery-mode requires iso-oci or registry"; DELIVERY_MODE="$2"; shift 2 ;;
+      --registry-image) [[ $# -ge 2 ]] || die "--registry-image requires a value"; REGISTRY_IMAGE_REF="$2"; shift 2 ;;
+      --iso-image-path) [[ $# -ge 2 ]] || die "--iso-image-path requires a value"; ISO_IMAGE_LAYOUT_PATH="$2"; shift 2 ;;
+      --local-registry-port) [[ $# -ge 2 ]] || die "--local-registry-port requires a value"; LOCAL_REGISTRY_PORT="$2"; shift 2 ;;
       --live-ref) [[ $# -ge 2 ]] || die "--live-ref requires a value"; LIVE_ISO_REF="$2"; shift 2 ;;
       --custom-image-ref) [[ $# -ge 2 ]] || die "--custom-image-ref requires a value"; CUSTOM_IMAGE_REF="$2"; shift 2 ;;
       --push-target-image) PUSH_TARGET_IMAGE=1; shift ;;
@@ -456,7 +579,11 @@ parse_args() {
 
 recompute_paths() {
   ARTIFACT_DIR="${ARTIFACT_DIR:-$WORKDIR/artifacts/$PROFILE}"
-  TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-localhost/conception/vanilla-desktop-${PROFILE}:${BUILD_DATE}}"
+  KERNEL_DEB_DIR="${KERNEL_DEB_DIR:-$ARTIFACT_DIR/kernel-debs}"
+  TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-localhost/conception/vanilla-desktop-${PROFILE}}"
+  TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-${TARGET_IMAGE_REPOSITORY}:${BUILD_DATE}}"
+  ISO_IMAGE_LAYOUT_PATH="${ISO_IMAGE_LAYOUT_PATH:-/target-images/$PROFILE}"
+  DELIVERY_MODE="${DELIVERY_MODE:-iso-oci}"
   VIB_BIN="${VIB_BIN:-$WORKDIR/tools/vib}"
 
   SOURCES_DIR="$WORKDIR/sources"
@@ -465,7 +592,7 @@ recompute_paths() {
   OUTPUT_DIR="$WORKDIR/output"
   LOG_DIR="$OUTPUT_DIR/logs"
   TMP_DIR="$WORKDIR/tmp"
-  TMP_ROOT="$TMP_DIR/v7.0.13-${SESSION_ID}"
+  TMP_ROOT="$TMP_DIR/v8.0.0-${SESSION_ID}"
   RELEASES_DIR="$OUTPUT_DIR/releases"
   CUSTOM_IMAGE_SOURCE="$SOURCES_DIR/custom-image"
   CUSTOM_PROJECT="$TMP_ROOT/custom-image-project"
@@ -477,6 +604,320 @@ recompute_paths() {
   QCOM_UPDATER_DIR="$SOURCES_DIR/qcom-firmware-updater"
   STAGED_FIRMWARE_DIR="$WORKDIR/staged-firmware/$PROFILE"
   BUILD_COUNTER_FILE="$WORKDIR/.build-number"
+  PROFILE_RESOLVED_JSON="$TMP_ROOT/profile.resolved.json"
+  PROFILE_VALIDATION_REPORT="$TMP_ROOT/profile-validation.tsv"
+  ROOT_OVERLAY_INVENTORY="$TMP_ROOT/root-overlay-inventory.sha256"
+  EMBEDDED_OCI_LAYOUT="$TMP_ROOT/embedded-target-oci"
+  EMBEDDED_OCI_INVENTORY="$TMP_ROOT/embedded-image-inventory.tsv"
+  EMBEDDED_OCI_TREE_HASH="$TMP_ROOT/target-image-layout.sha256"
+  INSTALLER_PATCH_MANIFEST="$TMP_ROOT/installer-patch-manifest.tsv"
+  INSTALLED_BOOT_EXPECTED_JSON="$TMP_ROOT/installed-boot-expected.json"
+}
+
+
+resolve_profile_path() {
+  local value="$1"
+  [[ -n "$value" ]] || { printf ''; return 0; }
+  value="$(normalize_path_input "$value")"
+  if [[ "$value" == /* ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s/%s' "$WORKDIR" "$value"
+  fi
+}
+
+json_bool_to_flag() {
+  case "$1" in
+    true|1|yes) printf '1' ;;
+    false|0|no|'') printf '0' ;;
+    *) die "Invalid JSON boolean value: $1" ;;
+  esac
+}
+
+synthesize_compatibility_profile() {
+  PROFILE_FILE_RESOLVED="$TMP_ROOT/profile.synthesized.json"
+  jq -n \
+    --arg profile "$PROFILE" \
+    --arg display "$PROFILE" \
+    --arg artifacts "$ARTIFACT_DIR" \
+    --arg kernel_dir "$KERNEL_DEB_DIR" \
+    --arg kernel_release "$EXPECTED_CUSTOM_KERNEL_RELEASE" \
+    --arg dtb "$DTB_FILE_OVERRIDE" \
+    --arg dtb_name "$DTB_INSTALLED_NAME_OVERRIDE" \
+    --arg root "$ROOT_SOURCE" \
+    --arg firmware "$FIRMWARE_SOURCE_OVERRIDE" \
+    --arg qcom "$QCOM_DEVICE_PATH" \
+    --arg base "$CUSTOM_IMAGE_BASE" \
+    --arg repo "$TARGET_IMAGE_REPOSITORY" \
+    --arg abroot "$ABROOT_IMAGE_NAME" \
+    --arg iso_path "$ISO_IMAGE_LAYOUT_PATH" \
+    --arg registry "$REGISTRY_IMAGE_REF" \
+    --arg delivery "$DELIVERY_MODE" \
+    --argjson min_free "$MIN_FREE_GIB" \
+    '{
+      schema_version: 1,
+      profile: $profile,
+      display_name: $display,
+      architecture: "arm64",
+      artifacts: {
+        directory: $artifacts,
+        root_overlay: (if $root == "" then null else $root end)
+      },
+      kernel: {
+        deb_directory: $kernel_dir,
+        expected_release: (if $kernel_release == "" then null else $kernel_release end),
+        allow_single_release_discovery: true,
+        command_line_append: []
+      },
+      dtb: {
+        source: (if $dtb == "" then null else $dtb end),
+        installed_name: (if $dtb_name == "" then null else $dtb_name end)
+      },
+      firmware: {
+        mode: (if $firmware == "" then "ask" else "prestaged" end),
+        source: (if $firmware == "" then null else $firmware end),
+        device_path: $qcom,
+        probes: [],
+        initramfs_probes: []
+      },
+      target_image: {
+        base: $base,
+        local_repository: $repo,
+        abroot_name: (if $abroot == "" then null else $abroot end),
+        iso_layout_path: $iso_path,
+        registry_fallback: (if $registry == "" then null else $registry end)
+      },
+      installer: {
+        default_delivery: $delivery,
+        auto_start: true,
+        ignore_cpu: true,
+        allow_custom_image_override: true
+      },
+      validation: {
+        installed_paths: [],
+        minimum_free_gib: $min_free
+      }
+    }' > "$PROFILE_FILE_RESOLVED"
+  warn "No profile manifest was found. A compatibility profile was synthesized: $PROFILE_FILE_RESOLVED"
+}
+
+load_hardware_profile() {
+  local candidate profile_id schema_version value
+
+  if [[ -n "$PROFILE_FILE" ]]; then
+    PROFILE_FILE_RESOLVED="$(resolve_profile_path "$PROFILE_FILE")"
+  else
+    for candidate in \
+      "$WORKDIR/profiles/$PROFILE/profile.json" \
+      "$WORKDIR/profiles/$PROFILE.json"; do
+      if [[ -f "$candidate" ]]; then
+        PROFILE_FILE_RESOLVED="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$PROFILE_FILE_RESOLVED" ]]; then
+    synthesize_compatibility_profile
+  fi
+
+  [[ -f "$PROFILE_FILE_RESOLVED" ]] || die "Hardware profile does not exist: $PROFILE_FILE_RESOLVED"
+  jq -e . "$PROFILE_FILE_RESOLVED" >/dev/null || die "Hardware profile is not valid JSON: $PROFILE_FILE_RESOLVED"
+
+  schema_version="$(jq -r '.schema_version // empty' "$PROFILE_FILE_RESOLVED")"
+  [[ "$schema_version" == "$PROFILE_SCHEMA_VERSION" ]] || \
+    die "Unsupported hardware-profile schema version '$schema_version'; expected $PROFILE_SCHEMA_VERSION"
+
+  profile_id="$(jq -r '.profile // empty' "$PROFILE_FILE_RESOLVED")"
+  [[ "$profile_id" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || \
+    die "Unsafe or missing hardware-profile identifier: $profile_id"
+  if [[ "$profile_id" != "$PROFILE" ]]; then
+    if [[ -n "$PROFILE_FILE" && "$PROFILE_SELECTOR_EXPLICIT" == "0" ]]; then
+      info "Adopting profile identifier from explicit manifest: $profile_id"
+      PROFILE="$profile_id"
+    else
+      die "Selected profile '$PROFILE' does not match manifest profile '$profile_id'"
+    fi
+  fi
+
+  PROFILE_DISPLAY_NAME="$(jq -r '.display_name // .profile' "$PROFILE_FILE_RESOLVED")"
+  PROFILE_ARCHITECTURE="$(jq -r '.architecture // "arm64"' "$PROFILE_FILE_RESOLVED")"
+  [[ "$PROFILE_ARCHITECTURE" == "arm64" ]] || \
+    die "v8.0.0 supports ARM64 profiles only; profile requested $PROFILE_ARCHITECTURE"
+
+  if [[ -z "$ENV_ARTIFACT_DIR_SET" ]]; then
+    value="$(jq -r '.artifacts.directory // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || ARTIFACT_DIR="$(resolve_profile_path "$value")"
+  fi
+  if [[ -z "$ENV_KERNEL_DEB_DIR_SET" ]]; then
+    value="$(jq -r '.kernel.deb_directory // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || KERNEL_DEB_DIR="$(resolve_profile_path "$value")"
+  fi
+  if [[ -z "$ENV_ROOT_SOURCE_SET" ]]; then
+    value="$(jq -r '.artifacts.root_overlay // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || ROOT_SOURCE="$(resolve_profile_path "$value")"
+  fi
+  if [[ -z "$ENV_DTB_FILE_SET" ]]; then
+    value="$(jq -r '.dtb.source // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || DTB_FILE_OVERRIDE="$(resolve_profile_path "$value")"
+  fi
+  if [[ -z "$ENV_DTB_NAME_SET" ]]; then
+    value="$(jq -r '.dtb.installed_name // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || DTB_INSTALLED_NAME_OVERRIDE="$value"
+  fi
+  if [[ -z "$ENV_KERNEL_RELEASE_SET" ]]; then
+    value="$(jq -r '.kernel.expected_release // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || EXPECTED_CUSTOM_KERNEL_RELEASE="$value"
+  fi
+  if [[ -z "$ENV_FIRMWARE_SOURCE_SET" ]]; then
+    value="$(jq -r '.firmware.source // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || FIRMWARE_SOURCE_OVERRIDE="$(resolve_profile_path "$value")"
+  fi
+
+  value="$(jq -r '.firmware.mode // empty' "$PROFILE_FILE_RESOLVED")"
+  [[ -z "$value" || "$FIRMWARE_MODE" != "ask" ]] || FIRMWARE_MODE="$value"
+  value="$(jq -r '.firmware.device_path // empty' "$PROFILE_FILE_RESOLVED")"
+  [[ -z "$value" ]] || QCOM_DEVICE_PATH="$value"
+
+  if [[ -z "$ENV_CUSTOM_IMAGE_BASE_SET" ]]; then
+    value="$(jq -r '.target_image.base // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || CUSTOM_IMAGE_BASE="$value"
+  fi
+  if [[ -z "$ENV_TARGET_REPOSITORY_SET" ]]; then
+    value="$(jq -r '.target_image.local_repository // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || TARGET_IMAGE_REPOSITORY="$value"
+  fi
+  if [[ -z "$ENV_TARGET_IMAGE_SET" && -n "$TARGET_IMAGE_REPOSITORY" ]]; then
+    TARGET_IMAGE_REF="${TARGET_IMAGE_REPOSITORY}:${BUILD_DATE}"
+  fi
+  if [[ -z "$ENV_ABROOT_IMAGE_SET" ]]; then
+    value="$(jq -r '.target_image.abroot_name // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || ABROOT_IMAGE_NAME="$value"
+  fi
+  if [[ -z "$ENV_ISO_LAYOUT_PATH_SET" ]]; then
+    value="$(jq -r '.target_image.iso_layout_path // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || ISO_IMAGE_LAYOUT_PATH="$value"
+  fi
+  if [[ -z "$ENV_REGISTRY_IMAGE_SET" ]]; then
+    value="$(jq -r '.target_image.registry_fallback // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || REGISTRY_IMAGE_REF="$value"
+  fi
+  if [[ -z "$ENV_DELIVERY_MODE_SET" ]]; then
+    value="$(jq -r '.installer.default_delivery // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || DELIVERY_MODE="$value"
+  fi
+
+  INSTALLER_AUTOSTART="$(json_bool_to_flag "$(jq -r '.installer.auto_start // true' "$PROFILE_FILE_RESOLVED")")"
+  INSTALLER_IGNORE_CPU="$(json_bool_to_flag "$(jq -r '.installer.ignore_cpu // true' "$PROFILE_FILE_RESOLVED")")"
+  INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE="$(json_bool_to_flag "$(jq -r '.installer.allow_custom_image_override // true' "$PROFILE_FILE_RESOLVED")")"
+
+  if [[ -z "$ENV_MIN_FREE_GIB_SET" ]]; then
+    value="$(jq -r '.validation.minimum_free_gib // empty' "$PROFILE_FILE_RESOLVED")"
+    [[ -z "$value" ]] || MIN_FREE_GIB="$value"
+  fi
+
+  mapfile -t PROFILE_FIRMWARE_PROBES < <(jq -r '.firmware.probes[]? // empty' "$PROFILE_FILE_RESOLVED")
+  mapfile -t PROFILE_INITRAMFS_PROBES < <(jq -r '.firmware.initramfs_probes[]? // empty' "$PROFILE_FILE_RESOLVED")
+  mapfile -t PROFILE_INSTALLED_PATH_PROBES < <(jq -r '.validation.installed_paths[]? // empty' "$PROFILE_FILE_RESOLVED")
+  mapfile -t PROFILE_KERNEL_CMDLINE_APPEND < <(jq -r '.kernel.command_line_append[]? // empty' "$PROFILE_FILE_RESOLVED")
+
+  [[ "$ISO_IMAGE_LAYOUT_PATH" == /target-images/* ]] || \
+    die "ISO image-layout path must be beneath /target-images: $ISO_IMAGE_LAYOUT_PATH"
+  [[ "$LOCAL_REGISTRY_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_REGISTRY_PORT >= 1024 && LOCAL_REGISTRY_PORT <= 65535 )) || \
+    die "Invalid unprivileged local registry port: $LOCAL_REGISTRY_PORT"
+
+  case "$DELIVERY_MODE" in
+    iso-oci) : ;;
+    registry)
+      [[ -n "$REGISTRY_IMAGE_REF" ]] || die "registry delivery requires REGISTRY_IMAGE_REF or target_image.registry_fallback"
+      ;;
+    *) die "Unsupported delivery mode: $DELIVERY_MODE" ;;
+  esac
+
+  ok "Loaded hardware profile: $PROFILE_DISPLAY_NAME ($PROFILE)"
+  info "Profile manifest: $PROFILE_FILE_RESOLVED"
+}
+
+write_resolved_profile() {
+  local firmware_json initramfs_json installed_json cmdline_json
+  firmware_json="$(printf '%s\n' "${PROFILE_FIRMWARE_PROBES[@]}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+  initramfs_json="$(printf '%s\n' "${PROFILE_INITRAMFS_PROBES[@]}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+  installed_json="$(printf '%s\n' "${PROFILE_INSTALLED_PATH_PROBES[@]}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+  cmdline_json="$(printf '%s\n' "${PROFILE_KERNEL_CMDLINE_APPEND[@]}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+
+  jq -n \
+    --argjson schema "$PROFILE_SCHEMA_VERSION" \
+    --arg profile "$PROFILE" \
+    --arg display "$PROFILE_DISPLAY_NAME" \
+    --arg architecture "$PROFILE_ARCHITECTURE" \
+    --arg source_profile "$PROFILE_FILE_RESOLVED" \
+    --arg artifact_dir "$ARTIFACT_DIR" \
+    --arg kernel_dir "$KERNEL_DEB_DIR" \
+    --arg kernel_release "$EXPECTED_CUSTOM_KERNEL_RELEASE" \
+    --arg dtb_source "$DTB_FILE_OVERRIDE" \
+    --arg dtb_name "$DTB_INSTALLED_NAME_OVERRIDE" \
+    --arg root_source "$ROOT_SOURCE" \
+    --arg firmware_mode "$FIRMWARE_MODE" \
+    --arg firmware_source "$FIRMWARE_SOURCE_OVERRIDE" \
+    --arg device_path "$QCOM_DEVICE_PATH" \
+    --arg base "$CUSTOM_IMAGE_BASE" \
+    --arg target_ref "$TARGET_IMAGE_REF" \
+    --arg abroot "$ABROOT_IMAGE_NAME" \
+    --arg iso_path "$ISO_IMAGE_LAYOUT_PATH" \
+    --arg delivery "$DELIVERY_MODE" \
+    --arg registry "$REGISTRY_IMAGE_REF" \
+    --argjson autostart "$INSTALLER_AUTOSTART" \
+    --argjson ignore_cpu "$INSTALLER_IGNORE_CPU" \
+    --argjson allow_custom "$INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE" \
+    --argjson min_free "$MIN_FREE_GIB" \
+    --argjson firmware_probes "$firmware_json" \
+    --argjson initramfs_probes "$initramfs_json" \
+    --argjson installed_paths "$installed_json" \
+    --argjson cmdline "$cmdline_json" \
+    '{
+      schema_version: $schema,
+      profile: $profile,
+      display_name: $display,
+      architecture: $architecture,
+      source_profile: $source_profile,
+      resolved: {
+        artifact_directory: $artifact_dir,
+        kernel_deb_directory: $kernel_dir,
+        expected_kernel_release: (if $kernel_release == "" then null else $kernel_release end),
+        dtb_source: (if $dtb_source == "" then null else $dtb_source end),
+        dtb_installed_name: (if $dtb_name == "" then null else $dtb_name end),
+        root_overlay: (if $root_source == "" then null else $root_source end),
+        firmware_mode: $firmware_mode,
+        firmware_source: (if $firmware_source == "" then null else $firmware_source end),
+        firmware_device_path: $device_path,
+        firmware_probes: $firmware_probes,
+        initramfs_probes: $initramfs_probes,
+        kernel_command_line_append: $cmdline,
+        target_base: $base,
+        target_image: $target_ref,
+        abroot_image: $abroot,
+        iso_layout_path: $iso_path,
+        delivery_mode: $delivery,
+        registry_fallback: (if $registry == "" then null else $registry end),
+        installer_autostart: $autostart,
+        installer_ignore_cpu: $ignore_cpu,
+        allow_custom_image_override: $allow_custom,
+        installed_path_probes: $installed_paths,
+        minimum_free_gib: $min_free
+      }
+    }' > "$PROFILE_RESOLVED_JSON"
+
+  {
+    printf 'check\tstatus\tdetail\n'
+    printf 'schema_version\tpass\t%s\n' "$PROFILE_SCHEMA_VERSION"
+    printf 'profile_identifier\tpass\t%s\n' "$PROFILE"
+    printf 'architecture\tpass\t%s\n' "$PROFILE_ARCHITECTURE"
+    printf 'artifact_directory\tresolved\t%s\n' "$ARTIFACT_DIR"
+    printf 'kernel_deb_directory\tresolved\t%s\n' "$KERNEL_DEB_DIR"
+    printf 'dtb_source\t%s\t%s\n' "$([[ -n "$DTB_FILE_OVERRIDE" ]] && printf resolved || printf discovery)" "${DTB_FILE_OVERRIDE:-deterministic discovery}"
+    printf 'delivery_mode\tpass\t%s\n' "$DELIVERY_MODE"
+    printf 'iso_layout_path\tpass\t%s\n' "$ISO_IMAGE_LAYOUT_PATH"
+  } > "$PROFILE_VALIDATION_REPORT"
 }
 
 require_root() {
@@ -744,7 +1185,8 @@ ${C_BOLD}Conception VanillaOS ARM64 Container-Model Builder${C_RESET}
 Version: $SCRIPT_VERSION
 
 Work directory:   $WORKDIR
-Profile:          $PROFILE
+Profile:          $PROFILE ($PROFILE_DISPLAY_NAME)
+Profile file:     $PROFILE_FILE_RESOLVED
 Artifact default: $ARTIFACT_DIR
 Sources:          $SOURCES_DIR
 
@@ -759,11 +1201,36 @@ configure_repository_interactively() {
   choose_repo_policy
 }
 
+choose_installer_delivery() {
+  if is_interactive; then
+    local choice default_choice=1
+    [[ "$DELIVERY_MODE" == "registry" ]] && default_choice=2
+    choice="$(menu "Installed Image Delivery
+
+ISO-local delivery embeds the verified target OCI layout and requires no external network. Registry mode remains available as an explicit fallback." "$default_choice"       "1|Embed and install the verified OCI from this ISO [RECOMMENDED]|Start a loopback-only registry bridge over the ISO-local OCI layout."       "2|Install from an external registry reference|Use the profile registry fallback or enter an explicit image reference."       "3|Open a shell before choosing|Inspect target image and profile settings.")"
+    case "$choice" in
+      1) DELIVERY_MODE="iso-oci" ;;
+      2)
+        DELIVERY_MODE="registry"
+        REGISTRY_IMAGE_REF="$(prompt_text "Registry image reference" "${REGISTRY_IMAGE_REF:-$TARGET_IMAGE_REF}")"
+        ;;
+      3) open_shell "$WORKDIR"; choose_installer_delivery; return ;;
+    esac
+  fi
+
+  case "$DELIVERY_MODE" in
+    iso-oci) : ;;
+    registry) [[ -n "$REGISTRY_IMAGE_REF" ]] || die "Registry delivery requires an image reference." ;;
+    *) die "Unsupported installer delivery mode: $DELIVERY_MODE" ;;
+  esac
+}
+
 configure_build_inputs_interactively() {
   choose_artifact_directory
   choose_root_overlay
   choose_firmware_source
   choose_target_image
+  choose_installer_delivery
 }
 
 # ----------------------- host dependency safety -------------------------
@@ -802,6 +1269,7 @@ sha256sum|coreutils
 md5sum|coreutils
 file|file
 zstd|zstd
+skopeo|skopeo
 $OCI_RUNTIME|$([[ "$OCI_RUNTIME" == "docker" ]] && printf docker.io || printf podman)
 $LIVE_ISO_RUNTIME|$([[ "$LIVE_ISO_RUNTIME" == "docker" ]] && printf docker.io || printf podman)
 EOF_DEPS
@@ -1048,10 +1516,10 @@ discover_kernel_and_dtb_inputs() {
   mkdir -p "$TMP_ROOT/deb-listings"
 
   mapfile -t KERNEL_DEBS < <(
-    find "$ARTIFACT_DIR/kernel-debs" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print 2>/dev/null |
+    find "$KERNEL_DEB_DIR" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print 2>/dev/null |
       sort -u
   )
-  ((${#KERNEL_DEBS[@]} > 0)) || die "No .deb files found in $ARTIFACT_DIR/kernel-debs or $ARTIFACT_DIR."
+  ((${#KERNEL_DEBS[@]} > 0)) || die "No .deb files found in $KERNEL_DEB_DIR or $ARTIFACT_DIR."
 
   local -a release_candidates=()
   local deb pkg version arch listing rel
@@ -1213,7 +1681,8 @@ discover_kernel_and_dtb_inputs() {
     die "Multiple DTBs found. Set DTB_FILE_OVERRIDE or use interactive mode."
   fi
 
-  DTB_NAME="$(basename "$DTB_FILE")"
+  DTB_NAME="${DTB_INSTALLED_NAME_OVERRIDE:-$(basename "$DTB_FILE")}"
+  [[ "$DTB_NAME" != */* && -n "$DTB_NAME" ]] || die "Installed DTB name must be a basename: $DTB_NAME"
   write_kernel_package_selection_manifest
 
   ok "Custom kernel release: $KERNEL_RELEASE"
@@ -1832,6 +2301,11 @@ qcom updater checkout:      $(source_checkout_summary "$QCOM_UPDATER_DIR")
 Target OCI base:            $CUSTOM_IMAGE_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
+Installer delivery:        $DELIVERY_MODE
+ISO OCI layout path:       $ISO_IMAGE_LAYOUT_PATH
+Registry fallback:         ${REGISTRY_IMAGE_REF:-none}
+Profile manifest:          $PROFILE_FILE_RESOLVED
+Kernel package directory:  $KERNEL_DEB_DIR
 Push target OCI:            $PUSH_TARGET_IMAGE
 Pico image:                 $LIVE_ISO_CONTAINER_IMAGE
 ARM64 package-list suffix:  $LIVE_ARM64_PACKAGE_LIST_SUFFIX
@@ -2314,6 +2788,27 @@ install_vib_and_plugins() {
 
 # ------------------------ custom target OCI ------------------------------
 
+generate_root_overlay_inventory() {
+  : > "$ROOT_OVERLAY_INVENTORY"
+  [[ -n "$ROOT_SOURCE" ]] || return 0
+  [[ -d "$ROOT_SOURCE" ]] || die "Root overlay source is not a directory: $ROOT_SOURCE"
+
+  while IFS= read -r -d '' file; do
+    local rel hash
+    rel="${file#"$ROOT_SOURCE"/}"
+    hash="$(sha256sum "$file" | awk '{print $1}')"
+    printf '%s  /root/%s\n' "$hash" "$rel" >> "$ROOT_OVERLAY_INVENTORY"
+  done < <(find "$ROOT_SOURCE" -type f -print0 | sort -z)
+}
+
+shell_array_literal() {
+  local value out='('
+  for value in "$@"; do
+    printf -v out '%s %q' "$out" "$value"
+  done
+  printf '%s )' "$out"
+}
+
 prepare_custom_image_project() {
   [[ -e "$CUSTOM_PROJECT/.git" ]] || die "custom-image checkout is unavailable: $CUSTOM_PROJECT"
   [[ -f "$CUSTOM_PROJECT/modules/80-set-image-abroot-config.yml" ]] || \
@@ -2325,7 +2820,9 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/usr/lib/firmware" \
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
     "$CUSTOM_PROJECT/includes.container/root" \
-    "$CUSTOM_PROJECT/includes.container/image-info"
+    "$CUSTOM_PROJECT/includes.container/image-info" \
+    "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE" \
+    "$CUSTOM_PROJECT/includes.container/usr/lib/conception"
 
   mkdir -p \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
@@ -2335,6 +2832,8 @@ prepare_custom_image_project() {
     "$CUSTOM_PROJECT/includes.container/root" \
     "$CUSTOM_PROJECT/includes.container/image-info" \
     "$CUSTOM_PROJECT/includes.container/usr/local/sbin" \
+    "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE" \
+    "$CUSTOM_PROJECT/includes.container/usr/lib/conception" \
     "$CUSTOM_PROJECT/modules"
 
   local deb class pkg listing
@@ -2385,6 +2884,11 @@ prepare_custom_image_project() {
   else
     ROOT_PROBE_REL=""
   fi
+
+  generate_root_overlay_inventory
+  cp -a "$PROFILE_RESOLVED_JSON"     "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE/profile.resolved.json"
+  cp -a "$PROFILE_VALIDATION_REPORT"     "$CUSTOM_PROJECT/includes.container/usr/share/conception/profiles/$PROFILE/profile-validation.tsv"
+  cp -a "$ROOT_OVERLAY_INVENTORY"     "$CUSTOM_PROJECT/includes.container/usr/lib/conception/root-overlay.sha256"
 
   # Preserve every supplied package without forcing optional build artifacts
   # into the immutable runtime package transaction.
@@ -2489,12 +2993,20 @@ cat "$receipt"
 INSTALL_DEBS_EOF
   chmod 0755 "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
 
+  local firmware_array initramfs_array installed_array cmdline_array
+  firmware_array="$(shell_array_literal "${PROFILE_FIRMWARE_PROBES[@]}")"
+  initramfs_array="$(shell_array_literal "${PROFILE_INITRAMFS_PROBES[@]}")"
+  installed_array="$(shell_array_literal "${PROFILE_INSTALLED_PATH_PROBES[@]}")"
+  cmdline_array="$(shell_array_literal "${PROFILE_KERNEL_CMDLINE_APPEND[@]}")"
+
   cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize" <<EOF_FINALIZE
 #!/usr/bin/env bash
 set -Eeuo pipefail
-release='$KERNEL_RELEASE'
-dtb='$DTB_NAME'
-firmware_probe='$FIRMWARE_PROBE_REL'
+release=$(printf '%q' "$KERNEL_RELEASE")
+dtb=$(printf '%q' "$DTB_NAME")
+profile=$(printf '%q' "$PROFILE")
+firmware_probes=$firmware_array
+cmdline_append=$cmdline_array
 
 test -s "/boot/vmlinuz-\$release"
 test -d "/usr/lib/modules/\$release" || test -d "/lib/modules/\$release"
@@ -2508,11 +3020,102 @@ ln -sfn "boot/vmlinuz-\$release" /vmlinuz
 ln -sfn "boot/initrd.img-\$release" /initrd.img
 printf '%s\n' "\$release" > /usr/lib/conception-kernel-release
 printf '%s\n' "\$dtb" > /usr/lib/conception-dtb
-if [[ -n "\$firmware_probe" ]]; then
-  test -s "/usr/lib/firmware/\$firmware_probe" || test -s "/lib/firmware/\$firmware_probe"
-fi
+printf '%s\n' "\$profile" > /usr/lib/conception-profile
+printf '%s\n' "\${cmdline_append[@]}" > /usr/lib/conception-kernel-command-line
+for probe in "\${firmware_probes[@]}"; do
+  [[ -e "/usr/lib/firmware/\$probe" || -e "/lib/firmware/\$probe" ]] || {
+    echo "Missing profile firmware probe: \$probe" >&2
+    exit 91
+  }
+done
 EOF_FINALIZE
   chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize"
+
+  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot" <<EOF_INSTALLED_VERIFY
+#!/usr/bin/env bash
+set -Eeuo pipefail
+expected_profile=$(printf '%q' "$PROFILE")
+expected_release=$(printf '%q' "$KERNEL_RELEASE")
+expected_dtb=$(printf '%q' "$DTB_NAME")
+firmware_probes=$firmware_array
+initramfs_probes=$initramfs_array
+installed_paths=$installed_array
+cmdline_append=$cmdline_array
+
+profile="\$(cat /usr/lib/conception-profile)"
+release="\$(cat /usr/lib/conception-kernel-release)"
+dtb="\$(cat /usr/lib/conception-dtb)"
+[[ "\$profile" == "\$expected_profile" ]]
+[[ "\$release" == "\$expected_release" ]]
+[[ "\$dtb" == "\$expected_dtb" ]]
+
+state=/boot/init/vos-a
+cfg="\$state/abroot.cfg"
+test -s "\$state/vmlinuz-\$release"
+test -s "\$state/initrd.img-\$release"
+test -s "\$state/dtbs/\$dtb"
+test -s "\$cfg"
+
+grep -Fq "vmlinuz-\$release" "\$cfg"
+grep -Fq "devicetree (lvm/vos--root-init)/vos-a/dtbs/\$dtb" "\$cfg"
+grep -Fq "initrd.img-\$release" "\$cfg"
+awk -v dtb="devicetree (lvm/vos--root-init)/vos-a/dtbs/\$dtb" \
+    -v initrd="initrd (lvm/vos--root-init)/vos-a/initrd.img-\$release" '
+  index(\$0, dtb) { d=NR }
+  index(\$0, initrd) { i=NR }
+  END { exit(d > 0 && i > 0 && d < i ? 0 : 1) }
+' "\$cfg"
+for argument in "\${cmdline_append[@]}"; do
+  [[ -n "\$argument" ]] || continue
+  grep -Fq -- "\$argument" "\$cfg" || {
+    echo "Installed ABRoot config lacks required kernel argument: \$argument" >&2
+    exit 94
+  }
+done
+
+for probe in "\${firmware_probes[@]}"; do
+  [[ -e "/usr/lib/firmware/\$probe" || -e "/lib/firmware/\$probe" ]]
+done
+for path in "\${installed_paths[@]}"; do
+  [[ -e "\$path" ]]
+done
+
+if (( \${#initramfs_probes[@]} > 0 )); then
+  command -v lsinitramfs >/dev/null 2>&1 || {
+    echo "lsinitramfs is required for configured initramfs firmware probes" >&2
+    exit 92
+  }
+  listing="\$(mktemp)"
+  trap 'rm -f "\$listing"' EXIT
+  lsinitramfs "\$state/initrd.img-\$release" > "\$listing"
+  for probe in "\${initramfs_probes[@]}"; do
+    normalized="\${probe#/}"
+    grep -Fq "\$normalized" "\$listing" || {
+      echo "Installed initramfs lacks required probe: \$probe" >&2
+      exit 93
+    }
+  done
+fi
+
+if [[ -s /usr/lib/conception/root-overlay.sha256 ]]; then
+  sha256sum -c /usr/lib/conception/root-overlay.sha256
+fi
+
+mkdir -p /usr/lib/conception
+{
+  printf 'check\tstatus\tdetail\n'
+  printf 'profile\tpass\t%s\n' "\$profile"
+  printf 'kernel\tpass\t%s\n' "\$release"
+  printf 'dtb\tpass\t%s\n' "\$dtb"
+  printf 'abroot_a\tpass\t%s\n' "\$cfg"
+  printf 'initramfs\tpass\t%s\n' "\$state/initrd.img-\$release"
+} > /usr/lib/conception/installed-boot-validation.tsv
+EOF_INSTALLED_VERIFY
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot"
+
+  bash -n "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-hardware-finalize"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/conception-verify-installed-boot"
 
   cat > "$CUSTOM_PROJECT/modules/50-install-hardware-debs.yml" <<'MODULE_DEBS_EOF'
 name: install-hardware-debs
@@ -2542,6 +3145,7 @@ stages:
     labels:
       maintainer: Conception
       conception.profile: $PROFILE
+      conception.profile-schema: "$PROFILE_SCHEMA_VERSION"
       conception.kernel: $KERNEL_RELEASE
       conception.dtb: $DTB_NAME
     args:
@@ -2651,7 +3255,7 @@ build_target_oci() {
   if [[ "$PUSH_TARGET_IMAGE" == "1" ]]; then
     run_logged "push-target-oci" "$OCI_RUNTIME" push "$TARGET_IMAGE_REF"
   elif [[ "$TARGET_IMAGE_REF" == localhost/* ]]; then
-    warn "The target OCI reference is local-only. The graphical installer cannot pull it from another environment."
+    info "The target OCI reference is local-only; v8 will embed and serve it from the ISO in iso-oci mode."
   fi
 }
 
@@ -2681,6 +3285,7 @@ firmware_probe="$4"
 root_probe="$5"
 expected_archive_count="$6"
 expected_package_file="$7"
+expected_profile="$8"
 
 receipt=/usr/lib/conception/target-installed-kernel-packages.tsv
 receipt_checksum=/usr/lib/conception/target-installed-kernel-packages.tsv.sha256
@@ -2693,6 +3298,8 @@ test "$(readlink -f /initrd.img)" = "/boot/initrd.img-$release"
 test -s "/boot/dtbs/$dtb"
 grep -Fxq "$release" /usr/lib/conception-kernel-release
 grep -Fxq "$dtb" /usr/lib/conception-dtb
+grep -Fxq "$expected_profile" /usr/lib/conception-profile
+test -f /usr/lib/conception-kernel-command-line
 grep -Fq "$abroot_name" /usr/share/abroot/abroot.json
 
 # The official custom-image cleanup locks the package layer before FsGuard.
@@ -2795,7 +3402,7 @@ VERIFY_OCI_EOF
     --entrypoint /bin/bash "$TARGET_IMAGE_REF" \
     /verify-target-oci.sh "$KERNEL_RELEASE" "$DTB_NAME" "$ABROOT_IMAGE_NAME" \
     "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL" "${#KERNEL_DEBS[@]}" \
-    /expected-target-packages.tsv
+    /expected-target-packages.tsv "$PROFILE"
 
   # Export the exact receipt from the verified image into release evidence.
   "$OCI_RUNTIME" run --rm \
@@ -2811,6 +3418,91 @@ VERIFY_OCI_EOF
   ok "Target OCI verification passed without requiring runtime package-manager tools."
 }
 
+
+
+# ---------------------- embedded target image ----------------------------
+
+local_image_transport_ref() {
+  case "$OCI_RUNTIME" in
+    podman) printf 'containers-storage:%s' "$TARGET_IMAGE_REF" ;;
+    docker) printf 'docker-daemon:%s' "$TARGET_IMAGE_REF" ;;
+    *) die "Unsupported OCI runtime for local image export: $OCI_RUNTIME" ;;
+  esac
+}
+
+hash_tree_manifest() {
+  local root="$1"
+  (
+    cd "$root"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+  )
+}
+
+export_target_oci_for_installer() {
+  local source_ref descriptor digest_hex manifest_blob
+  source_ref="$(local_image_transport_ref)"
+  EMBEDDED_IMAGE_TAG="${EMBEDDED_IMAGE_TAG:-${BUILD_DATE}-${RELEASE_ID}}"
+  LOCAL_INSTALL_IMAGE_REF="${LOCAL_REGISTRY_HOST}:${LOCAL_REGISTRY_PORT}/conception/${PROFILE}:${EMBEDDED_IMAGE_TAG}"
+
+  rm -rf "$EMBEDDED_OCI_LAYOUT"
+  mkdir -p "$EMBEDDED_OCI_LAYOUT"
+
+  run_logged "export-target-oci-layout" \
+    skopeo copy --all "$source_ref" "oci:$EMBEDDED_OCI_LAYOUT:$EMBEDDED_IMAGE_TAG"
+
+  [[ -s "$EMBEDDED_OCI_LAYOUT/oci-layout" ]] || die "OCI layout marker was not exported."
+  [[ -s "$EMBEDDED_OCI_LAYOUT/index.json" ]] || die "OCI layout index was not exported."
+
+  descriptor="$(jq -c --arg tag "$EMBEDDED_IMAGE_TAG" '
+    [.manifests[] | select(.annotations["org.opencontainers.image.ref.name"] == $tag)]
+    | if length == 1 then .[0] else empty end
+  ' "$EMBEDDED_OCI_LAYOUT/index.json")"
+  [[ -n "$descriptor" ]] || die "OCI layout index does not contain exactly one descriptor for tag $EMBEDDED_IMAGE_TAG"
+
+  TARGET_IMAGE_MANIFEST_DIGEST="$(jq -r '.digest' <<<"$descriptor")"
+  [[ "$TARGET_IMAGE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+    die "Unexpected embedded OCI manifest digest: $TARGET_IMAGE_MANIFEST_DIGEST"
+  digest_hex="${TARGET_IMAGE_MANIFEST_DIGEST#sha256:}"
+  manifest_blob="$EMBEDDED_OCI_LAYOUT/blobs/sha256/$digest_hex"
+  [[ -s "$manifest_blob" ]] || die "Embedded OCI manifest blob is missing: $manifest_blob"
+  [[ "sha256:$(sha256sum "$manifest_blob" | awk '{print $1}')" == "$TARGET_IMAGE_MANIFEST_DIGEST" ]] || \
+    die "Embedded OCI manifest blob digest mismatch."
+
+  {
+    printf 'path\tbytes\tsha256\n'
+    while IFS= read -r -d '' file; do
+      printf '%s\t%s\t%s\n' \
+        "${file#"$EMBEDDED_OCI_LAYOUT"/}" \
+        "$(stat -c %s "$file")" \
+        "$(sha256sum "$file" | awk '{print $1}')"
+    done < <(find "$EMBEDDED_OCI_LAYOUT" -type f -print0 | sort -z)
+  } > "$EMBEDDED_OCI_INVENTORY"
+  hash_tree_manifest "$EMBEDDED_OCI_LAYOUT" > "$EMBEDDED_OCI_TREE_HASH"
+
+  if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
+    INSTALLER_DEFAULT_IMAGE_REF="$LOCAL_INSTALL_IMAGE_REF"
+  else
+    INSTALLER_DEFAULT_IMAGE_REF="$REGISTRY_IMAGE_REF"
+  fi
+
+  jq -n \
+    --arg profile "$PROFILE" \
+    --arg tag "$EMBEDDED_IMAGE_TAG" \
+    --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
+    --arg layout "$ISO_IMAGE_LAYOUT_PATH" \
+    --arg local_ref "$LOCAL_INSTALL_IMAGE_REF" \
+    --arg installer_ref "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg delivery "$DELIVERY_MODE" \
+    --arg kernel "$KERNEL_RELEASE" \
+    --arg dtb "$DTB_NAME" \
+    '{profile:$profile, tag:$tag, manifest_digest:$digest, iso_layout_path:$layout,
+      local_registry_reference:$local_ref, installer_reference:$installer_ref,
+      delivery_mode:$delivery, kernel_release:$kernel, dtb:$dtb}' \
+    > "$TMP_ROOT/embedded-target-image.json"
+
+  ok "Exported verified target OCI layout: $TARGET_IMAGE_MANIFEST_DIGEST"
+  ok "Installer image source: $INSTALLER_DEFAULT_IMAGE_REF"
+}
 
 # --------------------------- live ISO build ------------------------------
 
@@ -3718,6 +4410,437 @@ PATCH_GRUB_PY
 }
 
 
+
+write_local_oci_registry_server() {
+  local destination="$1"
+  cat > "$destination" <<'PY_LOCAL_REGISTRY'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import re
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--layout", required=True)
+parser.add_argument("--tag", required=True)
+parser.add_argument("--repository", required=True)
+parser.add_argument("--host", default="127.0.0.1")
+parser.add_argument("--port", type=int, default=5000)
+args = parser.parse_args()
+
+layout = Path(args.layout).resolve()
+index = json.loads((layout / "index.json").read_text())
+descriptors = {
+    d.get("annotations", {}).get("org.opencontainers.image.ref.name"): d
+    for d in index.get("manifests", [])
+}
+if args.tag not in descriptors:
+    raise SystemExit(f"tag {args.tag!r} is absent from OCI layout")
+tag_descriptor = descriptors[args.tag]
+
+def blob_path(digest: str) -> Path:
+    algorithm, encoded = digest.split(":", 1)
+    if algorithm != "sha256" or not re.fullmatch(r"[0-9a-f]{64}", encoded):
+        raise ValueError("unsupported digest")
+    return layout / "blobs" / algorithm / encoded
+
+def descriptor_for_reference(reference: str):
+    if reference == args.tag:
+        return tag_descriptor
+    if reference.startswith("sha256:"):
+        path = blob_path(reference)
+        if path.is_file():
+            raw = path.read_bytes()
+            media_type = "application/vnd.oci.image.manifest.v1+json"
+            try:
+                parsed = json.loads(raw)
+                media_type = parsed.get("mediaType", media_type)
+            except Exception:
+                pass
+            return {"digest": reference, "mediaType": media_type, "size": len(raw)}
+    return None
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ConceptionOCIRegistry/1.0"
+
+    def log_message(self, fmt, *values):
+        print(f"registry: {self.address_string()} {fmt % values}", flush=True)
+
+    def _send_file(self, path: Path, content_type: str, digest: str | None = None, head=False):
+        if not path.is_file():
+            self.send_error(404)
+            return
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        if digest:
+            self.send_header("Docker-Content-Digest", digest)
+        self.end_headers()
+        if not head:
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
+    def _handle(self, head=False):
+        path = unquote(self.path.split("?", 1)[0])
+        if path in ("/v2", "/v2/"):
+            self.send_response(200)
+            self.send_header("Docker-Distribution-API-Version", "registry/2.0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        prefix = f"/v2/{args.repository}/"
+        if not path.startswith(prefix):
+            self.send_error(404)
+            return
+        suffix = path[len(prefix):]
+
+        if suffix == "tags/list":
+            body = json.dumps({"name": args.repository, "tags": [args.tag]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+
+        if suffix.startswith("manifests/"):
+            reference = suffix[len("manifests/"):]
+            descriptor = descriptor_for_reference(reference)
+            if descriptor is None:
+                self.send_error(404)
+                return
+            digest = descriptor["digest"]
+            self._send_file(blob_path(digest), descriptor.get("mediaType", "application/vnd.oci.image.manifest.v1+json"), digest, head)
+            return
+
+        if suffix.startswith("blobs/"):
+            digest = suffix[len("blobs/"):]
+            try:
+                file_path = blob_path(digest)
+            except ValueError:
+                self.send_error(400)
+                return
+            self._send_file(file_path, "application/octet-stream", digest, head)
+            return
+
+        self.send_error(404)
+
+    def do_GET(self):
+        self._handle(False)
+
+    def do_HEAD(self):
+        self._handle(True)
+
+ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+PY_LOCAL_REGISTRY
+  chmod 0755 "$destination"
+  python3 - "$destination" <<'PY_VALIDATE_REGISTRY_SERVER'
+from pathlib import Path
+import sys
+compile(Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
+PY_VALIDATE_REGISTRY_SERVER
+}
+
+patch_vanilla_installer_processor() {
+  local root="$1" processor original patched diff_file
+  processor="$(find "$root/usr" -type f -path '*/vanilla_installer/utils/processor.py' -print -quit 2>/dev/null || true)"
+  [[ -n "$processor" ]] || die "Unable to locate Vanilla Installer processor.py in live filesystem."
+
+  original="$TMP_ROOT/installer-processor.original.py"
+  patched="$TMP_ROOT/installer-processor.patched.py"
+  diff_file="$TMP_ROOT/installer-processor.diff"
+  cp -a "$processor" "$original"
+
+  python3 - "$processor" <<'PATCH_INSTALLER_PROCESSOR'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+data = path.read_text(encoding="utf-8")
+marker = "CONCEPTION_V8_PROFILE_INSTALLER_PATCH"
+if marker in data:
+    raise SystemExit("processor already contains the v8 patch marker")
+
+installation_anchor = '''        # Installation
+        recipe.set_installation("oci", oci_image)
+'''
+installation_replacement = '''        # Installation
+        # CONCEPTION_V8_PROFILE_INSTALLER_PATCH
+        abroot_image = sys_recipe.get("conception_abroot_image", oci_image)
+        expected_image_digest = sys_recipe.get("conception_embedded_digest", "")
+        recipe.set_installation("oci", oci_image)
+'''
+if installation_anchor not in data:
+    raise SystemExit("unable to locate installer installation anchor")
+data = data.replace(installation_anchor, installation_replacement, 1)
+
+abimage_anchor = '''                oci_image,
+            )
+            file.write(abimage)
+'''
+abimage_replacement = '''                abroot_image,
+            )
+            file.write(abimage)
+'''
+if abimage_anchor not in data:
+    raise SystemExit("unable to locate abimage image-name anchor")
+data = data.replace(abimage_anchor, abimage_replacement, 1)
+
+overlay_anchor = '''            # Mount `/etc` as overlay
+'''
+profile_boot_step = r"""            # Replace the generic ABRoot entry with the deterministic
+            # hardware-profile kernel and DTB binding.
+            recipe.add_postinstall_step(
+                "shell",
+                [
+                    " ".join(
+                        f'''KERNEL_VERSION=$(cat /mnt/a/usr/lib/conception-kernel-release) && \
+                        DTB_NAME=$(cat /mnt/a/usr/lib/conception-dtb) && \
+                        PROFILE_NAME=$(cat /mnt/a/usr/lib/conception-profile) && \
+                        KERNEL_CMDLINE=$(tr '\\n' ' ' < /mnt/a/usr/lib/conception-kernel-command-line) && \
+                        ROOTA_UUID=$(lsblk -d -n -o UUID {root_a_part}) && \
+                        test -n "$KERNEL_VERSION" && \
+                        test -n "$DTB_NAME" && \
+                        test -n "$PROFILE_NAME" && \
+                        test -d "/mnt/a/usr/lib/modules/$KERNEL_VERSION" && \
+                        test -s "/mnt/a/boot/vmlinuz-$KERNEL_VERSION" && \
+                        test -s "/mnt/a/boot/dtbs/$DTB_NAME" && \
+                        mkdir -p /mnt/a/boot/init/vos-a/dtbs /mnt/a/boot/init/vos-b/dtbs && \
+                        cp -a "/mnt/a/boot/dtbs/$DTB_NAME" "/mnt/a/boot/init/vos-a/dtbs/$DTB_NAME" && \
+                        cp -a "/mnt/a/boot/dtbs/$DTB_NAME" "/mnt/a/boot/init/vos-b/dtbs/$DTB_NAME" && \
+                        printf '%s\\n' \
+                          'insmod gzio' \
+                          'insmod part_gpt' \
+                          'insmod ext2' \
+                          "linux (lvm/vos--root-init)/vos-a/vmlinuz-$KERNEL_VERSION root=UUID=$ROOTA_UUID quiet splash bgrt_disable \\$vt_handoff lsm=integrity $KERNEL_CMDLINE" \
+                          "devicetree (lvm/vos--root-init)/vos-a/dtbs/$DTB_NAME" \
+                          "initrd (lvm/vos--root-init)/vos-a/initrd.img-$KERNEL_VERSION" \
+                          > /mnt/a/boot/init/vos-a/abroot.cfg'''.split()
+                    )
+                ],
+            )
+
+"""
+if overlay_anchor not in data:
+    raise SystemExit("unable to locate installer boot-step insertion anchor")
+data = data.replace(overlay_anchor, profile_boot_step + overlay_anchor, 1)
+
+abimage_command_anchor = '''                    "IMAGE_DIGEST=$(cat /mnt/a/.oci_digest) \\
+                    envsubst < /tmp/abimage.abr > /mnt/a/abimage.abr \\
+                    '$IMAGE_DIGEST'".split()
+'''
+abimage_command_replacement = '''                    (
+                        f"IMAGE_DIGEST=$(cat /mnt/a/.oci_digest) && "
+                        f"( test -z '{expected_image_digest}' || test \\\"$IMAGE_DIGEST\\\" = '{expected_image_digest}' ) && "
+                        f"envsubst < /tmp/abimage.abr > /mnt/a/abimage.abr '$IMAGE_DIGEST'"
+                    ).split()
+'''
+if abimage_command_anchor not in data:
+    raise SystemExit("unable to locate abimage digest command anchor")
+data = data.replace(abimage_command_anchor, abimage_command_replacement, 1)
+
+move_anchor = '''                "update-initramfs -c -k all",
+                "mv /boot/config* /boot/initrd.img* /boot/System.map* /boot/vmlinuz* /boot/init/vos-a",
+'''
+move_replacement = '''                "update-initramfs -c -k all",
+                "mv /boot/config* /boot/initrd.img* /boot/System.map* /boot/vmlinuz* /boot/init/vos-a",
+                "/usr/local/sbin/conception-verify-installed-boot",
+'''
+if move_anchor not in data:
+    raise SystemExit("unable to locate installed-initramfs validation anchor")
+data = data.replace(move_anchor, move_replacement, 1)
+
+path.write_text(data, encoding="utf-8")
+PATCH_INSTALLER_PROCESSOR
+
+  python3 -m py_compile "$processor"
+  cp -a "$processor" "$patched"
+  diff -u "$original" "$patched" > "$diff_file" || true
+
+  {
+    printf 'component\tpath\tbefore_sha256\tafter_sha256\tdiff\n'
+    printf 'vanilla-installer-processor\t%s\t%s\t%s\t%s\n' \
+      "${processor#"$root"}" \
+      "$(sha256sum "$original" | awk '{print $1}')" \
+      "$(sha256sum "$patched" | awk '{print $1}')" \
+      "$diff_file"
+  } > "$INSTALLER_PATCH_MANIFEST"
+
+  ok "Patched Vanilla Installer for deterministic profile kernel/DTB installation."
+}
+
+install_profile_aware_installer_overlay() {
+  local root="$1"
+  local recipe_source="$root/etc/vanilla-installer/recipe.json"
+  local profile_dir="$root/etc/vanilla-installer/profiles/$PROFILE"
+  local recipe_target="$profile_dir/recipe.json"
+  local wrapper="$root/usr/local/libexec/conception-installer-$PROFILE"
+  local registry_server="$root/usr/local/libexec/conception-oci-registry.py"
+  local desktop="$root/etc/xdg/autostart/conception-installer-$PROFILE.desktop"
+  local app="$root/usr/share/applications/conception-installer-$PROFILE.desktop"
+
+  [[ -s "$recipe_source" ]] || die "Live filesystem lacks Vanilla Installer recipe.json."
+  mkdir -p "$profile_dir" "$root/usr/local/libexec" \
+    "$root/etc/xdg/autostart" "$root/usr/share/applications" \
+    "$root/etc/containers/registries.conf.d" \
+    "$root/usr/share/conception/profiles/$PROFILE"
+
+  jq \
+    --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg profile "$PROFILE" \
+    --arg abroot "$ABROOT_IMAGE_NAME" \
+    --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
+    --arg delivery "$DELIVERY_MODE" \
+    --arg allow_custom "$INSTALLER_ALLOW_CUSTOM_IMAGE_OVERRIDE" \
+    '.images.default = $image
+     | .images.nvidia = $image
+     | .images.vm = $image
+     | .conception_profile = $profile
+     | .conception_abroot_image = $abroot
+     | .conception_embedded_digest = $digest
+     | .conception_delivery_mode = $delivery
+     | if $delivery == "iso-oci" then del(.steps["conn-check"]) else . end
+     | if $allow_custom == "1" then . else del(.steps["image"]) end' \
+    "$recipe_source" > "$recipe_target"
+
+  cp -a "$PROFILE_RESOLVED_JSON" \
+    "$root/usr/share/conception/profiles/$PROFILE/profile.resolved.json"
+  cp -a "$TMP_ROOT/embedded-target-image.json" \
+    "$root/usr/share/conception/profiles/$PROFILE/embedded-target-image.json"
+
+  write_local_oci_registry_server "$registry_server"
+
+  cat > "$wrapper" <<EOF_INSTALLER_WRAPPER
+#!/usr/bin/env bash
+set -Eeuo pipefail
+profile=$(printf '%q' "$PROFILE")
+delivery=$(printf '%q' "$DELIVERY_MODE")
+layout_path=$(printf '%q' "$ISO_IMAGE_LAYOUT_PATH")
+tag=$(printf '%q' "$EMBEDDED_IMAGE_TAG")
+repository=$(printf '%q' "conception/$PROFILE")
+host=$(printf '%q' "$LOCAL_REGISTRY_HOST")
+port=$(printf '%q' "$LOCAL_REGISTRY_PORT")
+recipe=/etc/vanilla-installer/profiles/$PROFILE/recipe.json
+server_pid=""
+
+cleanup_registry() {
+  if [[ -n "\$server_pid" ]]; then
+    kill "\$server_pid" >/dev/null 2>&1 || true
+    wait "\$server_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_registry EXIT INT TERM
+
+if [[ "\$delivery" == "iso-oci" ]]; then
+  medium=""
+  for candidate in /run/live/medium /cdrom /run/media/*/* /media/*/*; do
+    [[ -d "\$candidate" ]] || continue
+    if [[ -s "\$candidate/\${layout_path#/}/oci-layout" ]]; then
+      medium="\$candidate"
+      break
+    fi
+  done
+  [[ -n "\$medium" ]] || {
+    echo "Unable to locate embedded target OCI layout: \$layout_path" >&2
+    exit 70
+  }
+  layout="\$medium/\${layout_path#/}"
+  python3 /usr/local/libexec/conception-oci-registry.py \
+    --layout "\$layout" --tag "\$tag" --repository "\$repository" \
+    --host "\$host" --port "\$port" \
+    > /tmp/conception-local-registry.log 2>&1 &
+  server_pid=\$!
+
+  python3 - "\$host" "\$port" <<'PY_WAIT_REGISTRY'
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+for _ in range(100):
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            raise SystemExit(0)
+    except OSError:
+        time.sleep(0.1)
+raise SystemExit("local OCI registry bridge did not become ready")
+PY_WAIT_REGISTRY
+fi
+
+export VANILLA_CUSTOM_RECIPE="\$recipe"
+EOF_INSTALLER_WRAPPER
+  if [[ "$INSTALLER_IGNORE_CPU" == "1" ]]; then
+    printf 'export IGNORE_CPU=1\n' >> "$wrapper"
+  fi
+  cat >> "$wrapper" <<'EOF_INSTALLER_WRAPPER_END'
+
+set +e
+vanilla-installer "$@"
+rc=$?
+set -e
+exit "$rc"
+EOF_INSTALLER_WRAPPER_END
+  chmod 0755 "$wrapper"
+
+  cat > "$root/etc/containers/registries.conf.d/90-conception-local.conf" <<EOF_REGISTRY_CONF
+[[registry]]
+location = "$LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT"
+insecure = true
+blocked = false
+EOF_REGISTRY_CONF
+
+  cat > "$app" <<EOF_INSTALLER_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Install $PROFILE_DISPLAY_NAME
+Comment=Install the profile-specific offline VanillaOS target image
+Exec=/usr/local/libexec/conception-installer-$PROFILE
+Icon=org.vanillaos.Installer
+Terminal=false
+Categories=System;
+EOF_INSTALLER_DESKTOP
+  cp -a "$app" "$desktop"
+  if [[ "$INSTALLER_AUTOSTART" != "1" ]]; then
+    printf 'X-GNOME-Autostart-enabled=false\n' >> "$desktop"
+  else
+    printf 'X-GNOME-Autostart-enabled=true\n' >> "$desktop"
+  fi
+
+  bash -n "$wrapper"
+  jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg profile "$PROFILE" \
+    '.images.default == $image and .conception_profile == $profile' \
+    "$recipe_target" >/dev/null || \
+    die "Generated profile-specific Vanilla Installer recipe failed validation."
+
+  patch_vanilla_installer_processor "$root"
+
+  jq -n \
+    --arg profile "$PROFILE" \
+    --arg release "$KERNEL_RELEASE" \
+    --arg dtb "$DTB_NAME" \
+    --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    --arg digest "$TARGET_IMAGE_MANIFEST_DIGEST" \
+    --arg cfg "/boot/init/vos-a/abroot.cfg" \
+    '{profile:$profile,kernel_release:$release,dtb:$dtb,installer_image:$image,
+      manifest_digest:$digest,abroot_a_config:$cfg,
+      required_markers:["/usr/lib/conception-profile","/usr/lib/conception-kernel-release","/usr/lib/conception-dtb"]}' \
+    > "$INSTALLED_BOOT_EXPECTED_JSON"
+
+  ok "Installed profile-aware Vanilla Installer overlay for $PROFILE."
+}
+
 remaster_boot_hardware_only() {
   local iso_tree="$TMP_ROOT/iso-tree"
   local squash_root="$TMP_ROOT/squash-root"
@@ -3748,6 +4871,10 @@ remaster_boot_hardware_only() {
   fi
   cp -a "$DTB_FILE" "$squash_root/boot/dtbs/$DTB_NAME"
 
+  # Embed installer-side profile metadata and patch the installer before the
+  # live squashfs is rebuilt. This does not alter package manifests.
+  install_profile_aware_installer_overlay "$squash_root"
+
   [[ -s "$squash_root/boot/vmlinuz-$KERNEL_RELEASE" ]] || \
     die "Live squashfs lacks /boot/vmlinuz-$KERNEL_RELEASE after package extraction."
   [[ -d "$squash_root/usr/lib/modules/$KERNEL_RELEASE" || -d "$squash_root/lib/modules/$KERNEL_RELEASE" ]] || \
@@ -3775,6 +4902,15 @@ remaster_boot_hardware_only() {
   cp -a "$squash_root/boot/initrd.img-$KERNEL_RELEASE" "$iso_tree/live/initrd.img-$KERNEL_RELEASE"
   mkdir -p "$iso_tree/boot/dtbs"
   cp -a "$DTB_FILE" "$iso_tree/boot/dtbs/$DTB_NAME"
+
+  # Embed the verified OCI image layout outside the squashfs so it can be read
+  # directly from the mounted installation medium without consuming live RAM.
+  local embedded_dest="$iso_tree/${ISO_IMAGE_LAYOUT_PATH#/}"
+  rm -rf "$embedded_dest"
+  mkdir -p "$embedded_dest"
+  rsync -aHAX "$EMBEDDED_OCI_LAYOUT/" "$embedded_dest/"
+  cp -a "$TMP_ROOT/embedded-target-image.json" "$embedded_dest/CONCEPTION-IMAGE.json"
+  cp -a "$PROFILE_RESOLVED_JSON" "$embedded_dest/profile.resolved.json"
 
   # Preserve both official package manifests byte-for-byte. The custom live
   # kernel is a boot payload overlay, not a package-list or APT transaction.
@@ -3824,6 +4960,7 @@ remaster_boot_hardware_only() {
   mkdir -p "$RELEASE_DIR"
   rm -f "$FINAL_ISO"
   xorriso -as mkisofs \
+    -iso-level 3 \
     -r -J -joliet-long \
     -V "Vanilla OS" \
     -o "$FINAL_ISO" \
@@ -3883,6 +5020,49 @@ verify_final_release() {
       die "Final squashfs lacks firmware probe: $FIRMWARE_PROBE_REL"
   fi
 
+  # Verify the embedded OCI layout and exact manifest digest.
+  local embedded_verify="$verify_dir/embedded-oci"
+  mkdir -p "$embedded_verify"
+  extract_iso_file "$FINAL_ISO" "$ISO_IMAGE_LAYOUT_PATH/oci-layout" "$embedded_verify/oci-layout"
+  extract_iso_file "$FINAL_ISO" "$ISO_IMAGE_LAYOUT_PATH/index.json" "$embedded_verify/index.json"
+  [[ -s "$embedded_verify/oci-layout" && -s "$embedded_verify/index.json" ]] || \
+    die "Final ISO lacks the embedded OCI layout metadata."
+
+  local embedded_descriptor embedded_digest embedded_hex
+  embedded_descriptor="$(jq -c --arg tag "$EMBEDDED_IMAGE_TAG" '
+    [.manifests[] | select(.annotations["org.opencontainers.image.ref.name"] == $tag)]
+    | if length == 1 then .[0] else empty end
+  ' "$embedded_verify/index.json")"
+  [[ -n "$embedded_descriptor" ]] || die "Final ISO OCI index lacks tag $EMBEDDED_IMAGE_TAG"
+  embedded_digest="$(jq -r '.digest' <<<"$embedded_descriptor")"
+  [[ "$embedded_digest" == "$TARGET_IMAGE_MANIFEST_DIGEST" ]] || \
+    die "Final ISO embedded manifest digest differs from verified target digest."
+  embedded_hex="${embedded_digest#sha256:}"
+  extract_iso_file "$FINAL_ISO" \
+    "$ISO_IMAGE_LAYOUT_PATH/blobs/sha256/$embedded_hex" \
+    "$embedded_verify/manifest.blob"
+  [[ "sha256:$(sha256sum "$embedded_verify/manifest.blob" | awk '{print $1}')" == "$embedded_digest" ]] || \
+    die "Final ISO embedded OCI manifest blob failed digest validation."
+
+  # Verify the profile-specific recipe and installer patch inside squashfs.
+  unsquashfs -cat "$final_squash" \
+    "etc/vanilla-installer/profiles/$PROFILE/recipe.json" \
+    > "$verify_dir/installer-recipe.json"
+  jq -e --arg image "$INSTALLER_DEFAULT_IMAGE_REF" \
+    '.images.default == $image' "$verify_dir/installer-recipe.json" >/dev/null || \
+    die "Final ISO installer recipe does not default to the resolved profile image."
+  unsquashfs -cat "$final_squash" \
+    "usr/local/libexec/conception-installer-$PROFILE" \
+    > "$verify_dir/installer-wrapper"
+  grep -Fq "VANILLA_CUSTOM_RECIPE" "$verify_dir/installer-wrapper" || \
+    die "Final ISO lacks the profile installer wrapper."
+  unsquashfs -cat "$final_squash" \
+    "usr/share/conception/profiles/$PROFILE/profile.resolved.json" \
+    > "$verify_dir/profile.resolved.json"
+  jq -e --arg profile "$PROFILE" '.profile == $profile' \
+    "$verify_dir/profile.resolved.json" >/dev/null || \
+    die "Final ISO embedded installer profile does not match $PROFILE."
+
   local el_torito="$verify_dir/el-torito.txt"
   xorriso -indev "$FINAL_ISO" -report_el_torito as_mkisofs > "$el_torito" 2>&1
   grep -Fq -- "-e '/boot/grub/efi.img'" "$el_torito" || die "Final ISO lacks the expected ARM64 El Torito EFI image."
@@ -3901,6 +5081,15 @@ verify_final_release() {
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/kernel-package-selection.tsv" "$RELEASE_DIR/"
+  cp -a "$PROFILE_RESOLVED_JSON" "$RELEASE_DIR/profile.resolved.json"
+  cp -a "$PROFILE_VALIDATION_REPORT" "$RELEASE_DIR/profile-validation.tsv"
+  cp -a "$ROOT_OVERLAY_INVENTORY" "$RELEASE_DIR/root-overlay-inventory.sha256"
+  cp -a "$EMBEDDED_OCI_INVENTORY" "$RELEASE_DIR/embedded-image-inventory.tsv"
+  cp -a "$EMBEDDED_OCI_TREE_HASH" "$RELEASE_DIR/target-image-layout.sha256"
+  cp -a "$TMP_ROOT/embedded-target-image.json" "$RELEASE_DIR/"
+  cp -a "$INSTALLED_BOOT_EXPECTED_JSON" "$RELEASE_DIR/installed-boot-expected.json"
+  [[ -f "$INSTALLER_PATCH_MANIFEST" ]] && cp -a "$INSTALLER_PATCH_MANIFEST" "$RELEASE_DIR/"
+  [[ -f "$TMP_ROOT/installer-processor.diff" ]] && cp -a "$TMP_ROOT/installer-processor.diff" "$RELEASE_DIR/"
   [[ -n "$GRUB_PATCH_MANIFEST" && -f "$GRUB_PATCH_MANIFEST" ]] &&     cp -a "$GRUB_PATCH_MANIFEST" "$RELEASE_DIR/"
   if [[ -d "$TMP_ROOT/grub-patches" ]]; then
     mkdir -p "$RELEASE_DIR/grub-patches"
@@ -3918,20 +5107,22 @@ verify_final_release() {
   cat > "$RELEASE_DIR/CUSTOM-TARGET-IMAGE.txt" <<EOF_TARGET
 Custom VanillaOS target image
 ==============================
-Build reference:   $TARGET_IMAGE_REF
-ABRoot image name: $ABROOT_IMAGE_NAME
-Base image:        $CUSTOM_IMAGE_BASE
-Profile:           $PROFILE
-Kernel:            $KERNEL_RELEASE
-DTB:               $DTB_NAME
-Built:             $(date -u --iso-8601=seconds)
+Build reference:          $TARGET_IMAGE_REF
+Manifest digest:          $TARGET_IMAGE_MANIFEST_DIGEST
+ABRoot image name:        $ABROOT_IMAGE_NAME
+Base image:               $CUSTOM_IMAGE_BASE
+Profile:                  $PROFILE
+Profile display name:     $PROFILE_DISPLAY_NAME
+Kernel:                   $KERNEL_RELEASE
+DTB:                      $DTB_NAME
+Installer delivery:       $DELIVERY_MODE
+Installer image source:   $INSTALLER_DEFAULT_IMAGE_REF
+ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
+Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
+Built:                    $(date -u --iso-8601=seconds)
 
-Graphical installer custom-image entry:
-  $TARGET_IMAGE_REF
-
-The installer must be able to resolve and pull this reference. A localhost
-reference is not reachable from a separate live environment unless the image is
-made available through a registry or an explicitly supported local mechanism.
+In iso-oci mode the installer wrapper starts a loopback-only registry bridge
+serving the embedded OCI image layout. No external image registry is required.
 EOF_TARGET
 
   cat > "$RELEASE_DIR/BUILD-MANIFEST.txt" <<EOF_MANIFEST
@@ -3939,6 +5130,10 @@ Conception VanillaOS ARM64 build
 Version:                     $SCRIPT_VERSION
 Release ID:                  $RELEASE_ID
 Profile:                     $PROFILE
+Profile display name:        $PROFILE_DISPLAY_NAME
+Profile source:              $PROFILE_FILE_RESOLVED
+Profile resolved record:     profile.resolved.json
+Kernel package directory:    $KERNEL_DEB_DIR
 Kernel release:              $KERNEL_RELEASE
 Supplied kernel .debs:       ${#KERNEL_DEBS[@]}
 Target-installed .debs:      ${#TARGET_KERNEL_DEBS[@]}
@@ -3952,7 +5147,14 @@ GRUB binding evidence:       grub-patch-manifest.tsv and final-grub.cfg
 Firmware source:             ${FIRMWARE_SOURCE:-none}
 Target /root source:         ${ROOT_SOURCE:-none}
 Target OCI:                  $TARGET_IMAGE_REF
+Target OCI manifest digest:  $TARGET_IMAGE_MANIFEST_DIGEST
 ABRoot image name:           $ABROOT_IMAGE_NAME
+Installer delivery mode:     $DELIVERY_MODE
+Installer default image:     $INSTALLER_DEFAULT_IMAGE_REF
+Embedded OCI layout path:    $ISO_IMAGE_LAYOUT_PATH
+Embedded OCI tag:            $EMBEDDED_IMAGE_TAG
+Local registry bridge:       $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
+Registry fallback:           ${REGISTRY_IMAGE_REF:-none}
 Target OCI base:             $CUSTOM_IMAGE_BASE
 Vib version:                 $VIB_DETECTED_VERSION
 FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG
@@ -3973,44 +5175,69 @@ Live package manifests:      byte-identical to accepted ARM64 baseline
 Built:                       $(date -u --iso-8601=seconds)
 EOF_MANIFEST
 
+  local scope_record
+  scope_record="$(dirname "$(readlink -f "$0")")/VanillaOS-ARM64-v8.0.0-Scope-and-Acceptance.md"
+  [[ -f "$scope_record" ]] && cp -a "$scope_record" "$RELEASE_DIR/"
+
+  (
+    cd "$RELEASE_DIR"
+    find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
+  )
+
   ok "Final ISO: $FINAL_ISO"
   ok "Target OCI: $TARGET_IMAGE_REF"
+  ok "Embedded target digest: $TARGET_IMAGE_MANIFEST_DIGEST"
+  ok "Installer default image: $INSTALLER_DEFAULT_IMAGE_REF"
   ok "Both live package manifests remained byte-identical."
 }
 
 # ------------------------------- main -----------------------------------
 
 main() {
+  preparse_profile_args "$@"
+  recompute_paths
+  require_root
+  setup_directories
+  load_hardware_profile
+
+  # Re-run the authoritative parser after profile loading so command-line
+  # values override both the manifest and environment-derived defaults.
   parse_args "$@"
+  recompute_paths
+  setup_directories
+  write_resolved_profile
+
   [[ "$INTERACTIVE_MODE" != "auto" ]] || {
     if [[ -t 0 && -t 1 ]]; then INTERACTIVE_MODE=1; else INTERACTIVE_MODE=0; fi
   }
 
-  recompute_paths
-  require_root
-  setup_directories
   setup_logging
 
-  stage "1/12 Selecting the official Git source policy"
+  stage "1/13 Selecting the official Git source policy"
   configure_repository_interactively
 
-  stage "2/12 Checking host dependencies without changing initramfs implementation"
+  stage "2/13 Checking host dependencies without changing initramfs implementation"
   install_host_dependencies_safely
   check_free_space
 
-  stage "3/12 Applying and verifying the official Git source action"
+  stage "3/13 Applying and verifying the official Git source action"
   if (( PLAN_ONLY == 1 )); then
     report_repository_plan_state
   else
     sync_required_repositories
   fi
 
-  stage "4/12 Resolving interactive build inputs and validating hardware artifacts"
+  stage "4/13 Resolving interactive build inputs and validating hardware artifacts"
   configure_build_inputs_interactively
   discover_kernel_and_dtb_inputs
+  # Refresh resolved profile evidence with the deterministic discovered values.
+  EXPECTED_CUSTOM_KERNEL_RELEASE="$KERNEL_RELEASE"
+  DTB_FILE_OVERRIDE="$DTB_FILE"
+  DTB_INSTALLED_NAME_OVERRIDE="$DTB_NAME"
+  write_resolved_profile
   print_plan
   if (( PLAN_ONLY == 1 )); then
-    ok "Plan mode complete. No repository checkout, firmware staging, container build, or ISO build was performed."
+    ok "Plan mode complete. No repository checkout, firmware staging, OCI export, container build, or ISO build was performed."
     exit 0
   fi
 
@@ -4022,30 +5249,33 @@ main() {
   FINAL_ISO="$RELEASE_DIR/Conception-VanillaOS-Orchid-arm64-${BUILD_DATE}-${RELEASE_ID}-${PROFILE}.iso"
   mkdir -p "$RELEASE_DIR"
 
-  stage "5/12 Staging Qualcomm firmware without modifying the build host"
+  stage "5/13 Staging Qualcomm firmware without modifying the build host"
   stage_firmware
 
-  stage "6/12 Preparing a clean custom-image worktree and resolving Vib/plugins"
+  stage "6/13 Preparing a clean custom-image worktree and resolving Vib/plugins"
   prepare_custom_image_worktree
   install_vib_and_plugins
 
-  stage "7/12 Preparing the official custom-image-derived hardware recipe"
+  stage "7/13 Preparing the official custom-image-derived hardware recipe"
   prepare_custom_image_project
 
-  stage "8/12 Building and verifying the desktop:dev-derived target OCI"
+  stage "8/13 Building and verifying the desktop:dev-derived target OCI"
   build_target_oci
 
-  stage "9/12 Preparing and building an upstream-derived graphical ARM64 live ISO"
+  stage "9/13 Exporting the verified target OCI for installer delivery"
+  export_target_oci_for_installer
+
+  stage "10/13 Preparing and building an upstream-derived graphical ARM64 live ISO"
   prepare_arm64_live_worktree
   build_arm64_live_iso
 
-  stage "10/12 Remastering only boot-critical hardware content"
+  stage "11/13 Remastering boot hardware and profile-aware installer delivery"
   remaster_boot_hardware_only
 
-  stage "11/12 Verifying package-closure preservation and release artifacts"
+  stage "12/13 Verifying package closure, embedded OCI, installer, and release artifacts"
   verify_final_release
 
-  stage "12/12 Complete"
+  stage "13/13 Complete"
   cat "$RELEASE_DIR/BUILD-MANIFEST.txt"
 }
 
