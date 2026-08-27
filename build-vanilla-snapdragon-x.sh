@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r3
+# Version 8.5-r4
+#
+# v8.5-r4 final-release verifier correction for systemd enablement evidence
+# ----------------------------------------------------------------
+# r4 is deliberately narrow. The r3 service/autostart architecture is retained
+# unchanged. r4 corrects only a false-negative final-release check: the harness
+# runs with pipefail, while the r3 verifier piped `unsquashfs -ll` into
+# `grep -q`. After grep found the enablement symlink and exited successfully,
+# unsquashfs could receive SIGPIPE; pipefail then reported the whole pipeline as
+# failed. r4 reuses the complete squashfs listing already materialized earlier
+# in verify_final_release() and validates both the service enablement path and
+# the exact symlink target from that file.
 #
 # v8.5-r3 live OCI bridge lifecycle and autostart race correction
 # ----------------------------------------------------------------
@@ -342,7 +353,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r3"
+SCRIPT_VERSION="8.5-r4"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -6538,7 +6549,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r3.
+# Managed by VanillaOS-SnapdragonX v8.5-r4.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -6612,7 +6623,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r3-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r4-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
@@ -9516,8 +9527,15 @@ verify_final_release() {
       die "Final ISO OCI registry unit targets the wrong profile launcher."
     grep -Fq 'Restart=always' "$verify_dir/registry-service.unit" || \
       die "Final ISO OCI registry unit is not configured for supervised restart."
-    unsquashfs -ll "$final_squash" 2>/dev/null | \
-      grep -Fq "etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-oci-registry.service" || \
+    # v8.5-r4: reuse the complete squashfs listing captured above instead of
+    # piping a second unsquashfs process into grep -q. With global pipefail,
+    # grep -q may exit as soon as it finds the match, causing unsquashfs to
+    # receive SIGPIPE and the otherwise-successful pipeline to be reported as
+    # failed. Verify both the enablement path and its exact relative symlink
+    # target from the already-materialized listing.
+    grep -Fq \
+      "etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-oci-registry.service -> ../vanillaos-snapdragonx-oci-registry.service" \
+      "$squash_listing" || \
       die "Final ISO OCI registry service is not enabled in multi-user.target."
     grep -Fq 'VANILLAOS_SNAPDRAGONX_REGISTRY_SERVICE_CLIENT_V1' \
       "$verify_dir/installer-wrapper" || \
