@@ -1,359 +1,61 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r4
+# Version 8.5-r5
 #
-# v8.5-r4 final-release verifier correction for systemd enablement evidence
-# ----------------------------------------------------------------
-# r4 is deliberately narrow. The r3 service/autostart architecture is retained
-# unchanged. r4 corrects only a false-negative final-release check: the harness
-# runs with pipefail, while the r3 verifier piped `unsquashfs -ll` into
-# `grep -q`. After grep found the enablement symlink and exited successfully,
-# unsquashfs could receive SIGPIPE; pipefail then reported the whole pipeline as
-# failed. r4 reuses the complete squashfs listing already materialized earlier
-# in verify_final_release() and validates both the service enablement path and
-# the exact symlink target from that file.
+# ==== MILESTONE ==============================================================
+# v8.5-r5 — Vanilla OS 3.0 "Reunion" stable-release convergence
+# ============================================================================
+# Canonical accepted parent:
+#   build-vanilla-arm64-release-v8.5-r4.sh
+#   SHA-256 24b1b4d86dd4bf01c9d101d0f21e2d1908267d92814a2ad2c48f3f2695990180
 #
-# v8.5-r3 live OCI bridge lifecycle and autostart race correction
-# ----------------------------------------------------------------
-# Field installation of r2 proved that the canonical Installer recipe now
-# resolves the intended ISO-local logical image, but Albius later found no
-# listener at 127.0.0.1:5000. Current live-iso:orchid copies the stock
-# org.vanillaos.Installer.desktop into /etc/skel/.config/autostart before the
-# vanilla live user is created. r1/r2 additionally installed a second global
-# profile Installer autostart. Both launchers therefore raced through the
-# profile wrapper. Each wrapper also privately owned a background registry
-# process and killed its recorded PID on EXIT. Only one server could bind the
-# port; if that server belonged to the secondary Gio.Application launcher, the
-# secondary wrapper exited and killed the sole working bridge while the primary
-# Installer GUI continued. Connector/media speed changes could alter race
-# timing but cannot by themselves explain TCP connection-refused.
+# This milestone aligns the accepted v8.5-r4 Snapdragon X build architecture
+# with the formal Vanilla OS 3 Reunion release contract published 2026-08-24.
+# It deliberately does not begin the v8.6 simplification/refactoring program.
 #
-# r3 removes process ownership of the bridge from the GUI wrapper entirely. A
-# systemd system service owns the loopback registry for the lifetime of the
-# live system, restarts it on failure, and discovers the ISO medium itself. The
-# Installer wrapper only performs a bounded readiness/metadata integrity probe
-# and then starts the real Installer; it never kills the bridge. r3 also
-# converges on the upstream per-user Installer autostart when present and creates
-# a project fallback autostart only when upstream does not provide one, enforcing
-# exactly one automatic Installer launch path.
+# Stable Reunion convergence changes:
+#   - target base defaults to ghcr.io/vanilla-os/gnome:latest;
+#   - FsGuard generation/acquisition/evidence is removed because Reunion
+#     removed FsGuard from the stable boot/image composition;
+#   - project-owned executable payload moves out of ABRoot's writable
+#     /usr/local, /opt, and /root topology into immutable /usr/libexec and
+#     /usr/lib project namespaces;
+#   - stable VSO native identity is explicit: vso-native stack,
+#     ghcr.io/vanilla-os/vso:latest, managed apx-vso-native instance, with
+#     Debian testing recorded as the upstream VSO image base contract;
+#   - Distrobox v2/2.0.0-rc.4 coherence checks and opaque source-build version
+#     acceptance remain intact;
+#   - generic ARM64 remains upstream-owned through live-iso:orchid with
+#     LIVE_ARM64_PACKAGE_POLICY=upstream-native;
+#   - Pico remains the live/build substrate and the validated Podman runtime is
+#     the default for both OCI and live-ISO container execution;
+#   - moving stable OCI tags are resolved to manifest digests and emitted as
+#     build evidence;
+#   - the architecture-suffix naming change is audited without weakening the
+#     package-name-independent kernel and firmware intake engines.
 #
-# The old runtime self-test streamed and SHA-256 verified every embedded layer
-# before showing the GUI. With two racing wrappers this could read the complete
-# target OCI twice concurrently and made startup strongly media-speed dependent.
-# Build-time/export verification already binds the embedded target to its digest.
-# r3 therefore validates the runtime registry through /v2/, manifest digests, and
-# HEAD/size/digest checks for all referenced blobs without pre-reading every layer.
-# Albius still performs its normal content-verified pull during installation.
+# Inherited accepted r4 correction:
+#   - final squashfs systemd enablement evidence is checked against the complete
+#     materialized unsquashfs listing. No unsquashfs|grep-q pipeline is used
+#     under global pipefail, avoiding the accepted r3 false-negative/SIGPIPE.
 #
-# v8.5-r2 Reunion Distrobox coherence-gate correction
-# -----------------------------------------------------
-# Field building of r1 completed the target OCI but failed during target
-# verification because current upstream Distrobox reported:
-#     distrobox version dev
-# r1 incorrectly required the final version token to contain a numeric major.
-# Upstream Distrobox 2.0.0-rc.4 defines its build-time default Version as
-# "dev" and replaces it only when Git-derived VERSION metadata is available to
-# make. Vanilla core-image builds Distrobox from source through Vib's make
-# module, so an opaque token such as "dev" is a valid upstream build result.
-# APX 3.1.1 likewise treats the final --version token as opaque; it requires the
-# modern --version interface but does not parse semantic version components.
-# r2 therefore verifies the interface APX actually consumes. Numeric releases
-# remain range-checked (2.x, and rc.4+ for the 2.0.0 release-candidate line);
-# opaque source-build tokens are accepted only when the v2 command surface and
-# Vanilla's APX Distrobox helper/symlink layout are also present. No runtime
-# compatibility shim is added, and all r1 installation-path corrections remain.
+# Frozen project-owned behavior for this milestone:
+#   hardware profiles; package-semantic kernel intake/dependency closure; exact
+#   DTB selection; firmware provenance/board-data policy; Snapdragon boot
+#   arguments; live-only GDM timed login; external storage correctness guard;
+#   canonical Installer dispatcher and exactly-one autostart; systemd-owned
+#   ISO-local OCI Distribution v2 bridge; embedded target OCI; and deterministic
+#   target/final-ISO digest/evidence binding.
 #
-# v8.5-r1 installation-path regression correction
-# -------------------------------------------------
-# Field testing of the first 8.5 ISO proved that the current Reunion live
-# environment itself is healthy on Snapdragon X, including the GDM timed-login
-# correction, but exposed two release-harness defects:
-#   - Replacing the read-only squashfs extracted from the upstream ISO with a
-#     plain `mv` can trigger GNU mv's terminal overwrite prompt. The remaster
-#     now removes the immutable extracted destination explicitly before the
-#     new squashfs is moved into place, so Stage 12 is non-interactive.
-#   - The 8.5 live overlay generated and verified a profile-specific Installer
-#     recipe, but still left the stock /etc/vanilla-installer/recipe.json and
-#     stock /usr/bin/vanilla-installer launch path viable. Current Vanilla
-#     Installer is a single-instance Gio application and its stock recipe now
-#     defaults to ghcr.io/vanilla-os/gnome:latest. Any launch that did not
-#     inherit VANILLA_CUSTOM_RECIPE could therefore bypass the ISO-local OCI
-#     reference even though the embedded OCI layout and profile recipe were
-#     both correct. r1 makes the profile recipe the canonical live recipe and
-#     routes the stock installer executable through the profile wrapper, while
-#     retaining the original installer executable as a private real entrypoint.
-#     This guarantees that both automatic and manual launches start the local
-#     OCI bridge before the Installer and consume the same embedded image
-#     contract. Final verification now checks both recipe paths and the launcher
-#     dispatch chain.
-#
-# v8.5 Reunion convergence release
-# ---------------------------------
-# Canonical parent: v8.0.4-r4.1, SHA-256
-#   adc38fab5ae4ecdc3e0eadd611e323274b157147b3c8b44bf26383a1e17932cc
-#
-# This is a significant convergence release rather than an r4.x point fix.
-# Generic ARM64 enablement is now owned by the maturing upstream Reunion stack;
-# Snapdragon X hardware enablement and the offline/reproducible installation
-# architecture remain project-owned and are deliberately preserved.
-#
-# Reunion source/taxonomy reconciliation:
-#   - The installed target is a Vib custom OCI layered on the canonical Reunion
-#     development desktop image ghcr.io/vanilla-os/gnome:dev. The historical
-#     ghcr.io/vanilla-os/desktop:dev spelling is no longer the default.
-#   - Vanilla-OS/custom-image:main remains a scaffold/module source only. Its
-#     sample recipe taxonomy is not authoritative for the Reunion target base.
-#   - Vanilla-OS/live-iso:orchid remains the upstream branch identifier, but the
-#     current branch content identifies itself as Vanilla OS 3 / Reunion and
-#     now supports native ARM64 live builds.
-#   - LIVE_ARM64_PACKAGE_POLICY=upstream-native is the default. Current upstream
-#     architecture conditionals select ARM64 GRUB/shim and suppress AMD64-only
-#     microcode/VirtualBox content. The proven r4.1 explicit projection engine
-#     is retained intact as legacy-projection compatibility for historical refs.
-#   - The live build container default follows the current official workflow:
-#     ghcr.io/vanilla-os/pico:latest. The workflow-equivalent debootstrap
-#     prerequisite is installed inside that disposable build container before
-#     build.sh runs. Overrides remain supported.
-#   - Generated target recipes declare Vib recipe version 1.1.0 and the builder
-#     requires a Vib implementation compatible with that recipe generation.
-#
-# Reunion userland coherence gate:
-#   - The completed target must contain /usr/bin/distrobox, the current VSO
-#     native stack, both host hook placeholders, and a working `vso native`
-#     command surface. This specifically guards against the mixed-generation
-#     VSO/APX/Distrobox state diagnosed on the late-July/August test image.
-#   - The temporary recovery techniques used on that historical installation
-#     (OverlayFS path shims, Distrobox CLI translation, manual APX labels, and
-#     hook omission) are NOT incorporated into the built target.
-#
-# Live-session stability:
-#   - Integrates the tested live-only GDM timing correction: Debian live-config's
-#     gdm3 component is suppressed and GDM owns a short timed login for user
-#     `vanilla` (default 5 seconds, configurable 1..60). This policy is applied
-#     only to the live squashfs and is verified semantically in the final ISO.
-#
-# Identity/provenance contract:
-#   - Upstream base, local target build reference, ISO-embedded OCI manifest,
-#     installer logical reference, loopback physical transport, ABRoot logical
-#     identity, ABRoot future registry locator, and installation provenance are
-#     distinct layers. The release evidence records them separately.
-#   - ISO-local OCI installation remains first-class: the verified target OCI
-#     layout is embedded under /target-images/<profile>/ and served through the
-#     loopback OCI Distribution v2 bridge so installation requires no external
-#     target-image registry.
-#
-# Preserved project-owned implementation:
-#   - profile-driven, package-name-independent kernel selection and dependency
-#     closure; exact DTB selection; generic firmware package resolution and
-#     board-data policy; Snapdragon kernel arguments and evidence;
-#   - the r2 encrypted custom-layout storage guard and regression suite;
-#   - the r3 root-payload migration and installer transcript behavior;
-#   - the r4 profile/firmware schema and the r4.1 target-hook/embedded-digest
-#     verification boundary;
-#   - registry and ISO-local delivery modes, optional target publication,
-#     interactive/plan execution, hardware profiles, diagnostics, and all
-#     existing harness overrides unless explicitly superseded above.
-#
-# Architecture:
-#   - The installed system is a Vib custom OCI image layered on the current
-#     Reunion GNOME development image.
-#   - The graphical installer ISO is built from a clean official live-iso
-#     checkout using the upstream native ARM64 path whenever available.
-#   - Upstream package-list source files remain byte-identical. In the default
-#     policy the upstream ARCHITECTURES conditionals select the ARM64 closure;
-#     the historical explicit projection remains available only as a fallback.
-#   - The live filesystem remaster adds only profile/hardware requirements plus
-#     offline installer delivery and the live-session timing policy.
-#
-# v8.0.4-r4.1 final-artifact verification correction:
-#   - Corrects a stage-12 category error that attempted to read the installed
-#     target's ABRoot /var unlock hook from the live installer squashfs. The
-#     hook is target-OCI content and is not required in the live environment.
-#   - Imports the exported OCI layout under a temporary verification tag,
-#     exports and validates the hook from that exact content-addressed image,
-#     records its SHA-256, binds the evidence to the exported OCI manifest
-#     digest, and requires the final ISO's embedded manifest to match that exact
-#     digest. This proves the accepted hook is in the embedded target
-#     without duplicating it into or incorrectly inspecting the live squashfs.
-#   - Adds a required squashfs-file extraction helper so genuinely missing live
-#     installer overlay files fail with a contextual message rather than a raw
-#     unsquashfs "cat: no matches" termination.
-#   - Preserves the r4 firmware schema, r3 kernel intake, r2 storage guard,
-#     installer patches, package manifests, and generated target image content.
-#
-# v8.0.4-r4 profile-driven firmware package and board-data contract:
-#   - Promotes the hardware profile to schema version 2 and replaces the
-#     single hard-coded firmware-qcom-soc input with firmware.packages[].
-#   - Discovers firmware .deb inputs by Debian Package and Architecture control
-#     fields rather than filenames; package version strings and local filenames
-#     are opaque, while source, SHA-256, and expected-version pins remain
-#     deterministic and fail closed.
-#   - Supports required and optional firmware package roles, including split
-#     package sets such as firmware-qcom-soc plus firmware-qcom-dsp, without
-#     installing foreign-distribution firmware packages into the target.
-#   - Moves device firmware acceptance into firmware.required_paths[] and moves
-#     ATH11K board-data behavior into firmware.board_data.policy. Profiles that
-#     do not need replacement board-2 data use policy=none and inherit no HP
-#     WCN6855 checksum or subsystem predicates.
-#   - Retains schema-1 profile compatibility through an explicit in-memory
-#     migration to schema 2; HP compatibility profiles preserve the accepted
-#     103c:8d9a board-data and Adreno X1-45 requirements.
-#   - Generates a machine-readable firmware package lock, package inventory,
-#     extraction provenance, and resolved profile. Plan mode carries observed
-#     package hashes into the exact execute command through a JSON override.
-#   - Preserves the r3 package-name-independent kernel intake and the r2
-#     upstream-compatible encrypted custom-layout storage guard unchanged.
-#
-# v8.0.4-r3 package-name-independent kernel intake:
-#   - Selects the kernel by Debian payload semantics rather than Jens Glathe,
-#     Ubuntu, Debian, Armbian, flavour, ABI, or private-fork package naming.
-#   - Derives uname -r only from a regular /boot/vmlinuz-<release> member and
-#     accepts runtime modules from /lib/modules or /usr/lib/modules regardless
-#     of the binary package name that carries them.
-#   - Supports Debian's split linux-binary/linux-modules model, Ubuntu's
-#     linux-image-unsigned/linux-modules model, Armbian-style image packages,
-#     and locally named Debian packages when their payload is conventional.
-#   - Resolves a deterministic local Depends/Pre-Depends closure from supplied
-#     packages, including package-name-independent support packages, while
-#     leaving repository-resolvable dependencies to APT.
-#   - Adds an exact --kernel-image-deb selector for the rare case where more
-#     than one supplied package owns the same /boot/vmlinuz-<release>.
-#   - Canonicalizes staged .deb filenames from Package/Version/Architecture,
-#     eliminating reliance on input filenames and preventing basename clashes.
-#   - Fails closed on duplicate package identities with differing bytes,
-#     overlapping boot-critical payloads, unsupported vmlinux-only payloads,
-#     ambiguous image ownership, mixed architectures, or incomplete closures.
-#
-# v8.0.4-r2 encrypted custom-layout correction and project taxonomy:
-#   - Records the successful HP OmniBook 5 field milestone: encrypted /var now
-#     prompts correctly, all target volumes mount, and Adreno X1-45 is active.
-#   - Adds an external Albius recipe storage guard instead of modifying Vanilla
-#     Installer or Albius storage logic. The guard is compatible with an
-#     eventual upstream fix: correct storage metadata is preserved without
-#     duplicate operations, missing manual /var GPT metadata is repaired
-#     atomically, and ambiguous layouts fail.
-#   - Preflights custom/manual target identity, GPT partition-table support,
-#     partition number, parent disk, and existing vos-var PARTLABEL conflicts
-#     before Albius performs destructive setup operations.
-#   - Distinguishes automatic LVM /var (vos-var/var) from manual encrypted
-#     partition /var layouts and validates the correct initramfs discovery path
-#     for each topology before Albius can report installation success.
-#   - Adds synthetic regression tests for repaired, already-correct, automatic
-#     LVM, unencrypted, conflicting-label, duplicate-/var, and strict-policy
-#     recipes. Diagnostic recipe evidence is redacted, the live raw recipe is
-#     owner-readable only and removed after Albius exits, and LUKS passphrases
-#     are never copied into the support archive.
-#   - Renames project-owned comments, prompts, paths, services, evidence, OCI
-#     metadata, and artifacts from the retired project identity to
-#     VanillaOS-SnapdragonX. Vanilla-owned repository paths and ref names remain
-#     byte-for-byte compatible.
-#   - Uses the Vanilla OS 3.0 Reunion release taxonomy in project-facing text
-#     and artifact names while retaining Vanilla-owned upstream ref identifiers
-#     wherever changing them would break builds.
-#
-# v8.0.4-r1 checksum-bootstrap correction:
-#   - Keeps non-interactive execution fail-closed when the pinned Qualcomm
-#     firmware package lacks an expected SHA-256.
-#   - Allows read-only plan mode to observe the package SHA-256 and carry that
-#     exact value into the printed non-interactive execute command without
-#     modifying the artifact tree.
-#   - In interactive execute mode, presents an explicit trust decision: write
-#     an atomic package-specific .sha256 sidecar, enter an independently
-#     obtained SHA-256, or abort. No checksum is silently accepted.
-#   - Corrects checksum-source evidence assignment that was previously lost
-#     when the sidecar reader was invoked through command substitution.
-#
-# v8.0.4 closing milestone — Portable Build Root and Snapdragon X1-45 GPU
-# Enablement:
-#   - Derives the default project root from the canonical directory containing
-#     this script instead of from root's HOME after sudo. The harness can now be
-#     cloned beneath ~/src, ~/build, /opt/projects, or another location without
-#     creating compatibility symlinks or editing generated modules.
-#   - Resolves symlinked script invocation to a stable absolute SCRIPT_PATH and
-#     prints that path in the exact plan-to-execute command.
-#   - Treats profile-declared, SHA-256-pinned Debian firmware .debs as provenance-
-#     preserving sources and extracts them without installing foreign packages. The package is
-#     extracted, never installed into the VanillaOS image as a Sid package.
-#   - Layers generic package firmware first, then profile-specific firmware,
-#     and rejects non-identical duplicate destinations instead of silently
-#     overwriting either source.
-#   - Requires the canonical Adreno X1-45 firmware paths:
-#       qcom/gen71500_sqe.fw
-#       qcom/gen71500_gmu.bin
-#       qcom/x1p42100/gen71500_zap.mbn
-#     and rejects the invalid x1p4200 spelling and misplaced SQE/GMU copies.
-#   - Applies the profile's deduplicated kernel command-line additions to both
-#     live ISO GRUB entries and the installed ABRoot A-state configuration.
-#   - Preserves package metadata, firmware inventories, checksums, licensing,
-#     merge-conflict evidence, live GRUB evidence, and hardware diagnostics.
-#   - Adds target-side boot evidence and hardware-diagnostic collectors so the
-#     immutable installation can retain kernel/Adreno evidence under /var/log.
-#
-# v8.0.3 corrections after the first successful offline OCI installation
-# transfer and the subsequent installed-system verification failure:
-#   - Preserves image-provided content below /home, /mnt, /root, and /srv before
-#     Vanilla Installer relocates those paths to /var. The stock processor
-#     deleted the OCI /root payload before creating /root -> var/root, causing
-#     root-overlay checksum entries to report FAILED open or read.
-#   - Adds explicit installed-root migration evidence and verifies the resulting
-#     /root symlink, custom package archive, user-supplied root overlay, kernel,
-#     DTB, firmware, and ABRoot binding with named failure diagnostics.
-#   - Makes /etc/vanilla/installer.log a real Albius transcript. The installer
-#     VTE now runs Albius through root-owned bash/tee with pipefail, preserving
-#     the visible console output and the actual Albius exit status.
-#   - Persists the generated Albius recipe at
-#     /tmp/vanillaos-snapdragonx-albius-install-recipe.json for deterministic diagnosis.
-#   - Generates a live-system diagnostic collector at
-#     /usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics.
-#   - Rebuilds the profile launcher generator without the unquoted-heredoc
-#     expansion defect from v8.0.1 and without the duplicated runtime body that
-#     was present in the superseded v8.0.2 draft.
-#   - Preserves v8.0.1 logical-to-physical registry remapping, complete OCI
-#     manifest/blob self-test, hardware-profile support, and all v7 live-boot
-#     kernel, firmware, DTB, graphical, and GRUB safeguards.
-#
-# v8.0.1 corrections after the first offline-installer field test:
-#   - Separates the logical image name consumed by Albius from the physical
-#     loopback endpoint. The installer now uses a port-free logical reference
-#     under oci.vanillaos-snapdragonx.invalid, remapped by containers/image to
-#     127.0.0.1:<port>.
-#   - Avoids an Albius/Prometheus storage-name defect. Prometheus replaces '/'
-#     but not ':' when creating its containers-storage destination name; a
-#     source containing both ':<port>' and ':<tag>' therefore becomes invalid
-#     after manifest discovery and before any layer blobs are requested.
-#   - Keeps the bridge on loopback plaintext HTTP with an explicit insecure
-#     registry rule. HTTPS ClientHello probes are expected fallback behavior and
-#     are suppressed from the local bridge log.
-#   - Adds a complete local bridge self-test that validates the tag manifest,
-#     nested OCI indexes, config, layers, sizes, and SHA-256 digests before
-#     Vanilla Installer is launched.
-#   - Records both logical and physical registry references in release evidence.
-#
-# v8.0.0 installed-image architecture:
-#   - Freezes v7.0.13 as the proven bootable live-environment milestone and
-#     extends it without modifying the frozen milestone artifact.
-#   - Loads hardware-specific kernel, DTB, firmware, overlay, image, installer,
-#     and validation settings from a declarative JSON hardware profile. CLI and
-#     environment values override the profile; ambiguous discovery fails closed.
-#   - Exports the verified custom target image to an OCI image layout and embeds
-#     that layout on the installation ISO beneath /target-images/<profile>/.
-#   - Provides an offline loopback registry bridge over the embedded OCI layout,
-#     allowing the unmodified Albius OCI pull path to consume the ISO-local image
-#     without external network or registry access.
-#   - Installs a profile-specific Vanilla Installer recipe and autostart wrapper.
-#     The embedded hardware image is the default; IGNORE_CPU=1 is applied by the
-#     wrapper and the custom-image screen remains available as an override.
-#   - Patches the live installer processor so installed ABRoot state uses the
-#     explicit vanillaos-snapdragonx kernel/DTB/profile markers rather than module-directory
-#     sort order, copies the selected DTB into the A/B init-volume layout, writes
-#     a DTB-aware A-state abroot.cfg, and validates installed boot artifacts.
-#   - Preserves the v7.0.13 graphical closure, source provenance, ARM64 package
-#     candidate preflight, Vib/FsGuard, target receipt, and live GRUB safeguards.
+# Naming transition:
+#   v8.5-r4 and earlier: build-vanilla-arm64-release-v<version>*
+#   v8.5-r5 and later:   build-vanilla-snapdragon-x-v<version>*
+# Version numbering remains continuous; only the artifact basename changes.
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r4"
+SCRIPT_VERSION="8.5-r5"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -398,6 +100,7 @@ ENV_FIRMWARE_PACKAGE_OVERRIDES_SET="${FIRMWARE_PACKAGE_OVERRIDES_JSON+x}"
 ENV_KERNEL_RELEASE_SET="${EXPECTED_CUSTOM_KERNEL_RELEASE+x}"
 ENV_KERNEL_RELEASE_POLICY_SET="${KERNEL_RELEASE_POLICY+x}"
 ENV_CUSTOM_IMAGE_BASE_SET="${CUSTOM_IMAGE_BASE+x}"
+ENV_VSO_NATIVE_IMAGE_SET="${VSO_NATIVE_IMAGE+x}"
 ENV_TARGET_IMAGE_SET="${TARGET_IMAGE_REF+x}"
 ENV_TARGET_REPOSITORY_SET="${TARGET_IMAGE_REPOSITORY+x}"
 ENV_ABROOT_IMAGE_SET="${ABROOT_IMAGE_NAME+x}"
@@ -467,18 +170,29 @@ KERNEL_RELEASE_POLICY="${KERNEL_RELEASE_POLICY:-prefer}"
 
 CUSTOM_IMAGE_REPO_URL="${CUSTOM_IMAGE_REPO_URL:-https://github.com/Vanilla-OS/custom-image.git}"
 CUSTOM_IMAGE_REF="${CUSTOM_IMAGE_REF:-main}"
-CUSTOM_IMAGE_BASE="${CUSTOM_IMAGE_BASE:-ghcr.io/vanilla-os/gnome:dev}"
+CUSTOM_IMAGE_BASE="${CUSTOM_IMAGE_BASE:-ghcr.io/vanilla-os/gnome:latest}"
+VSO_NATIVE_IMAGE="${VSO_NATIVE_IMAGE:-ghcr.io/vanilla-os/vso:latest}"
+VSO_NATIVE_STACK="vso-native"
+VSO_NATIVE_INSTANCE="apx-vso-native"
+VSO_NATIVE_UPSTREAM_BASE="debian:testing"
 
 LIVE_ISO_REPO_URL="${LIVE_ISO_REPO_URL:-https://github.com/Vanilla-OS/live-iso.git}"
 LIVE_ISO_REF="${LIVE_ISO_REF:-orchid}"
 SOURCE_STALE_WARN_DAYS="${SOURCE_STALE_WARN_DAYS:-180}"
 LIVE_ISO_CONTAINER_IMAGE="${LIVE_ISO_CONTAINER_IMAGE:-ghcr.io/vanilla-os/pico:latest}"
-LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-docker}"
 
-# Current upstream Reunion owns generic ARM64 package selection through
-# live-build ARCHITECTURES conditionals. Keep the r4.1 projection engine as an
-# explicit compatibility path for historical refs, but never apply it silently
-# to a current upstream tree.
+# Both harness OCI construction and the official Pico live-ISO runtime shape
+# have been validated under Podman on the Reunion self-buildhost. Keep either
+# variable overridable for hosts that deliberately use another compatible OCI
+# runtime, but converge on Podman by default.
+OCI_RUNTIME="${OCI_RUNTIME:-podman}"
+LIVE_ISO_RUNTIME="${LIVE_ISO_RUNTIME:-$OCI_RUNTIME}"
+OCI_BUILD_NETWORK="${OCI_BUILD_NETWORK:-host}"
+
+# Stable Reunion owns generic ARM64 package selection through live-build
+# ARCHITECTURES conditionals. Keep the r4.1 projection engine only as an
+# explicit compatibility path for historical refs; never apply it silently to
+# the current Reunion tree.
 LIVE_ARM64_PACKAGE_POLICY="${LIVE_ARM64_PACKAGE_POLICY:-upstream-native}"
 
 # Legacy projection compatibility contract. These are the exact exclusions
@@ -494,8 +208,6 @@ QCOM_UPDATER_REF="${QCOM_UPDATER_REF:-main}"
 QCOM_DEVICE_PATH_DEFAULT="${QCOM_DEVICE_PATH_DEFAULT:-x1p42100/hp/omnibook-5}"
 QCOM_DEVICE_PATH="${QCOM_DEVICE_PATH:-$QCOM_DEVICE_PATH_DEFAULT}"
 
-OCI_RUNTIME="${OCI_RUNTIME:-podman}"
-OCI_BUILD_NETWORK="${OCI_BUILD_NETWORK:-host}"
 TARGET_IMAGE_REPOSITORY="${TARGET_IMAGE_REPOSITORY:-}"
 TARGET_IMAGE_REF="${TARGET_IMAGE_REF:-}"
 ABROOT_IMAGE_NAME="${ABROOT_IMAGE_NAME:-}"
@@ -526,12 +238,6 @@ VIB_VERSION="${VIB_VERSION:-1.1.0}"
 VIB_RECIPE_VERSION="${VIB_RECIPE_VERSION:-1.1.0}"
 VIB_BIN="${VIB_BIN:-}"
 VIB_DETECTED_VERSION=""
-FSGUARD_PLUGIN_REPO="${FSGUARD_PLUGIN_REPO:-Vanilla-OS/vib-fsguard}"
-FSGUARD_PLUGIN_VERSION="${FSGUARD_PLUGIN_VERSION:-auto}"
-FSGUARD_PLUGIN_FILE=""
-FSGUARD_PLUGIN_RESOLVED_TAG=""
-FSGUARD_PLUGIN_RELEASE_METADATA=""
-FSGUARD_PLUGIN_ASSET_URL=""
 
 REPO_POLICY="${REPO_POLICY:-ask-once}"
 FIRMWARE_MODE="${FIRMWARE_MODE:-ask}"
@@ -602,6 +308,8 @@ TARGET_ABROOT_CONFIG_EVIDENCE=""
 TARGET_BASE_INSPECT_JSON=""
 TARGET_USERLAND_COHERENCE_REPORT=""
 REUNION_CONVERGENCE_MANIFEST=""
+UPSTREAM_OCI_PROVENANCE_JSON=""
+REUNION_ARCHITECTURE_NAME_AUDIT=""
 
 # Discovered inputs.
 declare -a KERNEL_DEBS=()
@@ -658,7 +366,6 @@ stage() {
   # new command log. Clear the previous stage's path so the error handler never
   # presents stale output as though it belonged to the current failure.
   CURRENT_LOG=""
-
   printf '\n[%s]\n' "$CURRENT_STAGE"
 }
 
@@ -684,9 +391,6 @@ normalize_path_input() {
 }
 
 canonicalize_workdir() {
-  # readlink -m canonicalizes an absolute or relative path without requiring
-  # every component to exist. Relative explicit workdirs are resolved from the
-  # caller's current directory; the default is already the absolute SCRIPT_DIR.
   local value
   value="$(normalize_path_input "$1")"
   [[ -n "$value" ]] || die "WORKDIR resolved empty"
@@ -845,7 +549,7 @@ run_logged() {
 # ------------------------------- usage ----------------------------------
 
 usage() {
-  cat <<EOF
+  cat <<EOF_USAGE
 Usage:
   sudo $SCRIPT_NAME [--execute|--plan] [options]
 
@@ -865,13 +569,16 @@ Options:
   --profile-file PATH             Hardware-profile JSON manifest.
   --artifact-dir PATH             Profile artifact directory.
   --kernel-deb-dir PATH           Directory containing Debian kernel-related .debs.
-  --kernel-image-deb PATH          Exact package owning /boot/vmlinuz-<release>
+  --kernel-image-deb PATH         Exact package owning /boot/vmlinuz-<release>
                                   when more than one supplied package qualifies.
   --kernel-release RELEASE        Preferred or required exact uname -r.
   --kernel-release-policy POLICY  prefer, require, or auto. Default: prefer.
   --dtb-file PATH                 Exact DTB source file.
   --dtb-name NAME                 Installed DTB filename.
-  --root-source PATH              Directory copied into target OCI /root.
+  --root-source PATH              Legacy root-overlay source. In Reunion r5 its
+                                  contents are preserved beneath immutable
+                                  /usr/lib/vanillaos-snapdragonx/root-source-overlay
+                                  rather than written to ABRoot's /root.
   --firmware-dir PATH             Profile-specific firmware tree; paths are
                                   relative to /usr/lib/firmware.
   --qcom-soc-firmware-deb PATH    Legacy override for the firmware-qcom-soc package.
@@ -897,39 +604,32 @@ Checksum pin behavior:
                                   to the loopback bridge. Default:
                                   oci.vanillaos-snapdragonx.invalid
   --storage-guard-policy POLICY   Encrypted /var recipe policy: repair, strict,
-                                  or off. Default: repair. "repair" preserves
-                                  an upstream-correct namepart operation and
-                                  inserts it only when manual encrypted /var
-                                  lacks GPT PARTLABEL vos-var.
-  --live-package-policy POLICY   upstream-native or legacy-projection.
-                                  Default: upstream-native. The legacy mode
-                                  preserves the accepted r4.1 explicit package
-                                  projection for historical live-iso refs.
-  --live-gdm-delay SECONDS       Timed login delay for live user vanilla.
+                                  or off. Default: repair.
+  --live-package-policy POLICY    upstream-native or legacy-projection.
+                                  Default: upstream-native.
+  --live-gdm-delay SECONDS        Timed login delay for live user vanilla.
                                   Default: 5; valid range: 1..60.
   --live-ref REF                  live-iso branch, tag, or commit.
   --custom-image-ref REF          custom-image branch, tag, or commit.
   --push-target-image             Push target OCI after local verification.
   -h, --help                      Show this help.
 
-Source-reference strategy:
+Stable Reunion source contract:
   custom-image Git checkout: main branch (scaffold/modules only)
-  live-iso Git checkout:     orchid (current content: Vanilla OS 3 / Reunion)
-  target OCI base:           ghcr.io/vanilla-os/gnome:dev
+  live-iso Git checkout:     orchid (Vanilla OS 3 / Reunion)
+  target OCI base:           ghcr.io/vanilla-os/gnome:latest
   live build container:      ghcr.io/vanilla-os/pico:latest
+  VSO native image:          ghcr.io/vanilla-os/vso:latest
+  VSO managed instance:      apx-vso-native
+  VSO upstream base:         debian:testing
   live package policy:       upstream-native
 
-  Branch names, image names, and tags are separate taxonomies. Exact Git commit
-  SHAs and resolved OCI evidence are recorded. custom-image's sample
-  desktop:main base is intentionally ignored when this harness generates its
-  target recipe. The current desktop development image is gnome:dev.
+  Branch names, image names, tags, and resolved digests are separate taxonomy
+  layers. Exact Git commits and moving OCI tag digests are recorded as evidence.
 
 Vib toolchain defaults:
   VIB_VERSION=1.1.0
-  FSGUARD_PLUGIN_REPO=Vanilla-OS/vib-fsguard
-  FSGUARD_PLUGIN_VERSION=auto     Select newest release containing the exact
-                                  fsguard-<host-arch>.so asset.
-  GITHUB_TOKEN=<optional>         Raise GitHub API rate limits.
+  VIB_RECIPE_VERSION=1.1.0
   LIVE_GDM_TIMED_LOGIN_DELAY=5   Live-only GDM timed login (1..60 seconds).
 
 ARM64 live-ISO package policy:
@@ -945,9 +645,6 @@ ARM64 live-ISO package policy:
     LIVE_ARM64_EXCLUDE_PACKAGES=grub-efi-amd64,grub-efi-amd64-bin,
         grub-efi-amd64-signed,shim-helpers-amd64-signed,intel-microcode,
         amd64-microcode,iucode-tool,virtualbox-guest-utils,virtualbox-guest-x11
-
-  Legacy projection uses the unchanged r4.1 explicit allowlist and candidate
-  preflight. It is not invoked for a current upstream Reunion tree.
 
 Hardware profile lookup order:
   --profile-file PATH
@@ -988,15 +685,15 @@ Firmware package names are discovered by Debian control metadata. Profile-requir
   qcom/gen71500_gmu.bin
   qcom/x1p42100/gen71500_zap.mbn
 
-Target /root overlay used by the current project tree:
-  WORKDIR/artifacts/root/
+Legacy root-overlay input is preserved as immutable project data at:
+  /usr/lib/vanillaos-snapdragonx/root-source-overlay/
 
-Compatibility paths:
+Compatibility input paths:
   ARTIFACT_DIR/*.deb
   ARTIFACT_DIR/*.dtb
   ARTIFACT_DIR/root/
   WORKDIR/root-overlay/$PROFILE/
-EOF
+EOF_USAGE
 }
 
 preparse_profile_args() {
@@ -1128,9 +825,10 @@ recompute_paths() {
   TARGET_BASE_INSPECT_JSON="$TMP_ROOT/target-base-inspect.json"
   TARGET_USERLAND_COHERENCE_REPORT="$TMP_ROOT/target-userland-coherence.txt"
   REUNION_CONVERGENCE_MANIFEST="$TMP_ROOT/reunion-convergence.tsv"
+  UPSTREAM_OCI_PROVENANCE_JSON="$TMP_ROOT/upstream-oci-provenance.json"
+  REUNION_ARCHITECTURE_NAME_AUDIT="$TMP_ROOT/reunion-architecture-name-audit.txt"
   KERNEL_PACKAGE_CLOSURE_JSON="$TMP_ROOT/kernel-package-closure.json"
 }
-
 
 resolve_profile_path() {
   local value="$1"
@@ -1162,8 +860,6 @@ array_has_value() {
 }
 
 append_unique_values() {
-  # Append values to a named indexed array without creating duplicate entries.
-  # Bash namerefs keep the call sites readable while retaining strict quoting.
   local array_name="$1"
   shift
   local -n target_array="$array_name"
@@ -1578,10 +1274,12 @@ load_hardware_profile() {
 
   if [[ -z "$ENV_CUSTOM_IMAGE_BASE_SET" ]]; then
     value="$(jq -r '.target_image.base // empty' "$PROFILE_FILE_RESOLVED")"
-    if [[ "$value" == "ghcr.io/vanilla-os/desktop:dev" ]]; then
-      warn "Profile uses retired Reunion development taxonomy desktop:dev; resolving to canonical gnome:dev for v$SCRIPT_VERSION."
-      value="ghcr.io/vanilla-os/gnome:dev"
-    fi
+    case "$value" in
+      ghcr.io/vanilla-os/desktop:dev|ghcr.io/vanilla-os/gnome:dev)
+        warn "Profile uses pre-release Reunion desktop taxonomy '$value'; resolving to stable ghcr.io/vanilla-os/gnome:latest for v$SCRIPT_VERSION."
+        value="ghcr.io/vanilla-os/gnome:latest"
+        ;;
+    esac
     [[ -z "$value" ]] || CUSTOM_IMAGE_BASE="$value"
   fi
   if [[ -z "$ENV_TARGET_REPOSITORY_SET" ]]; then
@@ -1639,8 +1337,7 @@ load_hardware_profile() {
   apply_legacy_firmware_package_override
   apply_firmware_package_json_overrides
   validate_firmware_package_specs
-  printf '[]
-' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
+  printf '[]\n' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
   reconcile_profile_hardware_requirements
 
   [[ "$ISO_IMAGE_LAYOUT_PATH" == /target-images/* ]] || \
@@ -1818,8 +1515,6 @@ setup_logging() {
   info "Builder log: $log_file"
 }
 
-# ---------------------- interactive configuration -----------------------
-
 normalize_repo_policy() {
   case "${REPO_POLICY,,}" in
     ask|ask-once|once) REPO_POLICY="ask-once" ;;
@@ -1920,14 +1615,14 @@ choose_root_overlay() {
 
   local choice default_desc
   default_desc="${ROOT_SOURCE:-none detected}"
-  choice="$(menu "Target OCI /root Overlay\n\nFiles below the selected directory are copied into /root in the custom target OCI. They are not added to the live installer ISO.\n\nDetected/default path:\n  $default_desc" "1" \
-    "1|Use the detected/default /root source|Use WORKDIR/artifacts/root when present, then profile-local compatibility paths." \
-    "2|Choose another directory|Enter a directory whose contents should become /root/." \
-    "3|Skip the /root overlay|Build the target OCI without additional /root content." \
+  choice="$(menu "Legacy Root Overlay Compatibility Input\n\nReunion makes /root persistent through /var/root. r5 therefore preserves any selected legacy root-overlay bytes under immutable /usr/lib/vanillaos-snapdragonx/root-source-overlay instead of placing project payload in /root.\n\nDetected/default path:\n  $default_desc" "1" \
+    "1|Use the detected/default compatibility source|Preserve the source under the project immutable-data namespace." \
+    "2|Choose another directory|Enter a directory whose contents should be preserved as compatibility data." \
+    "3|Skip the legacy root overlay|Build without additional compatibility content." \
     "4|Open a shell before choosing|Inspect the artifact tree and return.")"
   case "$choice" in
     1) [[ -z "$ROOT_SOURCE" || -d "$ROOT_SOURCE" ]] || die "Default root source does not exist: $ROOT_SOURCE" ;;
-    2) ROOT_SOURCE="$(prompt_path "Directory copied into target /root" "${ROOT_SOURCE:-$WORKDIR/artifacts/root}")"; [[ -d "$ROOT_SOURCE" ]] || die "Root source does not exist: $ROOT_SOURCE" ;;
+    2) ROOT_SOURCE="$(prompt_path "Legacy root-overlay compatibility directory" "${ROOT_SOURCE:-$WORKDIR/artifacts/root}")"; [[ -d "$ROOT_SOURCE" ]] || die "Root source does not exist: $ROOT_SOURCE" ;;
     3) ROOT_SOURCE="" ;;
     4) open_shell "$WORKDIR/artifacts"; choose_root_overlay ;;
   esac
@@ -2058,30 +1753,6 @@ choose_target_image() {
   fi
   [[ "$ABROOT_IMAGE_NAME" == "${ABROOT_IMAGE_NAME,,}" ]] || die "ABROOT_IMAGE_NAME must be lowercase: $ABROOT_IMAGE_NAME"
   [[ "$ABROOT_IMAGE_NAME" == */* ]] || warn "ABROOT_IMAGE_NAME normally has owner/image form: $ABROOT_IMAGE_NAME"
-}
-
-print_builder_banner() {
-  cat >&2 <<EOF
-
-${C_BOLD}VanillaOS-SnapdragonX ARM64 Container-Model Builder${C_RESET}
-Version: $SCRIPT_VERSION
-
-Work directory:   $WORKDIR
-Profile:          $PROFILE ($PROFILE_DISPLAY_NAME)
-Profile source:   $PROFILE_FILE_SOURCE
-Profile normalized:$PROFILE_FILE_RESOLVED
-Artifact default: $ARTIFACT_DIR
-Sources:          $SOURCES_DIR
-
-v$SCRIPT_VERSION applies the selected Git source action before the remaining
-artifact, firmware, target-image, and build-confirmation questions. --execute
-does not suppress interactive questions.
-EOF
-}
-
-configure_repository_interactively() {
-  print_builder_banner
-  choose_repo_policy
 }
 
 choose_installer_delivery() {
@@ -2239,62 +1910,37 @@ package_field() {
 
 write_deb_content_listing() {
   local deb="$1" output="$2"
-  # Do not pipe dpkg-deb into grep -q. A consumer that exits early closes the
-  # pipe and makes dpkg-deb report a SIGPIPE/Broken pipe diagnostic. Complete
-  # the archive listing first, then inspect the stable file.
   dpkg-deb -c "$deb" > "$output"
 }
 
 deb_listing_has_regular_boot_kernel() {
-  # A boot kernel must be a regular archive member. Directories and symlinks do
-  # not qualify. Package names are deliberately irrelevant.
   local listing="$1" release="$2"
   awk -v release="$release" '
-    $1 ~ /^-/ {
-      path=$NF
-      sub(/^\.\//, "", path)
-      if (path == "boot/vmlinuz-" release) found=1
-    }
+    $1 ~ /^-/ { path=$NF; sub(/^\.\//, "", path); if (path == "boot/vmlinuz-" release) found=1 }
     END { exit(found ? 0 : 1) }
   ' "$listing"
 }
 
 deb_listing_has_runtime_module_object() {
-  # Header packages may carry /lib/modules/<release>/build symlinks. Require a
-  # regular kernel object, including Debian-family compressed module formats.
   local listing="$1" release="$2"
   awk -v release="$release" '
     $1 ~ /^-/ {
-      path=$NF
-      sub(/^\.\//, "", path)
-      prefix1="lib/modules/" release "/"
-      prefix2="usr/lib/modules/" release "/"
-      if ((index(path, prefix1) == 1 || index(path, prefix2) == 1) &&
-          path ~ /\.ko(\.(gz|xz|zst))?$/) {
-        found=1
-      }
+      path=$NF; sub(/^\.\//, "", path)
+      prefix1="lib/modules/" release "/"; prefix2="usr/lib/modules/" release "/"
+      if ((index(path, prefix1) == 1 || index(path, prefix2) == 1) && path ~ /\.ko(\.(gz|xz|zst))?$/) found=1
     }
     END { exit(found ? 0 : 1) }
   ' "$listing"
 }
 
 deb_listing_has_kernel_auxiliary_payload() {
-  # Accept release-bound support payloads independently of package taxonomy.
-  # This covers downstream DTB/config/System.map packages without assuming
-  # Debian, Ubuntu, Armbian, or private-fork binary package names.
   local listing="$1" release="$2"
   awk -v release="$release" '
     $1 ~ /^-/ {
-      path=$NF
-      sub(/^\.\//, "", path)
-      if (path == "boot/config-" release ||
-          path == "boot/System.map-" release ||
-          index(path, "usr/lib/linux-image-" release "/") == 1 ||
-          index(path, "lib/linux-image-" release "/") == 1 ||
-          index(path, "boot/dtb-" release "/") == 1 ||
-          index(path, "boot/dtb/" release "/") == 1) {
-        found=1
-      }
+      path=$NF; sub(/^\.\//, "", path)
+      if (path == "boot/config-" release || path == "boot/System.map-" release ||
+          index(path, "usr/lib/linux-image-" release "/") == 1 || index(path, "lib/linux-image-" release "/") == 1 ||
+          index(path, "boot/dtb-" release "/") == 1 || index(path, "boot/dtb/" release "/") == 1) found=1
     }
     END { exit(found ? 0 : 1) }
   ' "$listing"
@@ -2307,14 +1953,9 @@ kernel_deb_listing_path() {
 }
 
 kernel_deb_canonical_name() {
-  # Input filenames are not trusted as package identity. Construct a stable
-  # collision-resistant staging name from Debian control metadata.
   local deb="$1" pkg version arch safe_version
-  pkg="$(package_field "$deb" Package)"
-  version="$(package_field "$deb" Version)"
-  arch="$(package_field "$deb" Architecture)"
-  [[ -n "$pkg" && -n "$version" && -n "$arch" ]] || \
-    die "Unable to construct canonical package name for $deb"
+  pkg="$(package_field "$deb" Package)"; version="$(package_field "$deb" Version)"; arch="$(package_field "$deb" Architecture)"
+  [[ -n "$pkg" && -n "$version" && -n "$arch" ]] || die "Unable to construct canonical package name for $deb"
   safe_version="$(printf '%s' "$version" | sed -E 's/:/%3A/g; s/[^A-Za-z0-9.+~_=%-]/_/g')"
   printf '%s_%s_%s.deb' "$pkg" "$safe_version" "$arch"
 }
@@ -2322,46 +1963,25 @@ kernel_deb_canonical_name() {
 select_kernel_release_from_candidates() {
   local -a releases=("$@")
   mapfile -t releases < <(printf '%s\n' "${releases[@]}" | sed '/^$/d' | sort -u)
-
   if [[ -n "$EXPECTED_CUSTOM_KERNEL_RELEASE" && "$KERNEL_RELEASE_POLICY" != "auto" ]]; then
     local r found=0
     for r in "${releases[@]}"; do [[ "$r" == "$EXPECTED_CUSTOM_KERNEL_RELEASE" ]] && found=1; done
-    if (( found == 1 )); then
-      printf '%s' "$EXPECTED_CUSTOM_KERNEL_RELEASE"
-      return
-    fi
-    if [[ "$KERNEL_RELEASE_POLICY" == "require" ]]; then
-      die "Required kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' was not found in a regular /boot/vmlinuz-* payload. Detected: ${releases[*]:-none}"
-    fi
+    if (( found == 1 )); then printf '%s' "$EXPECTED_CUSTOM_KERNEL_RELEASE"; return; fi
+    [[ "$KERNEL_RELEASE_POLICY" != "require" ]] || die "Required kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' was not found. Detected: ${releases[*]:-none}"
     warn "Preferred kernel release '$EXPECTED_CUSTOM_KERNEL_RELEASE' is absent; selecting from detected payload releases: ${releases[*]:-none}"
   fi
-
   ((${#releases[@]} > 0)) || die "No kernel release could be derived from a regular /boot/vmlinuz-<release> package payload."
-  if ((${#releases[@]} == 1)); then
-    printf '%s' "${releases[0]}"
-    return
-  fi
-
-  if ! is_interactive; then
-    die "Multiple kernel releases detected from package payloads: ${releases[*]}. Set EXPECTED_CUSTOM_KERNEL_RELEASE or --kernel-release."
-  fi
-
+  if ((${#releases[@]} == 1)); then printf '%s' "${releases[0]}"; return; fi
+  if ! is_interactive; then die "Multiple kernel releases detected: ${releases[*]}. Set --kernel-release."; fi
   local options=() i=1 choice r
-  for r in "${releases[@]}"; do
-    options+=("$i|Use kernel release $r|Select this exact uname -r value for target OCI and live ISO boot artifacts.")
-    i=$((i+1))
-  done
+  for r in "${releases[@]}"; do options+=("$i|Use kernel release $r|Select this exact uname -r."); i=$((i+1)); done
   choice="$(menu "Multiple Kernel Releases Detected" "1" "${options[@]}")"
   printf '%s' "${releases[$((choice-1))]}"
 }
 
 classify_kernel_deb_for_target() {
-  # Classification is descriptive only. Runtime selection is based on payload
-  # and dependency closure, never on the Package field naming convention.
   local deb="$1" pkg listing
-  pkg="$(package_field "$deb" Package)"
-  listing="$(kernel_deb_listing_path "$deb")"
-
+  pkg="$(package_field "$deb" Package)"; listing="$(kernel_deb_listing_path "$deb")"
   if [[ -f "$listing" ]] && awk '$1 ~ /^-/ {p=$NF; sub(/^\.\//,"",p); if (p ~ /^boot\/vmlinuz-/) f=1} END{exit(f?0:1)}' "$listing"; then
     printf '%s\n' kernel-image
   elif [[ -f "$listing" ]] && awk '$1 ~ /^-/ {p=$NF; sub(/^\.\//,"",p); if (p ~ /^(usr\/)?lib\/modules\/[^/]+\/.*\.ko(\.(gz|xz|zst))?$/) f=1} END{exit(f?0:1)}' "$listing"; then
@@ -2378,53 +1998,40 @@ classify_kernel_deb_for_target() {
 }
 
 array_contains_exact() {
-  local needle="$1"
-  shift
-  local item
-  for item in "$@"; do
-    [[ "$item" == "$needle" ]] && return 0
-  done
+  local needle="$1"; shift; local item
+  for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
   return 1
 }
 
 kernel_deb_selection_role() {
   local deb="$1"
   [[ -s "$KERNEL_PACKAGE_CLOSURE_JSON" ]] || { printf 'reference-only'; return 0; }
-  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .role' \
-    "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
+  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .role' "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
 }
 
 kernel_deb_selection_reason() {
   local deb="$1"
   [[ -s "$KERNEL_PACKAGE_CLOSURE_JSON" ]] || { printf 'not selected'; return 0; }
-  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .reason' \
-    "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
+  jq -r --arg path "$deb" '.selected[]? | select(.path == $path) | .reason' "$KERNEL_PACKAGE_CLOSURE_JSON" | sed -n '1p'
 }
 
 write_kernel_package_selection_manifest() {
   local manifest="$TMP_ROOT/kernel-package-selection.tsv"
   local deb pkg version arch class target live role reason archive_name
-
   {
     printf 'package\tversion\tarchitecture\tclass\tclosure_role\ttarget_install\tlive_extract\tarchive_path\tsource_deb\treason\n'
     for deb in "${KERNEL_DEBS[@]}"; do
-      pkg="$(package_field "$deb" Package)"
-      version="$(package_field "$deb" Version)"
-      arch="$(package_field "$deb" Architecture)"
-      class="$(classify_kernel_deb_for_target "$deb")"
-      role="$(kernel_deb_selection_role "$deb")"
-      reason="$(kernel_deb_selection_reason "$deb")"
+      pkg="$(package_field "$deb" Package)"; version="$(package_field "$deb" Version)"; arch="$(package_field "$deb" Architecture)"
+      class="$(classify_kernel_deb_for_target "$deb")"; role="$(kernel_deb_selection_role "$deb")"; reason="$(kernel_deb_selection_reason "$deb")"
       archive_name="$(kernel_deb_canonical_name "$deb")"
-      target=no
-      live=no
+      target=no; live=no
       array_contains_exact "$deb" "${TARGET_KERNEL_DEBS[@]}" && target=yes
       array_contains_exact "$deb" "${LIVE_KERNEL_DEBS[@]}" && live=yes
       [[ -n "$role" ]] || role=reference-only
       [[ -n "$reason" ]] || reason="not selected for $KERNEL_RELEASE"
-
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$pkg" "$version" "$arch" "$class" "$role" "$target" "$live" \
-        "/root/custom-kernel-packages/$archive_name" "$deb" "$reason"
+        "/usr/lib/vanillaos-snapdragonx/kernel-packages/$archive_name" "$deb" "$reason"
     done
   } > "$manifest"
 }
@@ -2441,2204 +2048,543 @@ import subprocess
 import sys
 from collections import defaultdict, deque
 
-
 def die(message: str) -> None:
     print(f"kernel package closure: {message}", file=sys.stderr)
     raise SystemExit(2)
 
-
 def field(path: str, name: str) -> str:
-    proc = subprocess.run(
-        ["dpkg-deb", "-f", path, name],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    proc = subprocess.run(["dpkg-deb", "-f", path, name], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     return proc.stdout.strip() if proc.returncode == 0 else ""
-
 
 def sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(chunk)
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""): h.update(chunk)
     return h.hexdigest()
 
-
 def parse_listing(path: str):
-    proc = subprocess.run(
-        ["dpkg-deb", "-c", path],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        die(f"cannot list {path}: {proc.stderr.strip()}")
+    proc = subprocess.run(["dpkg-deb", "-c", path], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0: die(f"cannot list {path}: {proc.stderr.strip()}")
     regular = []
     for line in proc.stdout.splitlines():
         parts = line.split(None, 5)
-        if len(parts) < 6:
-            continue
+        if len(parts) < 6: continue
         mode, raw_path = parts[0], parts[5]
-        if " -> " in raw_path:
-            raw_path = raw_path.split(" -> ", 1)[0]
+        if " -> " in raw_path: raw_path = raw_path.split(" -> ", 1)[0]
         raw_path = raw_path.removeprefix("./")
-        if mode.startswith("-"):
-            regular.append(raw_path)
+        if mode.startswith("-"): regular.append(raw_path)
     return sorted(set(regular))
-
 
 def canonical_name(pkg: str, version: str, arch: str) -> str:
     safe = version.replace(":", "%3A")
     safe = re.sub(r"[^A-Za-z0-9.+~_=%-]", "_", safe)
     return f"{pkg}_{safe}_{arch}.deb"
 
-
 def parse_relations(value: str):
     groups = []
-    if not value:
-        return groups
-    # Binary control relations cannot contain commas inside version clauses.
+    if not value: return groups
     for group_text in value.split(","):
         alternatives = []
         for alt_text in group_text.split("|"):
             text = re.sub(r"\[[^]]*\]", "", alt_text)
             text = re.sub(r"<[^>]*>", "", text).strip()
-            match = re.match(
-                r"^([a-z0-9][a-z0-9+.-]*)(?::(?:any|native|[a-z0-9-]+))?"
-                r"(?:\s*\((<<|<=|=|>=|>>)\s*([^)]+)\))?",
-                text,
-            )
+            match = re.match(r"^([a-z0-9][a-z0-9+.-]*)(?::(?:any|native|[a-z0-9-]+))?(?:\s*\((<<|<=|=|>=|>>)\s*([^)]+)\))?", text)
             if match:
-                alternatives.append(
-                    {
-                        "name": match.group(1),
-                        "op": match.group(2) or "",
-                        "version": (match.group(3) or "").strip(),
-                    }
-                )
-        if alternatives:
-            groups.append(alternatives)
+                alternatives.append({"name": match.group(1), "op": match.group(2) or "", "version": (match.group(3) or "").strip()})
+        if alternatives: groups.append(alternatives)
     return groups
 
-
 def version_satisfies(actual: str, op: str, required: str) -> bool:
-    if not op:
-        return True
-    return subprocess.run(
-        ["dpkg", "--compare-versions", actual, op, required],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
-
+    if not op: return True
+    return subprocess.run(["dpkg", "--compare-versions", actual, op, required], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 def classify(pkg: str, paths):
-    if any(re.fullmatch(r"boot/vmlinuz-.+", p) for p in paths):
-        return "kernel-image"
-    if any(re.fullmatch(r"(?:usr/)?lib/modules/[^/]+/.+\.ko(?:\.(?:gz|xz|zst))?", p) for p in paths):
-        return "kernel-modules"
-    if re.match(r"linux-(?:.*-)?headers-", pkg) or pkg.startswith("linux-headers-"):
-        return "headers"
-    if "tools" in pkg and pkg.startswith("linux-"):
-        return "tools"
-    if pkg.endswith(("-dbg", "-dbgsym", "-dev")) or pkg == "linux-libc-dev":
-        return "development"
-    if pkg.startswith(("linux-source-", "linux-buildinfo-")):
-        return "metadata"
+    if any(re.fullmatch(r"boot/vmlinuz-.+", p) for p in paths): return "kernel-image"
+    if any(re.fullmatch(r"(?:usr/)?lib/modules/[^/]+/.+\.ko(?:\.(?:gz|xz|zst))?", p) for p in paths): return "kernel-modules"
+    if re.match(r"linux-(?:.*-)?headers-", pkg) or pkg.startswith("linux-headers-"): return "headers"
+    if "tools" in pkg and pkg.startswith("linux-"): return "tools"
+    if pkg.endswith(("-dbg", "-dbgsym", "-dev")) or pkg == "linux-libc-dev": return "development"
+    if pkg.startswith(("linux-source-", "linux-buildinfo-")): return "metadata"
     return "support"
 
-
-if len(sys.argv) < 5 or sys.argv[4] != "--":
-    die("internal invocation error")
+if len(sys.argv) < 5 or sys.argv[4] != "--": die("internal invocation error")
 output, release, override = sys.argv[1:4]
 paths = [os.path.realpath(p) for p in sys.argv[5:]]
-if not paths:
-    die("no package paths supplied")
+if not paths: die("no package paths supplied")
 
 facts = []
 for path in paths:
-    pkg = field(path, "Package")
-    version = field(path, "Version")
-    arch = field(path, "Architecture")
-    if not pkg or not version or not arch:
-        die(f"missing Package/Version/Architecture metadata: {path}")
+    pkg = field(path, "Package"); version = field(path, "Version"); arch = field(path, "Architecture")
+    if not pkg or not version or not arch: die(f"missing Package/Version/Architecture metadata: {path}")
     regular = parse_listing(path)
-    vmlinuz_releases = sorted(
-        p[len("boot/vmlinuz-") :]
-        for p in regular
-        if p.startswith("boot/vmlinuz-") and len(p) > len("boot/vmlinuz-")
-    )
-    vmlinux_releases = sorted(
-        p[len("boot/vmlinux-") :]
-        for p in regular
-        if p.startswith("boot/vmlinux-") and len(p) > len("boot/vmlinux-")
-    )
-    module_paths = sorted(
-        p for p in regular
-        if re.fullmatch(
-            rf"(?:usr/)?lib/modules/{re.escape(release)}/.+\.ko(?:\.(?:gz|xz|zst))?",
-            p,
-        )
-    )
-    auxiliary_paths = sorted(
-        p for p in regular
-        if p in {f"boot/config-{release}", f"boot/System.map-{release}"}
-        or p.startswith(f"usr/lib/linux-image-{release}/")
-        or p.startswith(f"lib/linux-image-{release}/")
-        or p.startswith(f"boot/dtb-{release}/")
-        or p.startswith(f"boot/dtb/{release}/")
-    )
-    facts.append(
-        {
-            "path": path,
-            "package": pkg,
-            "version": version,
-            "architecture": arch,
-            "sha256": sha256(path),
-            "canonical_name": canonical_name(pkg, version, arch),
-            "depends": field(path, "Depends"),
-            "pre_depends": field(path, "Pre-Depends"),
-            "provides": field(path, "Provides"),
-            "regular_paths": regular,
-            "vmlinuz_releases": vmlinuz_releases,
-            "vmlinux_releases": vmlinux_releases,
-            "module_paths": module_paths,
-            "auxiliary_paths": auxiliary_paths,
-            "class": classify(pkg, regular),
-        }
-    )
+    vmlinuz_releases = sorted(p[len("boot/vmlinuz-"):] for p in regular if p.startswith("boot/vmlinuz-") and len(p) > len("boot/vmlinuz-"))
+    vmlinux_releases = sorted(p[len("boot/vmlinux-"):] for p in regular if p.startswith("boot/vmlinux-") and len(p) > len("boot/vmlinux-"))
+    module_paths = sorted(p for p in regular if re.fullmatch(rf"(?:usr/)?lib/modules/{re.escape(release)}/.+\.ko(?:\.(?:gz|xz|zst))?", p))
+    auxiliary_paths = sorted(p for p in regular if p in {f"boot/config-{release}", f"boot/System.map-{release}"} or p.startswith(f"usr/lib/linux-image-{release}/") or p.startswith(f"lib/linux-image-{release}/") or p.startswith(f"boot/dtb-{release}/") or p.startswith(f"boot/dtb/{release}/"))
+    facts.append({"path": path,"package": pkg,"version": version,"architecture": arch,"sha256": sha256(path),"canonical_name": canonical_name(pkg, version, arch),"depends": field(path, "Depends"),"pre_depends": field(path, "Pre-Depends"),"provides": field(path, "Provides"),"regular_paths": regular,"vmlinuz_releases": vmlinuz_releases,"vmlinux_releases": vmlinux_releases,"module_paths": module_paths,"auxiliary_paths": auxiliary_paths,"class": classify(pkg, regular)})
 
 by_path = {f["path"]: f for f in facts}
 image_candidates = [f for f in facts if release in f["vmlinuz_releases"]]
 if override:
     override = os.path.realpath(override)
-    if override not in by_path:
-        die(f"--kernel-image-deb is not in the supplied package set: {override}")
-    if release not in by_path[override]["vmlinuz_releases"]:
-        die(f"selected image package does not own /boot/vmlinuz-{release}: {override}")
+    if override not in by_path: die(f"--kernel-image-deb is not in the supplied package set: {override}")
+    if release not in by_path[override]["vmlinuz_releases"]: die(f"selected image package does not own /boot/vmlinuz-{release}: {override}")
     image = by_path[override]
 else:
     if len(image_candidates) != 1:
-        details = "; ".join(
-            f"{f['package']}={f['version']} ({f['path']})" for f in image_candidates
-        ) or "none"
-        die(
-            f"expected exactly one owner of /boot/vmlinuz-{release}; found "
-            f"{len(image_candidates)}: {details}. Use --kernel-image-deb for an intentional choice."
-        )
+        details = "; ".join(f"{f['package']}={f['version']} ({f['path']})" for f in image_candidates) or "none"
+        die(f"expected exactly one owner of /boot/vmlinuz-{release}; found {len(image_candidates)}: {details}. Use --kernel-image-deb for an intentional choice.")
     image = image_candidates[0]
-
-if image["architecture"] != "arm64":
-    die(
-        f"package owning /boot/vmlinuz-{release} must be Architecture: arm64; "
-        f"found {image['architecture']} in {image['package']}={image['version']}"
-    )
-
+if image["architecture"] != "arm64": die(f"package owning /boot/vmlinuz-{release} must be Architecture: arm64; found {image['architecture']} in {image['package']}={image['version']}")
 selected = {}
-
 def add(fact, role: str, reason: str) -> bool:
     current = selected.get(fact["path"])
     if current:
-        roles = set(current["role"].split("+"))
-        roles.add(role)
-        current["role"] = "+".join(sorted(roles))
-        if reason not in current["reason"]:
-            current["reason"] += "; " + reason
+        roles = set(current["role"].split("+")); roles.add(role); current["role"] = "+".join(sorted(roles))
+        if reason not in current["reason"]: current["reason"] += "; " + reason
         return False
-    selected[fact["path"]] = {
-        "path": fact["path"],
-        "package": fact["package"],
-        "version": fact["version"],
-        "architecture": fact["architecture"],
-        "canonical_name": fact["canonical_name"],
-        "role": role,
-        "reason": reason,
-    }
+    selected[fact["path"]] = {"path": fact["path"],"package": fact["package"],"version": fact["version"],"architecture": fact["architecture"],"canonical_name": fact["canonical_name"],"role": role,"reason": reason}
     return True
-
 add(image, "image", f"owns regular /boot/vmlinuz-{release}")
-# Once an explicit image owner is selected, other packages that also own the
-# same /boot/vmlinuz path are reference-only alternatives. Do not pull their
-# modules or auxiliary payload into the selected closure indirectly.
-module_facts = [
-    f for f in facts
-    if f["module_paths"]
-    and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])
-]
-aux_facts = [
-    f for f in facts
-    if f["auxiliary_paths"]
-    and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])
-]
-
+module_facts = [f for f in facts if f["module_paths"] and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])]
+aux_facts = [f for f in facts if f["auxiliary_paths"] and (release not in f["vmlinuz_releases"] or f["path"] == image["path"])]
 for fact in module_facts:
-    if fact["architecture"] != "arm64":
-        die(
-            f"package containing runtime modules for {release} must be "
-            f"Architecture: arm64; found {fact['architecture']} in "
-            f"{fact['package']}={fact['version']}"
-        )
-
-# Distinct modules and modules-extra packages are valid, but two packages must
-# never claim the same runtime module path for one uname -r value.
+    if fact["architecture"] != "arm64": die(f"package containing runtime modules for {release} must be Architecture: arm64; found {fact['architecture']} in {fact['package']}={fact['version']}")
 module_owners = defaultdict(list)
 for fact in module_facts:
-    for module_path in fact["module_paths"]:
-        module_owners[module_path].append(fact)
+    for module_path in fact["module_paths"]: module_owners[module_path].append(fact)
 overlap = {p: owners for p, owners in module_owners.items() if len(owners) > 1}
 if overlap:
     path, owners = sorted(overlap.items())[0]
-    die(
-        f"overlapping runtime module payload {path}: "
-        + ", ".join(f"{f['package']}={f['version']}" for f in owners)
-    )
-
-# Fail before APT or live-filesystem extraction if different packages claim the
-# same boot-critical regular path. Byte-identical duplicate package identities
-# were already collapsed by the shell preflight; a remaining collision is an
-# ambiguous or internally inconsistent supplied package set.
-critical_owners = defaultdict(list)
-critical_facts = {image["path"]: image}
-for fact in module_facts + aux_facts:
-    critical_facts[fact["path"]] = fact
+    die(f"overlapping runtime module payload {path}: " + ", ".join(f"{f['package']}={f['version']}" for f in owners))
+critical_owners = defaultdict(list); critical_facts = {image["path"]: image}
+for fact in module_facts + aux_facts: critical_facts[fact["path"]] = fact
 for fact in critical_facts.values():
     critical_paths = set(fact["module_paths"]) | set(fact["auxiliary_paths"])
-    if fact["path"] == image["path"]:
-        critical_paths.add(f"boot/vmlinuz-{release}")
-    for critical_path in critical_paths:
-        critical_owners[critical_path].append(fact)
-critical_overlap = {
-    path: owners for path, owners in critical_owners.items() if len(owners) > 1
-}
+    if fact["path"] == image["path"]: critical_paths.add(f"boot/vmlinuz-{release}")
+    for critical_path in critical_paths: critical_owners[critical_path].append(fact)
+critical_overlap = {path: owners for path, owners in critical_owners.items() if len(owners) > 1}
 if critical_overlap:
     path, owners = sorted(critical_overlap.items())[0]
-    die(
-        f"overlapping boot-critical payload {path}: "
-        + ", ".join(f"{f['package']}={f['version']}" for f in owners)
-    )
-
-for fact in module_facts:
-    add(fact, "modules", f"contains runtime module objects for {release}")
-for fact in aux_facts:
-    add(fact, "auxiliary", f"contains release-bound support payload for {release}")
-
-# Debian 6.19+ may place the boot image and modules in linux-binary and
-# linux-modules packages while a release-specific linux-image package carries
-# orchestration/triggers and depends directly on both. Detect that relationship
-# semantically so an arbitrarily named equivalent is also retained, while a
-# rolling meta-package that only depends on the release wrapper is not selected.
-module_package_names = {f["package"] for f in module_facts}
-orchestrators = []
+    die(f"overlapping boot-critical payload {path}: " + ", ".join(f"{f['package']}={f['version']}" for f in owners))
+for fact in module_facts: add(fact, "modules", f"contains runtime module objects for {release}")
+for fact in aux_facts: add(fact, "auxiliary", f"contains release-bound support payload for {release}")
+module_package_names = {f["package"] for f in module_facts}; orchestrators = []
 for fact in facts:
-    if fact["path"] in selected:
-        continue
-    relation_names = {
-        alt["name"]
-        for group in (
-            parse_relations(fact["pre_depends"]) + parse_relations(fact["depends"])
-        )
-        for alt in group
-    }
-    if image["package"] in relation_names and relation_names.intersection(module_package_names):
-        orchestrators.append(fact)
-if len(orchestrators) > 1:
-    die(
-        "multiple supplied release-orchestrator packages depend directly on the "
-        f"selected image/modules closure: "
-        + ", ".join(f"{f['package']}={f['version']}" for f in orchestrators)
-    )
-if orchestrators:
-    add(
-        orchestrators[0],
-        "orchestrator",
-        f"depends directly on selected image and module packages for {release}",
-    )
-
-by_name = defaultdict(list)
-providers = defaultdict(list)
+    if fact["path"] in selected: continue
+    relation_names = {alt["name"] for group in (parse_relations(fact["pre_depends"]) + parse_relations(fact["depends"])) for alt in group}
+    if image["package"] in relation_names and relation_names.intersection(module_package_names): orchestrators.append(fact)
+if len(orchestrators) > 1: die("multiple supplied release-orchestrator packages depend directly on the selected image/modules closure: " + ", ".join(f"{f['package']}={f['version']}" for f in orchestrators))
+if orchestrators: add(orchestrators[0], "orchestrator", f"depends directly on selected image and module packages for {release}")
+by_name = defaultdict(list); providers = defaultdict(list)
 for fact in facts:
     by_name[fact["package"]].append(fact)
     for group in parse_relations(fact["provides"]):
-        for provided in group:
-            providers[provided["name"]].append((fact, provided))
-
-queue = deque(selected.keys())
-processed = set()
+        for provided in group: providers[provided["name"]].append((fact, provided))
+queue = deque(selected.keys()); processed = set()
 while queue:
     parent_path = queue.popleft()
-    if parent_path in processed:
-        continue
-    processed.add(parent_path)
-    parent = by_path[parent_path]
+    if parent_path in processed: continue
+    processed.add(parent_path); parent = by_path[parent_path]
     relations = parse_relations(parent["pre_depends"]) + parse_relations(parent["depends"])
     for alternatives in relations:
-        chosen = None
-        chosen_relation = None
+        chosen = None; chosen_relation = None
         for alt in alternatives:
-            candidates = [
-                f for f in by_name.get(alt["name"], [])
-                if version_satisfies(f["version"], alt["op"], alt["version"])
-            ]
+            candidates = [f for f in by_name.get(alt["name"], []) if version_satisfies(f["version"], alt["op"], alt["version"])]
             if not candidates:
                 provider_candidates = []
                 for provider_fact, provided in providers.get(alt["name"], []):
                     provided_version = provided["version"]
-                    if not alt["op"]:
-                        provider_candidates.append(provider_fact)
-                    elif provided_version and version_satisfies(
-                        provided_version, alt["op"], alt["version"]
-                    ):
-                        provider_candidates.append(provider_fact)
+                    if not alt["op"] or (provided_version and version_satisfies(provided_version, alt["op"], alt["version"])): provider_candidates.append(provider_fact)
                 candidates = provider_candidates
             if candidates:
                 identities = {(f["package"], f["version"], f["architecture"]) for f in candidates}
-                if len(identities) != 1:
-                    die(
-                        f"ambiguous supplied dependency '{alt['name']}' required by "
-                        f"{parent['package']}: "
-                        + ", ".join(f"{f['package']}={f['version']} ({f['path']})" for f in candidates)
-                    )
-                chosen = sorted(candidates, key=lambda f: f["path"])[0]
-                chosen_relation = alt
-                break
+                if len(identities) != 1: die(f"ambiguous supplied dependency '{alt['name']}' required by {parent['package']}: " + ", ".join(f"{f['package']}={f['version']} ({f['path']})" for f in candidates))
+                chosen = sorted(candidates, key=lambda f: f["path"])[0]; chosen_relation = alt; break
         if chosen is not None:
             relation_text = chosen_relation["name"]
-            if chosen_relation["op"]:
-                relation_text += f" ({chosen_relation['op']} {chosen_relation['version']})"
-            if add(
-                chosen,
-                "dependency",
-                f"supplied local dependency of {parent['package']}: {relation_text}",
-            ):
-                queue.append(chosen["path"])
-
-selected_facts = [by_path[p] for p in selected]
-selected_names = defaultdict(list)
-for fact in selected_facts:
-    selected_names[fact["package"]].append(fact)
+            if chosen_relation["op"]: relation_text += f" ({chosen_relation['op']} {chosen_relation['version']})"
+            if add(chosen, "dependency", f"supplied local dependency of {parent['package']}: {relation_text}"): queue.append(chosen["path"])
+selected_facts = [by_path[p] for p in selected]; selected_names = defaultdict(list)
+for fact in selected_facts: selected_names[fact["package"]].append(fact)
 for pkg, matches in selected_names.items():
     versions = {(f["version"], f["architecture"]) for f in matches}
-    if len(versions) > 1:
-        die(
-            f"selected closure contains multiple versions/architectures of {pkg}: "
-            + ", ".join(f"{f['version']}/{f['architecture']}" for f in matches)
-        )
-
-if not any(f["module_paths"] for f in selected_facts):
-    die(f"no selected package contains runtime module objects for {release}")
-
-selected_output = sorted(selected.values(), key=lambda x: (x["package"], x["path"]))
-selected_paths = {x["path"] for x in selected_output}
-excluded_output = [
-    {
-        "path": f["path"],
-        "package": f["package"],
-        "version": f["version"],
-        "architecture": f["architecture"],
-        "canonical_name": f["canonical_name"],
-        "class": f["class"],
-    }
-    for f in facts
-    if f["path"] not in selected_paths
-]
-
-fact_summary = [
-    {
-        "path": f["path"],
-        "package": f["package"],
-        "version": f["version"],
-        "architecture": f["architecture"],
-        "sha256": f["sha256"],
-        "canonical_name": f["canonical_name"],
-        "class": f["class"],
-        "depends": f["depends"],
-        "pre_depends": f["pre_depends"],
-        "provides": f["provides"],
-        "vmlinuz_releases": f["vmlinuz_releases"],
-        "vmlinux_releases": f["vmlinux_releases"],
-        "runtime_module_count": len(f["module_paths"]),
-        "auxiliary_paths": f["auxiliary_paths"],
-    }
-    for f in facts
-]
-
-result = {
-    "schema_version": 1,
-    "release": release,
-    "image_deb": image["path"],
-    "image_package": image["package"],
-    "image_version": image["version"],
-    "selected": selected_output,
-    "excluded": sorted(excluded_output, key=lambda x: (x["package"], x["path"])),
-    "facts": fact_summary,
-}
+    if len(versions) > 1: die(f"selected closure contains multiple versions/architectures of {pkg}: " + ", ".join(f"{f['version']}/{f['architecture']}" for f in matches))
+if not any(f["module_paths"] for f in selected_facts): die(f"no selected package contains runtime module objects for {release}")
+selected_output = sorted(selected.values(), key=lambda x: (x["package"], x["path"])); selected_paths = {x["path"] for x in selected_output}
+excluded_output = [{"path": f["path"],"package": f["package"],"version": f["version"],"architecture": f["architecture"],"canonical_name": f["canonical_name"],"class": f["class"]} for f in facts if f["path"] not in selected_paths]
+fact_summary = [{"path": f["path"],"package": f["package"],"version": f["version"],"architecture": f["architecture"],"sha256": f["sha256"],"canonical_name": f["canonical_name"],"class": f["class"],"depends": f["depends"],"pre_depends": f["pre_depends"],"provides": f["provides"],"vmlinuz_releases": f["vmlinuz_releases"],"vmlinux_releases": f["vmlinux_releases"],"runtime_module_count": len(f["module_paths"]),"auxiliary_paths": f["auxiliary_paths"]} for f in facts]
+result = {"schema_version": 1,"release": release,"image_deb": image["path"],"image_package": image["package"],"image_version": image["version"],"selected": selected_output,"excluded": sorted(excluded_output, key=lambda x: (x["package"], x["path"])),"facts": fact_summary}
 with open(output, "w", encoding="utf-8") as stream:
-    json.dump(result, stream, indent=2, sort_keys=True)
-    stream.write("\n")
+    json.dump(result, stream, indent=2, sort_keys=True); stream.write("\n")
 KERNEL_SELECTOR_PY
   chmod 0755 "$selector"
-
-  python3 "$selector" "$KERNEL_PACKAGE_CLOSURE_JSON" "$KERNEL_RELEASE" \
-    "$KERNEL_IMAGE_DEB_OVERRIDE" -- "${KERNEL_DEBS[@]}"
-  jq -e --arg release "$KERNEL_RELEASE" \
-    '.schema_version == 1 and .release == $release and (.selected | length) > 0' \
-    "$KERNEL_PACKAGE_CLOSURE_JSON" >/dev/null || \
-    die "Kernel package closure output failed structural validation."
+  python3 "$selector" "$KERNEL_PACKAGE_CLOSURE_JSON" "$KERNEL_RELEASE" "$KERNEL_IMAGE_DEB_OVERRIDE" -- "${KERNEL_DEBS[@]}"
+  jq -e --arg release "$KERNEL_RELEASE" '.schema_version == 1 and .release == $release and (.selected | length) > 0' "$KERNEL_PACKAGE_CLOSURE_JSON" >/dev/null || die "Kernel package closure output failed structural validation."
 }
 
 discover_kernel_and_dtb_inputs() {
-  KERNEL_DEBS=()
-  TARGET_KERNEL_DEBS=()
-  TARGET_EXCLUDED_KERNEL_DEBS=()
-  LIVE_KERNEL_DEBS=()
-  DTB_CANDIDATES=()
-  KERNEL_IMAGE_DEB=""
-  KERNEL_RELEASE_REQUESTED="$EXPECTED_CUSTOM_KERNEL_RELEASE"
-  case "$KERNEL_RELEASE_POLICY" in
-    prefer|require|auto) : ;;
-    *) die "Unsupported kernel release policy: $KERNEL_RELEASE_POLICY" ;;
-  esac
+  KERNEL_DEBS=(); TARGET_KERNEL_DEBS=(); TARGET_EXCLUDED_KERNEL_DEBS=(); LIVE_KERNEL_DEBS=(); DTB_CANDIDATES=(); KERNEL_IMAGE_DEB=""; KERNEL_RELEASE_REQUESTED="$EXPECTED_CUSTOM_KERNEL_RELEASE"
+  case "$KERNEL_RELEASE_POLICY" in prefer|require|auto) : ;; *) die "Unsupported kernel release policy: $KERNEL_RELEASE_POLICY" ;; esac
   mkdir -p "$TMP_ROOT/deb-listings"
-
   local -a discovered_debs=()
-  mapfile -t discovered_debs < <(
-    find "$KERNEL_DEB_DIR" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print 2>/dev/null |
-      sort -u
-  )
-  if [[ -n "$KERNEL_IMAGE_DEB_OVERRIDE" ]]; then
-    [[ -f "$KERNEL_IMAGE_DEB_OVERRIDE" ]] || die "Kernel image package override does not exist: $KERNEL_IMAGE_DEB_OVERRIDE"
-    discovered_debs+=("$KERNEL_IMAGE_DEB_OVERRIDE")
-  fi
+  mapfile -t discovered_debs < <(find "$KERNEL_DEB_DIR" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print 2>/dev/null | sort -u)
+  if [[ -n "$KERNEL_IMAGE_DEB_OVERRIDE" ]]; then [[ -f "$KERNEL_IMAGE_DEB_OVERRIDE" ]] || die "Kernel image package override does not exist: $KERNEL_IMAGE_DEB_OVERRIDE"; discovered_debs+=("$KERNEL_IMAGE_DEB_OVERRIDE"); fi
   mapfile -t discovered_debs < <(printf '%s\n' "${discovered_debs[@]}" | sed '/^$/d' | sort -u)
   ((${#discovered_debs[@]} > 0)) || die "No .deb files found in $KERNEL_DEB_DIR or $ARTIFACT_DIR."
-
   local -a release_candidates=() vmlinux_candidates=() normalized_debs=()
   local deb pkg version arch listing rel identity digest prior_digest
   declare -A identity_path=() identity_sha=()
   : > "$TMP_ROOT/debian-package-inventory.tsv"
-
   for deb in "${discovered_debs[@]}"; do
-    deb="$(readlink -f -- "$deb")"
-    [[ "$deb" != *$'\n'* && "$deb" != *$'\r'* ]] || die "Kernel package path contains a newline: $deb"
-    pkg="$(package_field "$deb" Package)"
-    version="$(package_field "$deb" Version)"
-    arch="$(package_field "$deb" Architecture)"
+    deb="$(readlink -f -- "$deb")"; [[ "$deb" != *$'\n'* && "$deb" != *$'\r'* ]] || die "Kernel package path contains a newline: $deb"
+    pkg="$(package_field "$deb" Package)"; version="$(package_field "$deb" Version)"; arch="$(package_field "$deb" Architecture)"
     [[ -n "$pkg" && -n "$version" && -n "$arch" ]] || die "Unable to read Debian package metadata: $deb"
     [[ "$arch" == "arm64" || "$arch" == "all" ]] || die "Package $pkg has unsupported architecture '$arch': $deb"
-
-    identity="$pkg"$'\037'"$version"$'\037'"$arch"
-    digest="$(sha256sum "$deb" | awk '{print $1}')"
-    if [[ -n "${identity_path[$identity]:-}" ]]; then
-      prior_digest="${identity_sha[$identity]}"
-      if [[ "$digest" == "$prior_digest" ]]; then
-        warn "Ignoring byte-identical duplicate package identity: $pkg=$version/$arch ($deb)"
-        continue
-      fi
-      die "Conflicting bytes for duplicate package identity $pkg=$version/$arch: ${identity_path[$identity]} and $deb"
-    fi
-    identity_path[$identity]="$deb"
-    identity_sha[$identity]="$digest"
-    normalized_debs+=("$deb")
-
+    identity="$pkg"$'\037'"$version"$'\037'"$arch"; digest="$(sha256sum "$deb" | awk '{print $1}')"
+    if [[ -n "${identity_path[$identity]:-}" ]]; then prior_digest="${identity_sha[$identity]}"; [[ "$digest" == "$prior_digest" ]] && { warn "Ignoring byte-identical duplicate package identity: $pkg=$version/$arch ($deb)"; continue; }; die "Conflicting bytes for duplicate package identity $pkg=$version/$arch: ${identity_path[$identity]} and $deb"; fi
+    identity_path[$identity]="$deb"; identity_sha[$identity]="$digest"; normalized_debs+=("$deb")
     printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$version" "$arch" "$digest" "$deb" >> "$TMP_ROOT/debian-package-inventory.tsv"
-    listing="$(kernel_deb_listing_path "$deb")"
-    write_deb_content_listing "$deb" "$listing"
-
-    while IFS= read -r rel; do
-      [[ -n "$rel" ]] && release_candidates+=("$rel")
-    done < <(
-      awk '
-        $1 ~ /^-/ {
-          path=$NF
-          sub(/^\.\//, "", path)
-          if (path ~ /^boot\/vmlinuz-/) {
-            sub(/^boot\/vmlinuz-/, "", path)
-            print path
-          }
-        }
-      ' "$listing"
-    )
-    while IFS= read -r rel; do
-      [[ -n "$rel" ]] && vmlinux_candidates+=("$rel")
-    done < <(
-      awk '
-        $1 ~ /^-/ {
-          path=$NF
-          sub(/^\.\//, "", path)
-          if (path ~ /^boot\/vmlinux-/) {
-            sub(/^boot\/vmlinux-/, "", path)
-            print path
-          }
-        }
-      ' "$listing"
-    )
+    listing="$(kernel_deb_listing_path "$deb")"; write_deb_content_listing "$deb" "$listing"
+    while IFS= read -r rel; do [[ -n "$rel" ]] && release_candidates+=("$rel"); done < <(awk '$1 ~ /^-/ {path=$NF; sub(/^\.\//,"",path); if(path ~ /^boot\/vmlinuz-/){sub(/^boot\/vmlinuz-/,"",path); print path}}' "$listing")
+    while IFS= read -r rel; do [[ -n "$rel" ]] && vmlinux_candidates+=("$rel"); done < <(awk '$1 ~ /^-/ {path=$NF; sub(/^\.\//,"",path); if(path ~ /^boot\/vmlinux-/){sub(/^boot\/vmlinux-/,"",path); print path}}' "$listing")
   done
   KERNEL_DEBS=("${normalized_debs[@]}")
-
-  if ((${#release_candidates[@]} == 0 && ${#vmlinux_candidates[@]} > 0)); then
-    mapfile -t vmlinux_candidates < <(printf '%s\n' "${vmlinux_candidates[@]}" | sort -u)
-    die "Only /boot/vmlinux-* payloads were found (${vmlinux_candidates[*]}). This GRUB/ABRoot harness requires the Debian-family /boot/vmlinuz-<release> boot artifact."
-  fi
-
+  if ((${#release_candidates[@]} == 0 && ${#vmlinux_candidates[@]} > 0)); then mapfile -t vmlinux_candidates < <(printf '%s\n' "${vmlinux_candidates[@]}" | sort -u); die "Only /boot/vmlinux-* payloads were found (${vmlinux_candidates[*]}). This GRUB/ABRoot harness requires /boot/vmlinuz-<release>."; fi
   KERNEL_RELEASE="$(select_kernel_release_from_candidates "${release_candidates[@]}")"
   resolve_kernel_package_closure
   KERNEL_IMAGE_DEB="$(jq -r '.image_deb' "$KERNEL_PACKAGE_CLOSURE_JSON")"
   mapfile -t TARGET_KERNEL_DEBS < <(jq -r '.selected[].path' "$KERNEL_PACKAGE_CLOSURE_JSON")
-  mapfile -t LIVE_KERNEL_DEBS < <(
-    jq -r '.selected[] |
-      select(.role | test("(^|\\+)(image|modules|auxiliary)(\\+|$)")) |
-      .path' "$KERNEL_PACKAGE_CLOSURE_JSON"
-  )
+  mapfile -t LIVE_KERNEL_DEBS < <(jq -r '.selected[] | select(.role | test("(^|\\+)(image|modules|auxiliary)(\\+|$)")) | .path' "$KERNEL_PACKAGE_CLOSURE_JSON")
   mapfile -t TARGET_EXCLUDED_KERNEL_DEBS < <(jq -r '.excluded[].path' "$KERNEL_PACKAGE_CLOSURE_JSON")
-
   [[ -f "$KERNEL_IMAGE_DEB" ]] || die "Resolved kernel image package is unavailable: $KERNEL_IMAGE_DEB"
   ((${#TARGET_KERNEL_DEBS[@]} > 0)) || die "Kernel package closure selected no target packages."
-  deb_listing_has_regular_boot_kernel "$(kernel_deb_listing_path "$KERNEL_IMAGE_DEB")" "$KERNEL_RELEASE" || \
-    die "Resolved image package no longer contains /boot/vmlinuz-$KERNEL_RELEASE"
-
+  deb_listing_has_regular_boot_kernel "$(kernel_deb_listing_path "$KERNEL_IMAGE_DEB")" "$KERNEL_RELEASE" || die "Resolved image package no longer contains /boot/vmlinuz-$KERNEL_RELEASE"
   local has_modules=0
-  for deb in "${LIVE_KERNEL_DEBS[@]}"; do
-    listing="$(kernel_deb_listing_path "$deb")"
-    if deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then
-      has_modules=1
-      break
-    fi
-  done
+  for deb in "${LIVE_KERNEL_DEBS[@]}"; do listing="$(kernel_deb_listing_path "$deb")"; if deb_listing_has_runtime_module_object "$listing" "$KERNEL_RELEASE"; then has_modules=1; break; fi; done
   (( has_modules == 1 )) || die "No selected package contains a regular runtime module object for $KERNEL_RELEASE."
-
-  mapfile -t DTB_CANDIDATES < <(
-    find "$ARTIFACT_DIR/dtb" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.dtb' -print 2>/dev/null |
-      sort -u
-  )
+  mapfile -t DTB_CANDIDATES < <(find "$ARTIFACT_DIR/dtb" "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.dtb' -print 2>/dev/null | sort -u)
   ((${#DTB_CANDIDATES[@]} > 0)) || die "No DTB found in $ARTIFACT_DIR/dtb or $ARTIFACT_DIR."
-
-  if [[ -n "$DTB_FILE_OVERRIDE" ]]; then
-    [[ -f "$DTB_FILE_OVERRIDE" ]] || die "DTB override does not exist: $DTB_FILE_OVERRIDE"
-    DTB_FILE="$DTB_FILE_OVERRIDE"
-  elif ((${#DTB_CANDIDATES[@]} == 1)); then
-    DTB_FILE="${DTB_CANDIDATES[0]}"
-  elif is_interactive; then
-    local opts=() i=1 choice candidate
-    for candidate in "${DTB_CANDIDATES[@]}"; do
-      opts+=("$i|Use $(basename "$candidate")|$candidate")
-      i=$((i+1))
-    done
-    choice="$(menu "Primary Device Tree Selection" "1" "${opts[@]}")"
-    DTB_FILE="${DTB_CANDIDATES[$((choice-1))]}"
-  else
-    die "Multiple DTBs found. Set DTB_FILE_OVERRIDE or use interactive mode."
-  fi
-
-  DTB_NAME="${DTB_INSTALLED_NAME_OVERRIDE:-$(basename "$DTB_FILE")}"
-  [[ "$DTB_NAME" != */* && -n "$DTB_NAME" ]] || die "Installed DTB name must be a basename: $DTB_NAME"
+  if [[ -n "$DTB_FILE_OVERRIDE" ]]; then [[ -f "$DTB_FILE_OVERRIDE" ]] || die "DTB override does not exist: $DTB_FILE_OVERRIDE"; DTB_FILE="$DTB_FILE_OVERRIDE"; elif ((${#DTB_CANDIDATES[@]} == 1)); then DTB_FILE="${DTB_CANDIDATES[0]}"; elif is_interactive; then local opts=() i=1 choice candidate; for candidate in "${DTB_CANDIDATES[@]}"; do opts+=("$i|Use $(basename "$candidate")|$candidate"); i=$((i+1)); done; choice="$(menu "Primary Device Tree Selection" "1" "${opts[@]}")"; DTB_FILE="${DTB_CANDIDATES[$((choice-1))]}"; else die "Multiple DTBs found. Set DTB_FILE_OVERRIDE or use interactive mode."; fi
+  DTB_NAME="${DTB_INSTALLED_NAME_OVERRIDE:-$(basename "$DTB_FILE")}"; [[ "$DTB_NAME" != */* && -n "$DTB_NAME" ]] || die "Installed DTB name must be a basename: $DTB_NAME"
   write_kernel_package_selection_manifest
-
-  ok "Kernel release selected from payload: $KERNEL_RELEASE"
-  ok "Kernel image owner: $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)"
-  ok "Kernel image source: $KERNEL_IMAGE_DEB"
-  ok "Supplied unique kernel-related packages: ${#KERNEL_DEBS[@]}"
-  ok "Resolved target/live package closure: ${#TARGET_KERNEL_DEBS[@]}"
-  ok "Reference-only packages excluded from installation: ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}"
-  ok "All supplied packages will be archived in target /root/custom-kernel-packages using canonical metadata-derived names."
-  ok "Selected DTB: $DTB_FILE"
-
+  ok "Kernel release selected from payload: $KERNEL_RELEASE"; ok "Kernel image owner: $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)"; ok "Kernel image source: $KERNEL_IMAGE_DEB"
+  ok "Supplied unique kernel-related packages: ${#KERNEL_DEBS[@]}"; ok "Resolved target/live package closure: ${#TARGET_KERNEL_DEBS[@]}"; ok "Reference-only packages excluded from installation: ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}"
+  ok "Supplied packages are not archived in the target; release-side selection/closure evidence remains authoritative."; ok "Selected DTB: $DTB_FILE"
   local excluded class role
-  for excluded in "${TARGET_EXCLUDED_KERNEL_DEBS[@]}"; do
-    pkg="$(package_field "$excluded" Package)"
-    class="$(classify_kernel_deb_for_target "$excluded")"
-    role="$(kernel_deb_selection_role "$excluded")"
-    warn "Target APT exclusion: $pkg ($class/${role:-reference-only}); archived for reference only."
-  done
+  for excluded in "${TARGET_EXCLUDED_KERNEL_DEBS[@]}"; do pkg="$(package_field "$excluded" Package)"; class="$(classify_kernel_deb_for_target "$excluded")"; role="$(kernel_deb_selection_role "$excluded")"; warn "Target APT exclusion: $pkg ($class/${role:-reference-only}); recorded in release evidence only."; done
 }
 
-
-# ------------------------- repository handling --------------------------
-
-normalize_git_url() {
-  local url="$1"
-  url="${url%.git}"
-  url="${url%/}"
-  printf '%s' "$url"
-}
-
-repo_state() {
-  local path="$1"
-  if [[ ! -d "$path/.git" ]]; then printf 'missing'; return; fi
-  local branch commit dirty origin
-  branch="$(git -C "$path" branch --show-current 2>/dev/null || true)"
-  commit="$(git -C "$path" rev-parse --short HEAD 2>/dev/null || true)"
-  origin="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
-  [[ -n "$(git -C "$path" status --porcelain 2>/dev/null || true)" ]] && dirty=dirty || dirty=clean
-  printf 'branch=%s commit=%s state=%s origin=%s' "${branch:-detached}" "${commit:-unknown}" "$dirty" "${origin:-unknown}"
-}
-
-repo_ref_kind() {
-  local path="$1" ref="$2"
-  if git -C "$path" show-ref --verify --quiet "refs/heads/$ref" ||
-     git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
-    printf 'branch'
-  elif git -C "$path" show-ref --verify --quiet "refs/tags/$ref"; then
-    printf 'tag'
-  elif git -C "$path" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
-    printf 'commit'
-  else
-    printf 'unresolved'
-  fi
-}
-
-repo_commit_iso_date() {
-  local path="$1"
-  git -C "$path" show -s --format=%cI HEAD 2>/dev/null || printf 'unknown'
-}
-
-repo_commit_age_days() {
-  local path="$1"
-  local commit_epoch now_epoch
-  commit_epoch="$(git -C "$path" show -s --format=%ct HEAD 2>/dev/null || true)"
-  [[ "$commit_epoch" =~ ^[0-9]+$ ]] || { printf 'unknown'; return 0; }
-  now_epoch="$(date -u +%s)"
-  printf '%s' "$(( (now_epoch - commit_epoch) / 86400 ))"
-}
-
-repo_exact_tags() {
-  local path="$1"
-  local tags
-  tags="$(git -C "$path" tag --points-at HEAD 2>/dev/null | LC_ALL=C sort | paste -sd, - || true)"
-  printf '%s' "${tags:-none}"
-}
+normalize_git_url() { local url="$1"; url="${url%.git}"; url="${url%/}"; printf '%s' "$url"; }
+repo_state() { local path="$1"; if [[ ! -d "$path/.git" ]]; then printf 'missing'; return; fi; local branch commit dirty origin; branch="$(git -C "$path" branch --show-current 2>/dev/null || true)"; commit="$(git -C "$path" rev-parse --short HEAD 2>/dev/null || true)"; origin="$(git -C "$path" remote get-url origin 2>/dev/null || true)"; [[ -n "$(git -C "$path" status --porcelain 2>/dev/null || true)" ]] && dirty=dirty || dirty=clean; printf 'branch=%s commit=%s state=%s origin=%s' "${branch:-detached}" "${commit:-unknown}" "$dirty" "${origin:-unknown}"; }
+repo_ref_kind() { local path="$1" ref="$2"; if git -C "$path" show-ref --verify --quiet "refs/heads/$ref" || git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$ref"; then printf branch; elif git -C "$path" show-ref --verify --quiet "refs/tags/$ref"; then printf tag; elif git -C "$path" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then printf commit; else printf unresolved; fi; }
+repo_commit_iso_date() { git -C "$1" show -s --format=%cI HEAD 2>/dev/null || printf unknown; }
+repo_commit_age_days() { local commit_epoch now_epoch; commit_epoch="$(git -C "$1" show -s --format=%ct HEAD 2>/dev/null || true)"; [[ "$commit_epoch" =~ ^[0-9]+$ ]] || { printf unknown; return 0; }; now_epoch="$(date -u +%s)"; printf '%s' "$(( (now_epoch - commit_epoch) / 86400 ))"; }
+repo_exact_tags() { local tags; tags="$(git -C "$1" tag --points-at HEAD 2>/dev/null | LC_ALL=C sort | paste -sd, - || true)"; printf '%s' "${tags:-none}"; }
 
 write_source_provenance_manifest() {
   SOURCE_PROVENANCE_MANIFEST="$TMP_ROOT/source-provenance.tsv"
-  {
-    printf 'role\trepository\trequested_ref\tref_kind\tcommit\tcommit_date_utc\tage_days\texact_tags\tcheckout\tbuild_use\n'
-    printf 'custom-image\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" \
-      "$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF")" \
-      "$CUSTOM_SOURCE_COMMIT" "$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")" \
-      "$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")" \
-      "$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")" "$CUSTOM_IMAGE_SOURCE" \
-      "template for generated custom target recipe"
-    printf 'live-iso\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" \
-      "$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF")" \
-      "$LIVE_SOURCE_COMMIT" "$(repo_commit_iso_date "$LIVE_ISO_SOURCE")" \
-      "$(repo_commit_age_days "$LIVE_ISO_SOURCE")" \
-      "$(repo_exact_tags "$LIVE_ISO_SOURCE")" "$LIVE_ISO_SOURCE" \
-      "installer ISO source"
-  } > "$SOURCE_PROVENANCE_MANIFEST"
+  { printf 'role\trepository\trequested_ref\tref_kind\tcommit\tcommit_date_utc\tage_days\texact_tags\tcheckout\tbuild_use\n';
+    printf 'custom-image\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" "$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF")" "$CUSTOM_SOURCE_COMMIT" "$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")" "$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")" "$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")" "$CUSTOM_IMAGE_SOURCE" "template for generated custom target recipe";
+    printf 'live-iso\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" "$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF")" "$LIVE_SOURCE_COMMIT" "$(repo_commit_iso_date "$LIVE_ISO_SOURCE")" "$(repo_commit_age_days "$LIVE_ISO_SOURCE")" "$(repo_exact_tags "$LIVE_ISO_SOURCE")" "$LIVE_ISO_SOURCE" "installer ISO source"; } > "$SOURCE_PROVENANCE_MANIFEST"
 }
 
 write_reunion_convergence_manifest() {
-  local live_conf="$LIVE_ISO_SOURCE/etc/terraform.conf"
-  local live_build="$LIVE_ISO_SOURCE/build.sh"
-  local live_codename="unknown" live_version="unknown" live_suffix="unknown"
-  [[ -f "$live_conf" ]] && {
-    live_codename="$(read_terraform_value "$live_conf" CODENAME)"
-    live_version="$(read_terraform_value "$live_conf" VERSION)"
-    live_suffix="$(read_terraform_value "$live_conf" PACKAGE_LISTS_SUFFIX)"
-  }
-
+  local live_conf="$LIVE_ISO_SOURCE/etc/terraform.conf" live_codename="unknown" live_version="unknown" live_suffix="unknown"
+  [[ -f "$live_conf" ]] && { live_codename="$(read_terraform_value "$live_conf" CODENAME)"; live_version="$(read_terraform_value "$live_conf" VERSION)"; live_suffix="$(read_terraform_value "$live_conf" PACKAGE_LISTS_SUFFIX)"; }
   {
     printf 'component\tselection\tbasis\n'
-    printf 'live-iso-ref\t%s@%s\tupstream branch identifier; content codename=%s version=%s\n' \
-      "$LIVE_ISO_REF" "$LIVE_SOURCE_COMMIT" "$live_codename" "$live_version"
+    printf 'milestone\tv8.5-r5\tformal Vanilla OS 3 Reunion stable-release convergence\n'
+    printf 'live-iso-ref\t%s@%s\tupstream branch identifier; content codename=%s version=%s\n' "$LIVE_ISO_REF" "$LIVE_SOURCE_COMMIT" "$live_codename" "$live_version"
     printf 'live-package-lists\t%s\tupstream PACKAGE_LISTS_SUFFIX\n' "$live_suffix"
     printf 'live-package-policy\t%s\tupstream-native is canonical; r4.1 projection retained only for compatibility\n' "$LIVE_ARM64_PACKAGE_POLICY"
-    printf 'live-builder\t%s\tcurrent official live-iso ARM64 workflow default\n' "$LIVE_ISO_CONTAINER_IMAGE"
-    printf 'custom-image\t%s@%s\tscaffold/modules only; sample base taxonomy is non-authoritative\n' \
-      "$CUSTOM_IMAGE_REF" "$CUSTOM_SOURCE_COMMIT"
-    printf 'target-base\t%s\tcanonical Reunion development desktop taxonomy\n' "$CUSTOM_IMAGE_BASE"
+    printf 'live-builder\t%s\tstable Reunion ARM64 workflow substrate; digest recorded separately\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf 'custom-image\t%s@%s\tscaffold/modules only; stable announcement and desktop-image are semantic authorities\n' "$CUSTOM_IMAGE_REF" "$CUSTOM_SOURCE_COMMIT"
+    printf 'target-base\t%s\tformal stable Reunion GNOME image taxonomy; digest recorded separately\n' "$CUSTOM_IMAGE_BASE"
     printf 'vib-binary\t%s\tbuilder tool request\n' "$VIB_VERSION"
     printf 'vib-recipe\t%s\tgenerated recipe declaration\n' "$VIB_RECIPE_VERSION"
-    printf 'system-operator-contract\tvso-native\ttarget verifier requires VSO native stack and canonical Distrobox path/interface\n'
+    printf 'fsguard\tabsent\tremoved from Vanilla OS 3 Reunion\n'
+    printf 'vso-stack\t%s\tpublished Reunion VSO native stack\n' "$VSO_NATIVE_STACK"
+    printf 'vso-image\t%s\tpublished VSO OCI image; digest recorded separately\n' "$VSO_NATIVE_IMAGE"
+    printf 'vso-instance\t%s\tmanaged VSO subsystem instance\n' "$VSO_NATIVE_INSTANCE"
+    printf 'vso-upstream-base\t%s\tpublished vso-image source contract\n' "$VSO_NATIVE_UPSTREAM_BASE"
+    printf 'distrobox\tv2 / 2.0.0-rc.4 contract\tretain opaque-source-version coherence gate\n'
     printf 'installation-transport\t%s\tISO-local OCI bridge remains first-class when iso-oci is selected\n' "$DELIVERY_MODE"
+    if [[ -s "$UPSTREAM_OCI_PROVENANCE_JSON" ]]; then
+      printf 'target-base-digest\t%s\tresolved ARM64 manifest digest for moving stable tag\n' "$(jq -r '.inputs[] | select(.role == "target-base") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")"
+      printf 'live-builder-digest\t%s\tresolved ARM64 manifest digest for moving stable tag\n' "$(jq -r '.inputs[] | select(.role == "live-builder") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")"
+      printf 'vso-native-digest\t%s\tresolved ARM64 manifest digest recorded as installed-system contract evidence\n' "$(jq -r '.inputs[] | select(.role == "vso-native") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")"
+    fi
   } > "$REUNION_CONVERGENCE_MANIFEST"
-
-  [[ -f "$live_build" ]] || warn "Current live-iso build.sh is unavailable while writing convergence evidence."
 }
 
 report_source_provenance() {
-  local custom_age live_age
-  custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"
-  live_age="$(repo_commit_age_days "$LIVE_ISO_SOURCE")"
-
-  info "Source-reference strategy:"
-  info "  custom-image: ref=$CUSTOM_IMAGE_REF kind=$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF") commit=$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE") age=${custom_age}d tags=$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")"
-  info "  live-iso:     ref=$LIVE_ISO_REF kind=$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF") commit=$(git -C "$LIVE_ISO_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$LIVE_ISO_SOURCE") age=${live_age}d tags=$(repo_exact_tags "$LIVE_ISO_SOURCE")"
-  info "  target base:  $CUSTOM_IMAGE_BASE"
-  info "  live builder: $LIVE_ISO_CONTAINER_IMAGE"
-
-  if [[ "$live_age" =~ ^[0-9]+$ ]] && (( live_age > SOURCE_STALE_WARN_DAYS )); then
-    warn "live-iso is older than ${SOURCE_STALE_WARN_DAYS} days. This is the refreshed upstream '$LIVE_ISO_REF' state, not a failed Git update."
-  fi
-  if [[ "$custom_age" =~ ^[0-9]+$ ]] && (( custom_age > SOURCE_STALE_WARN_DAYS )); then
-    warn "custom-image is older than ${SOURCE_STALE_WARN_DAYS} days."
-  fi
+  local custom_age live_age; custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"; live_age="$(repo_commit_age_days "$LIVE_ISO_SOURCE")"
+  info "Source-reference strategy:"; info "  custom-image: ref=$CUSTOM_IMAGE_REF kind=$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF") commit=$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE") age=${custom_age}d tags=$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")"; info "  live-iso: ref=$LIVE_ISO_REF kind=$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF") commit=$(git -C "$LIVE_ISO_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$LIVE_ISO_SOURCE") age=${live_age}d tags=$(repo_exact_tags "$LIVE_ISO_SOURCE")"; info "  target base: $CUSTOM_IMAGE_BASE"; info "  live builder: $LIVE_ISO_CONTAINER_IMAGE"
+  [[ "$live_age" =~ ^[0-9]+$ ]] && (( live_age > SOURCE_STALE_WARN_DAYS )) && warn "live-iso is older than ${SOURCE_STALE_WARN_DAYS} days."
+  [[ "$custom_age" =~ ^[0-9]+$ ]] && (( custom_age > SOURCE_STALE_WARN_DAYS )) && warn "custom-image is older than ${SOURCE_STALE_WARN_DAYS} days."
 }
 
 repo_action_menu() {
   local name="$1" path="$2" ref="$3"
-  menu "Repository Validation\n\nRepository: $name\nPath:       $path\nRequested:  $ref\nState:      $(repo_state "$path")" "2" \
+  menu "Repository Validation\n\nRepository: $name\nPath: $path\nRequested: $ref\nState: $(repo_state "$path")" "2" \
     "1|Continue with existing validated checkout|No fetch; requested ref must resolve locally and checkout must be clean." \
     "2|Refresh from origin [RECOMMENDED]|Fetch/prune and checkout the requested branch, tag, or commit." \
     "3|Re-clone clean|Delete this checkout and clone the configured origin again." \
     "4|Open a shell here|Inspect or repair the checkout, then return." \
     "5|Abort|Stop source preparation."
 }
-
 checkout_requested_ref() {
-  local path="$1" ref="$2" allow_fetch="$3"
-  (( allow_fetch == 1 )) && git -C "$path" fetch --all --tags --prune
-
+  local path="$1" ref="$2" allow_fetch="$3"; (( allow_fetch == 1 )) && git -C "$path" fetch --all --tags --prune
   if git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
-    if git -C "$path" show-ref --verify --quiet "refs/heads/$ref"; then
-      git -C "$path" checkout "$ref"
-      (( allow_fetch == 1 )) && git -C "$path" merge --ff-only "origin/$ref"
-    else
-      git -C "$path" checkout -b "$ref" --track "origin/$ref"
-    fi
-  elif git -C "$path" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
-    git -C "$path" checkout --detach "$ref"
-  elif (( allow_fetch == 1 )); then
-    git -C "$path" fetch origin "$ref"
-    git -C "$path" checkout --detach FETCH_HEAD
-  else
-    die "Requested ref '$ref' is not available locally in $path."
-  fi
+    if git -C "$path" show-ref --verify --quiet "refs/heads/$ref"; then git -C "$path" checkout "$ref"; (( allow_fetch == 1 )) && git -C "$path" merge --ff-only "origin/$ref"; else git -C "$path" checkout -b "$ref" --track "origin/$ref"; fi
+  elif git -C "$path" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then git -C "$path" checkout --detach "$ref"
+  elif (( allow_fetch == 1 )); then git -C "$path" fetch origin "$ref"; git -C "$path" checkout --detach FETCH_HEAD
+  else die "Requested ref '$ref' is not available locally in $path."; fi
 }
-
-check_git_remote_access() {
-  local name="$1" url="$2"
-  info "Checking remote access for $name: $url"
-  git ls-remote "$url" HEAD >/dev/null 2>&1 ||     die "Unable to access configured Git remote for $name: $url"
-  ok "$name remote is reachable."
-}
-
-verify_required_source_checkouts() {
-  [[ -d "$CUSTOM_IMAGE_SOURCE/.git" ]] ||     die "Required custom-image checkout is absent after synchronization: $CUSTOM_IMAGE_SOURCE"
-  [[ -d "$LIVE_ISO_SOURCE/.git" ]] ||     die "Required live-iso checkout is absent after synchronization: $LIVE_ISO_SOURCE"
-  [[ -n "$CUSTOM_SOURCE_COMMIT" ]] || die "custom-image source commit was not recorded."
-  [[ -n "$LIVE_SOURCE_COMMIT" ]] || die "live-iso source commit was not recorded."
-  [[ -z "$(git -C "$CUSTOM_IMAGE_SOURCE" status --porcelain)" ]] ||     die "custom-image checkout is dirty after synchronization."
-  [[ -z "$(git -C "$LIVE_ISO_SOURCE" status --porcelain)" ]] ||     die "live-iso checkout is dirty after synchronization."
-
-  SOURCES_SYNCHRONIZED=1
-  ok "Required source checkouts are present and clean."
-  info "custom-image: $CUSTOM_IMAGE_SOURCE @ $CUSTOM_SOURCE_COMMIT"
-  info "live-iso:     $LIVE_ISO_SOURCE @ $LIVE_SOURCE_COMMIT"
-}
-
-report_repository_plan_state() {
-  info "Plan mode is non-mutating: repositories will not be cloned, fetched, reset, or refreshed."
-  info "Selected execute-time repository policy: $REPO_POLICY"
-  info "custom-image current state: $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"
-  info "live-iso current state:     $(source_checkout_summary "$LIVE_ISO_SOURCE")"
-  info "core-image retained state:  $(source_checkout_summary "$CORE_IMAGE_SOURCE")"
-  info "desktop-image retained:     $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
-  info "qcom updater state:         $(source_checkout_summary "$QCOM_UPDATER_DIR")"
-
-  if [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
-    warn "Legacy live-iso-v7 path is present and will be normalized in execute mode when safe."
-  fi
-
-  if [[ ! -d "$CUSTOM_IMAGE_SOURCE/.git" || ! -d "$LIVE_ISO_SOURCE/.git" ]]; then
-    warn "One or both required source checkouts are absent. Execute mode will create them using policy '$REPO_POLICY'."
-  fi
-
-  return 0
-}
-
-source_checkout_summary() {
-  local path="$1"
-  if [[ -d "$path/.git" ]]; then
-    repo_state "$path"
-  elif [[ -e "$path" ]]; then
-    printf 'present but not a Git checkout'
-  else
-    printf 'absent'
-  fi
-  return 0
-}
-
+check_git_remote_access() { local name="$1" url="$2"; info "Checking remote access for $name: $url"; git ls-remote "$url" HEAD >/dev/null 2>&1 || die "Unable to access configured Git remote for $name: $url"; ok "$name remote is reachable."; }
+verify_required_source_checkouts() { [[ -d "$CUSTOM_IMAGE_SOURCE/.git" ]] || die "Required custom-image checkout is absent after synchronization: $CUSTOM_IMAGE_SOURCE"; [[ -d "$LIVE_ISO_SOURCE/.git" ]] || die "Required live-iso checkout is absent after synchronization: $LIVE_ISO_SOURCE"; [[ -n "$CUSTOM_SOURCE_COMMIT" && -n "$LIVE_SOURCE_COMMIT" ]] || die "Required source commits were not recorded."; [[ -z "$(git -C "$CUSTOM_IMAGE_SOURCE" status --porcelain)" ]] || die "custom-image checkout is dirty after synchronization."; [[ -z "$(git -C "$LIVE_ISO_SOURCE" status --porcelain)" ]] || die "live-iso checkout is dirty after synchronization."; SOURCES_SYNCHRONIZED=1; ok "Required source checkouts are present and clean."; }
+source_checkout_summary() { local path="$1"; if [[ -d "$path/.git" ]]; then repo_state "$path"; elif [[ -e "$path" ]]; then printf 'present but not a Git checkout'; else printf absent; fi; }
+report_repository_plan_state() { info "Plan mode is non-mutating: repositories will not be cloned, fetched, reset, or refreshed."; info "Selected execute-time repository policy: $REPO_POLICY"; info "custom-image current state: $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"; info "live-iso current state: $(source_checkout_summary "$LIVE_ISO_SOURCE")"; info "core-image retained state: $(source_checkout_summary "$CORE_IMAGE_SOURCE")"; info "desktop-image retained: $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"; info "qcom updater state: $(source_checkout_summary "$QCOM_UPDATER_DIR")"; [[ ! -e "$LEGACY_LIVE_ISO_SOURCE" ]] || warn "Legacy live-iso-v7 path is present and will be normalized in execute mode when safe."; [[ -d "$CUSTOM_IMAGE_SOURCE/.git" && -d "$LIVE_ISO_SOURCE/.git" ]] || warn "One or both required source checkouts are absent. Execute mode will create them using policy '$REPO_POLICY'."; return 0; }
 normalize_live_iso_source_path() {
-  # v7.0.2-v7.0.4 used sources/live-iso-v7. The repository itself is still the
-  # official VanillaOS live-iso checkout, so the version suffix adds no useful
-  # distinction. Migrate only when the canonical destination is absent and the
-  # legacy directory is a clean checkout with the expected origin.
-  [[ "$LIVE_ISO_SOURCE" == "$SOURCES_DIR/live-iso" ]] || \
-    die "Internal source-layout guard: canonical live ISO path is not sources/live-iso."
-
-  if [[ -d "$LIVE_ISO_SOURCE/.git" ]]; then
-    if [[ -d "$LEGACY_LIVE_ISO_SOURCE/.git" ]]; then
-      warn "Both canonical and legacy live-iso checkouts exist."
-      warn "Using:    $LIVE_ISO_SOURCE"
-      warn "Leaving:  $LEGACY_LIVE_ISO_SOURCE"
-    fi
-    return 0
-  fi
-
-  [[ -e "$LIVE_ISO_SOURCE" ]] && \
-    die "Canonical live-iso path exists but is not a Git checkout: $LIVE_ISO_SOURCE"
-
+  [[ "$LIVE_ISO_SOURCE" == "$SOURCES_DIR/live-iso" ]] || die "Internal source-layout guard: canonical live ISO path is not sources/live-iso."
+  if [[ -d "$LIVE_ISO_SOURCE/.git" ]]; then [[ ! -d "$LEGACY_LIVE_ISO_SOURCE/.git" ]] || warn "Both canonical and legacy live-iso checkouts exist; using canonical."; return 0; fi
+  [[ ! -e "$LIVE_ISO_SOURCE" ]] || die "Canonical live-iso path exists but is not a Git checkout: $LIVE_ISO_SOURCE"
   if [[ -d "$LEGACY_LIVE_ISO_SOURCE/.git" ]]; then
-    local legacy_origin expected_origin
-    legacy_origin="$(
-      normalize_git_url "$(git -C "$LEGACY_LIVE_ISO_SOURCE" remote get-url origin)"
-    )"
-    expected_origin="$(normalize_git_url "$LIVE_ISO_REPO_URL")"
-
-    [[ "$legacy_origin" == "$expected_origin" ]] || {
-      warn "Legacy live-iso-v7 checkout has an unexpected origin: $legacy_origin"
-      warn "It will be preserved; a canonical live-iso checkout will be cloned."
-      return 0
-    }
-
-    [[ -z "$(git -C "$LEGACY_LIVE_ISO_SOURCE" status --porcelain)" ]] || {
-      warn "Legacy live-iso-v7 checkout is dirty and will not be moved."
-      warn "It will be preserved; resolve it manually or allow a fresh canonical clone."
-      return 0
-    }
-
-    info "Migrating legacy source checkout to canonical path:"
-    info "  from: $LEGACY_LIVE_ISO_SOURCE"
-    info "  to:   $LIVE_ISO_SOURCE"
-    mv "$LEGACY_LIVE_ISO_SOURCE" "$LIVE_ISO_SOURCE"
-    ok "Canonical live-iso source path restored."
-  elif [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
-    warn "Legacy path exists but is not a Git checkout and will be preserved: $LEGACY_LIVE_ISO_SOURCE"
+    local legacy_origin expected_origin; legacy_origin="$(normalize_git_url "$(git -C "$LEGACY_LIVE_ISO_SOURCE" remote get-url origin)")"; expected_origin="$(normalize_git_url "$LIVE_ISO_REPO_URL")"
+    [[ "$legacy_origin" == "$expected_origin" ]] || { warn "Legacy live-iso-v7 checkout has unexpected origin and will be preserved."; return 0; }
+    [[ -z "$(git -C "$LEGACY_LIVE_ISO_SOURCE" status --porcelain)" ]] || { warn "Legacy live-iso-v7 checkout is dirty and will not be moved."; return 0; }
+    mv "$LEGACY_LIVE_ISO_SOURCE" "$LIVE_ISO_SOURCE"; ok "Canonical live-iso source path restored."
   fi
-
-  return 0
 }
-
-report_preserved_source_layout() {
-  info "Source checkout layout:"
-  info "  custom-image:          $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"
-  info "  live-iso:              $(source_checkout_summary "$LIVE_ISO_SOURCE")"
-  info "  core-image:            $(source_checkout_summary "$CORE_IMAGE_SOURCE")"
-  info "  desktop-image:         $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"
-  info "  qcom-firmware-updater: $(source_checkout_summary "$QCOM_UPDATER_DIR")"
-
-  if [[ -e "$LEGACY_LIVE_ISO_SOURCE" ]]; then
-    warn "Legacy source path remains present: $LEGACY_LIVE_ISO_SOURCE"
-  fi
-
-  # This is a reporting function. Optional absent source trees are normal and
-  # must never become its return status under `set -e`.
-  return 0
-}
-
+report_preserved_source_layout() { info "Source checkout layout:"; info "  custom-image: $(source_checkout_summary "$CUSTOM_IMAGE_SOURCE")"; info "  live-iso: $(source_checkout_summary "$LIVE_ISO_SOURCE")"; info "  core-image: $(source_checkout_summary "$CORE_IMAGE_SOURCE")"; info "  desktop-image: $(source_checkout_summary "$DESKTOP_IMAGE_SOURCE")"; info "  qcom-firmware-updater: $(source_checkout_summary "$QCOM_UPDATER_DIR")"; return 0; }
 sync_repo() {
-  local name="$1" url="$2" ref="$3" path="$4"
-  mkdir -p "$(dirname "$path")"
-
-  if [[ -e "$path" && ! -d "$path/.git" ]]; then
-    if ! is_interactive; then die "$path exists but is not a Git repository."; fi
-    local nongit
-    nongit="$(menu "Non-Git Source Directory\n\n$name expects a Git checkout at:\n  $path" "2" \
-      "1|Open a shell|Inspect or move the directory manually." \
-      "2|Move it aside and clone clean|Rename with a timestamp suffix." \
-      "3|Abort|Stop source handling.")"
-    case "$nongit" in
-      1) open_shell "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-      2) mv "$path" "${path}.non-git.$(date -u +%Y%m%d%H%M%S)" ;;
-      3) die "Non-Git source directory encountered." ;;
-    esac
-  fi
-
-  if [[ ! -d "$path/.git" ]]; then
-    check_git_remote_access "$name" "$url"
-    info "Cloning $name from $url into $path"
-    git clone "$url" "$path"
-    git -C "$path" config --local advice.detachedHead false
-    checkout_requested_ref "$path" "$ref" 1
+  local name="$1" url="$2" ref="$3" path="$4"; mkdir -p "$(dirname "$path")"
+  if [[ -e "$path" && ! -d "$path/.git" ]]; then is_interactive || die "$path exists but is not a Git repository."; mv "$path" "${path}.non-git.$(date -u +%Y%m%d%H%M%S)"; fi
+  if [[ ! -d "$path/.git" ]]; then check_git_remote_access "$name" "$url"; git clone "$url" "$path"; git -C "$path" config --local advice.detachedHead false; checkout_requested_ref "$path" "$ref" 1
   else
     git config --global --add safe.directory "$path" >/dev/null 2>&1 || true
-    local actual expected policy="$REPO_POLICY" choice
-    actual="$(normalize_git_url "$(git -C "$path" remote get-url origin 2>/dev/null || true)")"
-    expected="$(normalize_git_url "$url")"
-    if [[ "$actual" != "$expected" ]]; then
-      if ! is_interactive; then die "$name origin mismatch: expected $expected, found $actual"; fi
-      choice="$(menu "Repository Origin Mismatch\n\n$name\nExpected: $expected\nActual:   $actual" "2" \
-        "1|Use the existing origin for this run|Continue only after explicit operator acceptance." \
-        "2|Re-clone from the configured official origin [RECOMMENDED]|Replace the checkout." \
-        "3|Open a shell|Inspect remotes manually." \
-        "4|Abort|Stop.")"
-      case "$choice" in
-        1) warn "Using nonconfigured origin for $name: $actual" ;;
-        2) rm -rf "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-        3) open_shell "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-        4) die "Repository origin validation failed." ;;
-      esac
-    fi
-
-    if [[ "$policy" == "prompt" ]]; then
-      choice="$(repo_action_menu "$name" "$path" "$ref")"
-      case "$choice" in
-        1) policy=continue ;;
-        2) policy=refresh ;;
-        3) policy=reclone ;;
-        4) open_shell "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-        5) die "Repository handling aborted." ;;
-      esac
-    fi
-
+    local actual expected policy="$REPO_POLICY" choice; actual="$(normalize_git_url "$(git -C "$path" remote get-url origin 2>/dev/null || true)")"; expected="$(normalize_git_url "$url")"
+    [[ "$actual" == "$expected" ]] || die "$name origin mismatch: expected $expected, found $actual"
+    if [[ "$policy" == prompt ]]; then choice="$(repo_action_menu "$name" "$path" "$ref")"; case "$choice" in 1) policy=continue;; 2) policy=refresh;; 3) policy=reclone;; 4) open_shell "$path"; sync_repo "$name" "$url" "$ref" "$path"; return;; 5) die "Repository handling aborted.";; esac; fi
     case "$policy" in
-      continue)
-        [[ -z "$(git -C "$path" status --porcelain)" ]] || die "$name checkout is dirty under continue policy: $path"
-        checkout_requested_ref "$path" "$ref" 0
-        ;;
-      refresh)
-        check_git_remote_access "$name" "$url"
-        [[ -z "$(git -C "$path" status --porcelain)" ]] || {
-          if ! is_interactive; then die "$name checkout is dirty: $path"; fi
-          choice="$(menu "Dirty Git Checkout\n\n$name contains local changes:\n  $path" "2" \
-            "1|Open a shell and resolve manually|Return after commit, stash, or reset." \
-            "2|Re-clone clean [RECOMMENDED]|Replace the dirty checkout." \
-            "3|Abort|Preserve the checkout and stop.")"
-          case "$choice" in
-            1) open_shell "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-            2) rm -rf "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
-            3) die "Dirty checkout preserved; build stopped." ;;
-          esac
-        }
-        checkout_requested_ref "$path" "$ref" 1
-        ;;
-      reclone)
-        rm -rf "$path"
-        sync_repo "$name" "$url" "$ref" "$path"
-        return
-        ;;
+      continue) [[ -z "$(git -C "$path" status --porcelain)" ]] || die "$name checkout is dirty under continue policy: $path"; checkout_requested_ref "$path" "$ref" 0 ;;
+      refresh) check_git_remote_access "$name" "$url"; [[ -z "$(git -C "$path" status --porcelain)" ]] || die "$name checkout is dirty: $path"; checkout_requested_ref "$path" "$ref" 1 ;;
+      reclone) rm -rf "$path"; sync_repo "$name" "$url" "$ref" "$path"; return ;;
       *) die "Unsupported repository policy: $policy" ;;
     esac
   fi
-
-  local current_origin
-  current_origin="$(normalize_git_url "$(git -C "$path" remote get-url origin)")"
-  [[ "$current_origin" == "$(normalize_git_url "$url")" ]] || warn "$name is using accepted alternate origin: $current_origin"
   [[ -z "$(git -C "$path" status --porcelain)" ]] || die "$name checkout is not clean after synchronization."
   ok "$name validated: $(repo_state "$path")"
 }
-
-sync_required_repositories() {
-  info "Beginning required official source synchronization."
-  normalize_live_iso_source_path
-  report_preserved_source_layout
-  sync_repo "VanillaOS custom-image" "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" "$CUSTOM_IMAGE_SOURCE"
-  sync_repo "VanillaOS live-iso" "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" "$LIVE_ISO_SOURCE"
-  CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"
-  LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"
-  verify_required_source_checkouts
-  write_source_provenance_manifest
-  write_reunion_convergence_manifest
-  report_source_provenance
-  return 0
-}
+sync_required_repositories() { info "Beginning required official source synchronization."; normalize_live_iso_source_path; report_preserved_source_layout; sync_repo "VanillaOS custom-image" "$CUSTOM_IMAGE_REPO_URL" "$CUSTOM_IMAGE_REF" "$CUSTOM_IMAGE_SOURCE"; sync_repo "VanillaOS live-iso" "$LIVE_ISO_REPO_URL" "$LIVE_ISO_REF" "$LIVE_ISO_SOURCE"; CUSTOM_SOURCE_COMMIT="$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse HEAD)"; LIVE_SOURCE_COMMIT="$(git -C "$LIVE_ISO_SOURCE" rev-parse HEAD)"; verify_required_source_checkouts; write_source_provenance_manifest; write_reunion_convergence_manifest; report_source_provenance; return 0; }
 
 # ------------------------- firmware staging ------------------------------
-
-normalize_qcom_soc_firmware_policy() {
-  # Compatibility-only normalization for the legacy CLI variables.
-  case "${FIRMWARE_QCOM_SOC_POLICY,,}" in
-    require|required|strict) FIRMWARE_QCOM_SOC_POLICY="require" ;;
-    auto|optional) FIRMWARE_QCOM_SOC_POLICY="auto" ;;
-    skip|none|disabled) FIRMWARE_QCOM_SOC_POLICY="skip" ;;
-    *) die "Invalid Qualcomm SoC firmware package policy: $FIRMWARE_QCOM_SOC_POLICY" ;;
-  esac
-}
-
-sha256_is_valid() {
-  [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]
-}
-
+normalize_qcom_soc_firmware_policy() { case "${FIRMWARE_QCOM_SOC_POLICY,,}" in require|required|strict) FIRMWARE_QCOM_SOC_POLICY=require;; auto|optional) FIRMWARE_QCOM_SOC_POLICY=auto;; skip|none|disabled) FIRMWARE_QCOM_SOC_POLICY=skip;; *) die "Invalid Qualcomm SoC firmware package policy: $FIRMWARE_QCOM_SOC_POLICY";; esac; }
+sha256_is_valid() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
 read_package_checksum_sidecar() {
-  local deb="$1" sidecar base hash
-  base="$(basename "$deb")"
-  FIRMWARE_CHECKSUM_CANDIDATE=""
-  FIRMWARE_CHECKSUM_SOURCE=""
-  local -a sidecars=("$deb.sha256" "${deb%.deb}.sha256" "$(dirname "$deb")/SHA256SUMS")
-  for sidecar in "${sidecars[@]}"; do
-    [[ -f "$sidecar" ]] || continue
-    hash="$(awk -v base="$base" '
-      $1 ~ /^[0-9A-Fa-f]{64}$/ {
-        name=$2; sub(/^\*/, "", name); leaf=name; sub(/^.*\//, "", leaf)
-        if (name == base || name == "./" base || leaf == base) { print tolower($1); found=1; exit }
-        if (NF == 1 && fallback == "") fallback=tolower($1)
-      }
-      END { if (!found && fallback != "") print fallback }
-    ' "$sidecar" | sed -n '1p')"
-    if sha256_is_valid "$hash"; then
-      FIRMWARE_CHECKSUM_CANDIDATE="${hash,,}"
-      FIRMWARE_CHECKSUM_SOURCE="$sidecar"
-      return 0
-    fi
-  done
-  return 1
+  local deb="$1" sidecar base hash; base="$(basename "$deb")"; FIRMWARE_CHECKSUM_CANDIDATE=""; FIRMWARE_CHECKSUM_SOURCE=""; local -a sidecars=("$deb.sha256" "${deb%.deb}.sha256" "$(dirname "$deb")/SHA256SUMS")
+  for sidecar in "${sidecars[@]}"; do [[ -f "$sidecar" ]] || continue; hash="$(awk -v base="$base" '$1 ~ /^[0-9A-Fa-f]{64}$/ {name=$2; sub(/^\*/,"",name); leaf=name; sub(/^.*\//,"",leaf); if(name==base||name=="./" base||leaf==base){print tolower($1);found=1;exit} if(NF==1&&fallback=="")fallback=tolower($1)} END{if(!found&&fallback!="")print fallback}' "$sidecar" | sed -n '1p')"; if sha256_is_valid "$hash"; then FIRMWARE_CHECKSUM_CANDIDATE="${hash,,}"; FIRMWARE_CHECKSUM_SOURCE="$sidecar"; return 0; fi; done; return 1
 }
-
-write_firmware_package_checksum_sidecar() {
-  local deb="$1" actual="$2" package="$3" sidecar tmp base
-  base="$(basename "$deb")"
-  sidecar="$deb.sha256"
-  tmp="$(mktemp "$(dirname "$sidecar")/.${base}.sha256.tmp.XXXXXX")"
-  printf '%s  %s\n' "$actual" "$base" > "$tmp"
-  chmod 0644 "$tmp"
-  mv -f -- "$tmp" "$sidecar"
-  FIRMWARE_CHECKSUM_CANDIDATE="$actual"
-  FIRMWARE_CHECKSUM_SOURCE="$sidecar (created interactively)"
-  ok "Pinned $package checksum sidecar: $sidecar"
-}
+write_firmware_package_checksum_sidecar() { local deb="$1" actual="$2" package="$3" sidecar tmp base; base="$(basename "$deb")"; sidecar="$deb.sha256"; tmp="$(mktemp "$(dirname "$sidecar")/.${base}.sha256.tmp.XXXXXX")"; printf '%s  %s\n' "$actual" "$base" > "$tmp"; chmod 0644 "$tmp"; mv -f -- "$tmp" "$sidecar"; FIRMWARE_CHECKSUM_CANDIDATE="$actual"; FIRMWARE_CHECKSUM_SOURCE="$sidecar (created interactively)"; ok "Pinned $package checksum sidecar: $sidecar"; }
 
 resolve_missing_firmware_package_checksum() {
   local deb="$1" actual="$2" package="$3" version="$4" choice entered
-  FIRMWARE_CHECKSUM_CANDIDATE=""
-  FIRMWARE_CHECKSUM_SOURCE=""
-  if (( PLAN_ONLY == 1 )); then
-    warn "No persistent SHA-256 pin exists for $(basename "$deb"). Plan mode will carry the observed hash into the exact execute command."
-    FIRMWARE_CHECKSUM_CANDIDATE="$actual"
-    FIRMWARE_CHECKSUM_SOURCE="plan-observed SHA-256; not persisted"
-    return 0
-  fi
+  FIRMWARE_CHECKSUM_CANDIDATE=""; FIRMWARE_CHECKSUM_SOURCE=""
+  if (( PLAN_ONLY == 1 )); then warn "No persistent SHA-256 pin exists for $(basename "$deb"). Plan mode will carry the observed hash into execute."; FIRMWARE_CHECKSUM_CANDIDATE="$actual"; FIRMWARE_CHECKSUM_SOURCE="plan-observed SHA-256; not persisted"; return 0; fi
   is_interactive || return 1
-  printf '\nFirmware package requires an explicit SHA-256 pin.\n' >&2
-  printf 'Package:      %s (%s)\n' "$package" "$version" >&2
-  printf 'Artifact:     %s\n' "$deb" >&2
-  printf 'Observed SHA: %s\n' "$actual" >&2
-  choice="$(menu "Pin Firmware Package\n\nThe builder will not silently trust this package." "1" \
-    "1|Trust this local artifact and write its sidecar|Atomically create $(basename "$deb").sha256 beside the package." \
-    "2|Enter an independently obtained SHA-256|Continue only if it matches." \
-    "3|Abort before firmware extraction|Leave package and outputs unchanged.")"
-  case "$choice" in
-    1) write_firmware_package_checksum_sidecar "$deb" "$actual" "$package" ;;
-    2)
-      entered="$(prompt_text "Expected SHA-256 for $package" "")"
-      sha256_is_valid "$entered" || die "Entered SHA-256 is invalid for $package"
-      FIRMWARE_CHECKSUM_CANDIDATE="${entered,,}"
-      FIRMWARE_CHECKSUM_SOURCE="interactive operator entry"
-      ;;
-    3) die "Build aborted: $package remains unpinned." ;;
-  esac
+  choice="$(menu "Pin Firmware Package\n\nPackage: $package ($version)\nObserved SHA: $actual" "1" "1|Trust this artifact and write sidecar|Create package .sha256." "2|Enter independent SHA-256|Continue only if it matches." "3|Abort|Leave package unpinned.")"
+  case "$choice" in 1) write_firmware_package_checksum_sidecar "$deb" "$actual" "$package";; 2) entered="$(prompt_text "Expected SHA-256 for $package" "")"; sha256_is_valid "$entered" || die "Entered SHA-256 is invalid for $package"; FIRMWARE_CHECKSUM_CANDIDATE="${entered,,}"; FIRMWARE_CHECKSUM_SOURCE="interactive operator entry";; 3) die "Build aborted: $package remains unpinned.";; esac
 }
-
-firmware_deb_candidates() {
-  local directory
-  for directory in "$ARTIFACT_DIR/firmware-debs" "$ARTIFACT_DIR" "$WORKDIR/firmware-debs"; do
-    [[ -d "$directory" ]] || continue
-    find "$directory" -maxdepth 1 -type f -name '*.deb' -print
-  done | LC_ALL=C sort -u
-}
-
+firmware_deb_candidates() { local directory; for directory in "$ARTIFACT_DIR/firmware-debs" "$ARTIFACT_DIR" "$WORKDIR/firmware-debs"; do [[ -d "$directory" ]] || continue; find "$directory" -maxdepth 1 -type f -name '*.deb' -print; done | LC_ALL=C sort -u; }
 resolve_firmware_packages() {
-  mkdir -p "$FIRMWARE_PROVENANCE_DIR"
-  validate_firmware_package_specs
-  printf 'package\tarchitecture\trequired\tversion\tsha256\tsource\tchecksum_source\n' > "$FIRMWARE_PACKAGE_INVENTORY_FILE"
-  printf '[]\n' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
-
-  local mandatory_count
-  mandatory_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
-  if [[ "${FIRMWARE_MODE,,}" == "skip" ]]; then
-    if (( mandatory_count > 0 || ${#PROFILE_FIRMWARE_PROBES[@]} > 0 )) || [[ "$FIRMWARE_BOARD_POLICY" == "required" ]]; then
-      die "FIRMWARE_MODE=skip conflicts with mandatory firmware declarations."
-    fi
-    printf '[]\n' > "$FIRMWARE_PACKAGE_LOCK_FILE"
-    FIRMWARE_PACKAGE_OVERRIDES_JSON='[]'
-    info "Firmware package resolution skipped by profile/operator policy."
-    return 0
-  fi
-
-  local count index package architecture required source expected_sha expected_version
-  local actual_package actual_arch actual_version actual_sha checksum_source
-  local -a candidates=() matching=()
-  count="$(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+  mkdir -p "$FIRMWARE_PROVENANCE_DIR"; validate_firmware_package_specs
+  printf 'package\tarchitecture\trequired\tversion\tsha256\tsource\tchecksum_source\n' > "$FIRMWARE_PACKAGE_INVENTORY_FILE"; printf '[]\n' > "$FIRMWARE_PACKAGES_RESOLVED_FILE"
+  local mandatory_count; mandatory_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+  if [[ "${FIRMWARE_MODE,,}" == skip ]]; then (( mandatory_count == 0 && ${#PROFILE_FIRMWARE_PROBES[@]} == 0 )) && [[ "$FIRMWARE_BOARD_POLICY" != required ]] || die "FIRMWARE_MODE=skip conflicts with mandatory firmware declarations."; printf '[]\n' > "$FIRMWARE_PACKAGE_LOCK_FILE"; FIRMWARE_PACKAGE_OVERRIDES_JSON='[]'; return 0; fi
+  local count index package architecture required source expected_sha expected_version actual_package actual_arch actual_version actual_sha checksum_source candidate candidate_pkg candidate_arch safe
+  local -a candidates=() matching=(); count="$(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
   for ((index=0; index<count; index++)); do
-    package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGE_SPECS_FILE")"
-    architecture="$(jq -r ".[$index].architecture // \"all\"" "$FIRMWARE_PACKAGE_SPECS_FILE")"
-    required="$(jq -r ".[$index].required // false" "$FIRMWARE_PACKAGE_SPECS_FILE")"
-    source="$(jq -r ".[$index].source // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"
-    expected_sha="$(jq -r ".[$index].sha256 // empty" "$FIRMWARE_PACKAGE_SPECS_FILE" | tr '[:upper:]' '[:lower:]')"
-    expected_version="$(jq -r ".[$index].expected_version // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"
-
-    if [[ -n "$source" ]]; then
-      source="$(resolve_profile_path "$source")"
-      [[ -f "$source" ]] || die "Firmware package source does not exist for $package: $source"
-    else
-      mapfile -t candidates < <(firmware_deb_candidates)
-      matching=()
-      local candidate candidate_pkg candidate_arch
-      for candidate in "${candidates[@]}"; do
-        candidate_pkg="$(package_field "$candidate" Package)"
-        candidate_arch="$(package_field "$candidate" Architecture)"
-        [[ "$candidate_pkg" == "$package" && "$candidate_arch" == "$architecture" ]] && matching+=("$candidate")
-      done
-      case "${#matching[@]}" in
-        0)
-          if [[ "$required" == true ]]; then
-            die "Required firmware package $package:$architecture was not found by Debian control metadata under the firmware artifact directories."
-          fi
-          info "Optional firmware package not supplied: $package:$architecture"
-          continue
-          ;;
-        1) source="${matching[0]}" ;;
-        *)
-          printf 'Multiple firmware artifacts match %s:%s:\n' "$package" "$architecture" >&2
-          printf '  %s\n' "${matching[@]}" >&2
-          die "Set firmware.packages[].source explicitly for $package:$architecture"
-          ;;
-      esac
-    fi
-
-    actual_package="$(package_field "$source" Package)"
-    actual_arch="$(package_field "$source" Architecture)"
-    actual_version="$(package_field "$source" Version)"
-    [[ "$actual_package" == "$package" ]] || die "Firmware package identity mismatch: expected=$package actual=${actual_package:-unreadable} source=$source"
-    [[ "$actual_arch" == "$architecture" ]] || die "Firmware package architecture mismatch for $package: expected=$architecture actual=${actual_arch:-unreadable}"
-    [[ -n "$actual_version" ]] || die "Unable to read firmware package version: $source"
-    [[ -z "$expected_version" || "$actual_version" == "$expected_version" ]] || \
-      die "Firmware package version mismatch for $package: expected=$expected_version actual=$actual_version"
-
-    actual_sha="$(sha256sum "$source" | awk '{print tolower($1)}')"
-    checksum_source=""
-    if [[ -n "$expected_sha" ]]; then
-      FIRMWARE_CHECKSUM_SOURCE="profile/environment override"
-    elif read_package_checksum_sidecar "$source"; then
-      expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"
-    elif resolve_missing_firmware_package_checksum "$source" "$actual_sha" "$package" "$actual_version"; then
-      expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"
-    else
-      die "A pinned SHA-256 is required for $package. Observed: $actual_sha"
-    fi
-    checksum_source="$FIRMWARE_CHECKSUM_SOURCE"
-    sha256_is_valid "$expected_sha" || die "Resolved firmware SHA-256 is invalid for $package"
-    [[ "$actual_sha" == "$expected_sha" ]] || die "Firmware checksum mismatch for $package: expected=$expected_sha actual=$actual_sha"
-
-    local safe package_info filelist copyright_path
-    safe="$(printf '%s_%s' "$package" "$architecture" | sed 's/[^A-Za-z0-9._-]/_/g')"
-    dpkg-deb --info "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.package-info.txt"
-    dpkg-deb --contents "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.filelist.txt"
-    printf '%s  %s\n' "$actual_sha" "$(basename "$source")" > "$FIRMWARE_PROVENANCE_DIR/$safe.sha256"
-    printf '%s\n' "$checksum_source" > "$FIRMWARE_PROVENANCE_DIR/$safe.checksum-source.txt"
-
-    jq \
-      --arg package "$package" --arg architecture "$architecture" \
-      --argjson required "$required" --arg source "$source" \
-      --arg version "$actual_version" --arg sha "$actual_sha" \
-      --arg checksum_source "$checksum_source" \
-      '. + [{package:$package,architecture:$architecture,required:$required,source:$source,version:$version,sha256:$sha,checksum_source:$checksum_source}]' \
-      "$FIRMWARE_PACKAGES_RESOLVED_FILE" > "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp"
-    mv -f "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp" "$FIRMWARE_PACKAGES_RESOLVED_FILE"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$package" "$architecture" "$required" "$actual_version" "$actual_sha" "$source" "$checksum_source" >> "$FIRMWARE_PACKAGE_INVENTORY_FILE"
-    ok "Resolved firmware package by metadata: $package:$architecture $actual_version"
+    package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGE_SPECS_FILE")"; architecture="$(jq -r ".[$index].architecture // \"all\"" "$FIRMWARE_PACKAGE_SPECS_FILE")"; required="$(jq -r ".[$index].required // false" "$FIRMWARE_PACKAGE_SPECS_FILE")"; source="$(jq -r ".[$index].source // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"; expected_sha="$(jq -r ".[$index].sha256 // empty" "$FIRMWARE_PACKAGE_SPECS_FILE" | tr '[:upper:]' '[:lower:]')"; expected_version="$(jq -r ".[$index].expected_version // empty" "$FIRMWARE_PACKAGE_SPECS_FILE")"
+    if [[ -n "$source" ]]; then source="$(resolve_profile_path "$source")"; [[ -f "$source" ]] || die "Firmware package source does not exist for $package: $source"; else mapfile -t candidates < <(firmware_deb_candidates); matching=(); for candidate in "${candidates[@]}"; do candidate_pkg="$(package_field "$candidate" Package)"; candidate_arch="$(package_field "$candidate" Architecture)"; [[ "$candidate_pkg" == "$package" && "$candidate_arch" == "$architecture" ]] && matching+=("$candidate"); done; case "${#matching[@]}" in 0) [[ "$required" == true ]] && die "Required firmware package $package:$architecture was not found." || { info "Optional firmware package not supplied: $package:$architecture"; continue; };; 1) source="${matching[0]}";; *) die "Multiple firmware artifacts match $package:$architecture; set source explicitly.";; esac; fi
+    actual_package="$(package_field "$source" Package)"; actual_arch="$(package_field "$source" Architecture)"; actual_version="$(package_field "$source" Version)"
+    [[ "$actual_package" == "$package" && "$actual_arch" == "$architecture" && -n "$actual_version" ]] || die "Firmware package metadata mismatch for $package:$architecture"
+    [[ -z "$expected_version" || "$actual_version" == "$expected_version" ]] || die "Firmware package version mismatch for $package: expected=$expected_version actual=$actual_version"
+    actual_sha="$(sha256sum "$source" | awk '{print tolower($1)}')"; checksum_source=""
+    if [[ -n "$expected_sha" ]]; then FIRMWARE_CHECKSUM_SOURCE="profile/environment override"; elif read_package_checksum_sidecar "$source"; then expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"; elif resolve_missing_firmware_package_checksum "$source" "$actual_sha" "$package" "$actual_version"; then expected_sha="$FIRMWARE_CHECKSUM_CANDIDATE"; else die "A pinned SHA-256 is required for $package. Observed: $actual_sha"; fi
+    checksum_source="$FIRMWARE_CHECKSUM_SOURCE"; [[ "$actual_sha" == "$expected_sha" ]] || die "Firmware checksum mismatch for $package: expected=$expected_sha actual=$actual_sha"
+    safe="$(printf '%s_%s' "$package" "$architecture" | sed 's/[^A-Za-z0-9._-]/_/g')"; dpkg-deb --info "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.package-info.txt"; dpkg-deb --contents "$source" > "$FIRMWARE_PROVENANCE_DIR/$safe.filelist.txt"; printf '%s  %s\n' "$actual_sha" "$(basename "$source")" > "$FIRMWARE_PROVENANCE_DIR/$safe.sha256"; printf '%s\n' "$checksum_source" > "$FIRMWARE_PROVENANCE_DIR/$safe.checksum-source.txt"
+    jq --arg package "$package" --arg architecture "$architecture" --argjson required "$required" --arg source "$source" --arg version "$actual_version" --arg sha "$actual_sha" --arg checksum_source "$checksum_source" '. + [{package:$package,architecture:$architecture,required:$required,source:$source,version:$version,sha256:$sha,checksum_source:$checksum_source}]' "$FIRMWARE_PACKAGES_RESOLVED_FILE" > "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp"; mv -f "$FIRMWARE_PACKAGES_RESOLVED_FILE.tmp" "$FIRMWARE_PACKAGES_RESOLVED_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$package" "$architecture" "$required" "$actual_version" "$actual_sha" "$source" "$checksum_source" >> "$FIRMWARE_PACKAGE_INVENTORY_FILE"; ok "Resolved firmware package by metadata: $package:$architecture $actual_version"
   done
-
-  cp -a "$FIRMWARE_PACKAGES_RESOLVED_FILE" "$FIRMWARE_PACKAGE_LOCK_FILE"
-  FIRMWARE_PACKAGE_OVERRIDES_JSON="$(jq -c '[.[] | {package,architecture,required,source,sha256,expected_version:.version}]' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-
-  # Populate legacy evidence variables when the qcom-soc package is present.
-  FIRMWARE_QCOM_SOC_DEB="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .source' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
-  FIRMWARE_QCOM_SOC_ACTUAL_VERSION="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .version' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
-  FIRMWARE_QCOM_SOC_ACTUAL_SHA256="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .sha256' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"
-  FIRMWARE_QCOM_SOC_SHA256="$FIRMWARE_QCOM_SOC_ACTUAL_SHA256"
+  cp -a "$FIRMWARE_PACKAGES_RESOLVED_FILE" "$FIRMWARE_PACKAGE_LOCK_FILE"; FIRMWARE_PACKAGE_OVERRIDES_JSON="$(jq -c '[.[] | {package,architecture,required,source,sha256,expected_version:.version}]' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
+  FIRMWARE_QCOM_SOC_DEB="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .source' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"; FIRMWARE_QCOM_SOC_ACTUAL_VERSION="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .version' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"; FIRMWARE_QCOM_SOC_ACTUAL_SHA256="$(jq -r '.[] | select(.package=="firmware-qcom-soc" and .architecture=="all") | .sha256' "$FIRMWARE_PACKAGES_RESOLVED_FILE" | sed -n '1p')"; FIRMWARE_QCOM_SOC_SHA256="$FIRMWARE_QCOM_SOC_ACTUAL_SHA256"
 }
-
-# Compatibility entry point retained for callers and older tests.
-resolve_qcom_soc_firmware_package() {
-  resolve_firmware_packages
-}
-
-normalize_firmware_source_tree() {
-  # Normalize a user/package tree into a temporary root representing
-  # /usr/lib/firmware without modifying the caller's source.
-  local src="$1" dest="$2"
-  rm -rf "$dest"
-  mkdir -p "$dest"
-
-  if [[ "$(basename "$src")" == "qcom" ]]; then
-    mkdir -p "$dest/qcom"
-    rsync -aHAX "$src/" "$dest/qcom/"
-  elif [[ -d "$src/usr/lib/firmware" ]]; then
-    rsync -aHAX "$src/usr/lib/firmware/" "$dest/"
-  elif [[ -d "$src/lib/firmware" ]]; then
-    rsync -aHAX "$src/lib/firmware/" "$dest/"
-  else
-    rsync -aHAX "$src/" "$dest/"
-  fi
-}
-
+resolve_qcom_soc_firmware_package() { resolve_firmware_packages; }
+normalize_firmware_source_tree() { local src="$1" dest="$2"; rm -rf "$dest"; mkdir -p "$dest"; if [[ "$(basename "$src")" == qcom ]]; then mkdir -p "$dest/qcom"; rsync -aHAX "$src/" "$dest/qcom/"; elif [[ -d "$src/usr/lib/firmware" ]]; then rsync -aHAX "$src/usr/lib/firmware/" "$dest/"; elif [[ -d "$src/lib/firmware" ]]; then rsync -aHAX "$src/lib/firmware/" "$dest/"; else rsync -aHAX "$src/" "$dest/"; fi; }
 merge_firmware_tree_fail_closed() {
-  # Merge one normalized firmware tree into the final staging root. Identical
-  # duplicate files/symlinks are accepted and recorded. Any differing object at
-  # the same destination aborts the build before OCI or ISO construction.
-  local src="$1" dest="$2" label="$3"
-  [[ -d "$src" ]] || die "Firmware merge source is not a directory: $src"
-  mkdir -p "$dest" "$(dirname "$FIRMWARE_MERGE_REPORT")"
-  [[ -f "$FIRMWARE_MERGE_REPORT" ]] || \
-    printf 'source\taction\trelative_path\tdetail\n' > "$FIRMWARE_MERGE_REPORT"
-
+  local src="$1" dest="$2" label="$3"; [[ -d "$src" ]] || die "Firmware merge source is not a directory: $src"; mkdir -p "$dest" "$(dirname "$FIRMWARE_MERGE_REPORT")"; [[ -f "$FIRMWARE_MERGE_REPORT" ]] || printf 'source\taction\trelative_path\tdetail\n' > "$FIRMWARE_MERGE_REPORT"
   local path rel target source_hash target_hash source_link target_link
-  while IFS= read -r -d '' path; do
-    rel="${path#"$src"/}"
-    [[ "$rel" != "$path" ]] || continue
-    target="$dest/$rel"
-
-    if [[ -d "$path" && ! -L "$path" ]]; then
-      if [[ -e "$target" && ! -d "$target" ]]; then
-        die "Firmware merge conflict: directory $label:$rel collides with non-directory $target"
-      fi
-      mkdir -p "$target"
-      continue
-    fi
-
-    mkdir -p "$(dirname "$target")"
-    if [[ -L "$path" ]]; then
-      source_link="$(readlink "$path")"
-      if [[ -L "$target" ]]; then
-        target_link="$(readlink "$target")"
-        [[ "$source_link" == "$target_link" ]] || \
-          die "Firmware symlink conflict for $rel: $source_link != $target_link"
-        printf '%s\tidentical-symlink\t%s\t%s\n' "$label" "$rel" "$source_link" >> "$FIRMWARE_MERGE_REPORT"
-      elif [[ -e "$target" ]]; then
-        die "Firmware merge conflict: symlink $label:$rel collides with existing object"
-      else
-        cp -a "$path" "$target"
-        printf '%s\tadded-symlink\t%s\t%s\n' "$label" "$rel" "$source_link" >> "$FIRMWARE_MERGE_REPORT"
-      fi
-    elif [[ -f "$path" ]]; then
-      if [[ -L "$target" ]]; then
-        die "Firmware merge conflict: regular file $label:$rel would replace a symlink"
-      elif [[ -f "$target" ]]; then
-        source_hash="$(sha256sum "$path" | awk '{print $1}')"
-        target_hash="$(sha256sum "$target" | awk '{print $1}')"
-        [[ "$source_hash" == "$target_hash" ]] || \
-          die "Firmware content conflict for $rel: $label=$source_hash existing=$target_hash"
-        printf '%s\tidentical-file\t%s\t%s\n' "$label" "$rel" "$source_hash" >> "$FIRMWARE_MERGE_REPORT"
-      elif [[ -e "$target" ]]; then
-        die "Firmware merge conflict: regular file $label:$rel collides with existing object"
-      else
-        cp -a "$path" "$target"
-        source_hash="$(sha256sum "$path" | awk '{print $1}')"
-        printf '%s\tadded-file\t%s\t%s\n' "$label" "$rel" "$source_hash" >> "$FIRMWARE_MERGE_REPORT"
-      fi
-    else
-      die "Unsupported firmware object type: $path"
-    fi
-  done < <(find "$src" -mindepth 1 -print0 | LC_ALL=C sort -z)
+  while IFS= read -r -d '' path; do rel="${path#"$src"/}"; [[ "$rel" != "$path" ]] || continue; target="$dest/$rel"; if [[ -d "$path" && ! -L "$path" ]]; then [[ ! -e "$target" || -d "$target" ]] || die "Firmware merge conflict: directory $label:$rel"; mkdir -p "$target"; continue; fi; mkdir -p "$(dirname "$target")"; if [[ -L "$path" ]]; then source_link="$(readlink "$path")"; if [[ -L "$target" ]]; then target_link="$(readlink "$target")"; [[ "$source_link" == "$target_link" ]] || die "Firmware symlink conflict for $rel"; elif [[ -e "$target" ]]; then die "Firmware merge conflict: symlink $label:$rel"; else cp -a "$path" "$target"; fi; elif [[ -f "$path" ]]; then if [[ -f "$target" && ! -L "$target" ]]; then source_hash="$(sha256sum "$path"|awk '{print $1}')"; target_hash="$(sha256sum "$target"|awk '{print $1}')"; [[ "$source_hash" == "$target_hash" ]] || die "Firmware content conflict for $rel"; elif [[ -e "$target" ]]; then die "Firmware merge conflict: $label:$rel"; else cp -a "$path" "$target"; fi; else die "Unsupported firmware object type: $path"; fi; done < <(find "$src" -mindepth 1 -print0 | LC_ALL=C sort -z)
 }
-
-extract_resolved_firmware_package_trees() {
-  local count index package version source safe extract_root normalized_root firmware_root copyright_path
-  count="$(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-  for ((index=0; index<count; index++)); do
-    package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-    version="$(jq -r ".[$index].version" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-    source="$(jq -r ".[$index].source" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-    safe="$(printf '%s_%s' "$package" "$index" | sed 's/[^A-Za-z0-9._-]/_/g')"
-    extract_root="$TMP_ROOT/firmware-package-$safe-extract"
-    normalized_root="$TMP_ROOT/firmware-package-$safe-normalized"
-    rm -rf "$extract_root" "$normalized_root"
-    mkdir -p "$extract_root" "$normalized_root"
-    dpkg-deb --extract "$source" "$extract_root"
-    if [[ -d "$extract_root/usr/lib/firmware" ]]; then
-      firmware_root="$extract_root/usr/lib/firmware"
-    elif [[ -d "$extract_root/lib/firmware" ]]; then
-      firmware_root="$extract_root/lib/firmware"
-    else
-      die "Declared firmware package $package contains neither /usr/lib/firmware nor /lib/firmware"
-    fi
-    normalize_firmware_source_tree "$firmware_root" "$normalized_root"
-    copyright_path="$extract_root/usr/share/doc/$package/copyright"
-    [[ ! -f "$copyright_path" ]] || cp -a "$copyright_path" "$FIRMWARE_PROVENANCE_DIR/$safe.copyright"
-    merge_firmware_tree_fail_closed "$normalized_root" "$STAGED_FIRMWARE_DIR" "$package:$version"
-  done
-}
-
-# Compatibility name retained for old source-based tests.
-extract_qcom_soc_firmware_package_tree() {
-  extract_resolved_firmware_package_trees
-}
+extract_resolved_firmware_package_trees() { local count index package version source safe extract_root normalized_root firmware_root copyright_path; count="$(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"; for ((index=0; index<count; index++)); do package="$(jq -r ".[$index].package" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"; version="$(jq -r ".[$index].version" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"; source="$(jq -r ".[$index].source" "$FIRMWARE_PACKAGES_RESOLVED_FILE")"; safe="$(printf '%s_%s' "$package" "$index"|sed 's/[^A-Za-z0-9._-]/_/g')"; extract_root="$TMP_ROOT/firmware-package-$safe-extract"; normalized_root="$TMP_ROOT/firmware-package-$safe-normalized"; rm -rf "$extract_root" "$normalized_root"; mkdir -p "$extract_root" "$normalized_root"; dpkg-deb --extract "$source" "$extract_root"; if [[ -d "$extract_root/usr/lib/firmware" ]]; then firmware_root="$extract_root/usr/lib/firmware"; elif [[ -d "$extract_root/lib/firmware" ]]; then firmware_root="$extract_root/lib/firmware"; else die "Declared firmware package $package contains no firmware root"; fi; normalize_firmware_source_tree "$firmware_root" "$normalized_root"; merge_firmware_tree_fail_closed "$normalized_root" "$STAGED_FIRMWARE_DIR" "$package:$version"; done; }
+extract_qcom_soc_firmware_package_tree() { extract_resolved_firmware_package_trees; }
 
 validate_profile_board_data() {
-  [[ "$FIRMWARE_BOARD_POLICY" != "none" ]] || {
-    info "Profile declares firmware.board_data.policy=none; no replacement ATH11K board data is required."
-    return 0
-  }
-
-  local raw="$STAGED_FIRMWARE_DIR/$FIRMWARE_BOARD_RAW_PATH"
-  local compressed=""
+  [[ "$FIRMWARE_BOARD_POLICY" != none ]] || { info "Profile declares firmware.board_data.policy=none; no replacement ATH11K board data is required."; return 0; }
+  local raw="$STAGED_FIRMWARE_DIR/$FIRMWARE_BOARD_RAW_PATH" compressed="" raw_sha compressed_sha=""
   [[ -z "$FIRMWARE_BOARD_COMPRESSED_PATH" ]] || compressed="$STAGED_FIRMWARE_DIR/$FIRMWARE_BOARD_COMPRESSED_PATH"
-
-  if [[ "$FIRMWARE_BOARD_POLICY" == "optional" && ! -e "$raw" && ( -z "$compressed" || ! -e "$compressed" ) ]]; then
-    info "Optional board-data artifacts are not present; continuing without replacement board data."
-    return 0
-  fi
-
-  [[ -f "$raw" && ! -L "$raw" && -s "$raw" ]] || \
-    die "Board-data raw file is absent, empty, or a symlink: $raw"
-  if [[ -n "$compressed" ]]; then
-    [[ -f "$compressed" && ! -L "$compressed" && -s "$compressed" ]] || \
-      die "Board-data compressed file is absent, empty, or a symlink: $compressed"
-    zstd --test "$compressed" >/dev/null
-    cmp -s <(zstd -dc "$compressed") "$raw" || \
-      die "Compressed board-data content does not equal the raw board-data file"
-  fi
-
-  local raw_sha compressed_sha=""
-  raw_sha="$(sha256sum "$raw" | awk '{print tolower($1)}')"
-  [[ -z "$FIRMWARE_BOARD_RAW_SHA256" || "$raw_sha" == "$FIRMWARE_BOARD_RAW_SHA256" ]] || \
-    die "Board-data raw checksum mismatch: expected=$FIRMWARE_BOARD_RAW_SHA256 actual=$raw_sha"
-  if [[ -n "$compressed" ]]; then
-    compressed_sha="$(sha256sum "$compressed" | awk '{print tolower($1)}')"
-    [[ -z "$FIRMWARE_BOARD_COMPRESSED_SHA256" || "$compressed_sha" == "$FIRMWARE_BOARD_COMPRESSED_SHA256" ]] || \
-      die "Board-data compressed checksum mismatch: expected=$FIRMWARE_BOARD_COMPRESSED_SHA256 actual=$compressed_sha"
-  fi
-  [[ -z "$FIRMWARE_BOARD_MAGIC" ]] || grep -aFq "$FIRMWARE_BOARD_MAGIC" "$raw" || \
-    die "Board-data file lacks required magic string: $FIRMWARE_BOARD_MAGIC"
-  if [[ -n "$FIRMWARE_BOARD_SUBSYSTEM" ]]; then
-    local vendor="${FIRMWARE_BOARD_SUBSYSTEM%%:*}" device="${FIRMWARE_BOARD_SUBSYSTEM##*:}"
-    grep -aFq "subsystem-vendor=$vendor,subsystem-device=$device" "$raw" || \
-      die "Board-data file lacks required subsystem record: $FIRMWARE_BOARD_SUBSYSTEM"
-  fi
-
-  {
-    printf '%s  %s\n' "$raw_sha" "$FIRMWARE_BOARD_RAW_PATH"
-    [[ -z "$compressed_sha" ]] || printf '%s  %s\n' "$compressed_sha" "$FIRMWARE_BOARD_COMPRESSED_PATH"
-  } > "$FIRMWARE_PROVENANCE_DIR/board-data.sha256"
+  if [[ "$FIRMWARE_BOARD_POLICY" == optional && ! -e "$raw" && ( -z "$compressed" || ! -e "$compressed" ) ]]; then info "Optional board-data artifacts are not present; continuing."; return 0; fi
+  [[ -f "$raw" && ! -L "$raw" && -s "$raw" ]] || die "Board-data raw file is absent, empty, or a symlink: $raw"
+  if [[ -n "$compressed" ]]; then [[ -f "$compressed" && ! -L "$compressed" && -s "$compressed" ]] || die "Board-data compressed file invalid: $compressed"; zstd --test "$compressed" >/dev/null; cmp -s <(zstd -dc "$compressed") "$raw" || die "Compressed board-data content does not equal raw file"; fi
+  raw_sha="$(sha256sum "$raw" | awk '{print tolower($1)}')"; [[ -z "$FIRMWARE_BOARD_RAW_SHA256" || "$raw_sha" == "$FIRMWARE_BOARD_RAW_SHA256" ]] || die "Board-data raw checksum mismatch"
+  if [[ -n "$compressed" ]]; then compressed_sha="$(sha256sum "$compressed" | awk '{print tolower($1)}')"; [[ -z "$FIRMWARE_BOARD_COMPRESSED_SHA256" || "$compressed_sha" == "$FIRMWARE_BOARD_COMPRESSED_SHA256" ]] || die "Board-data compressed checksum mismatch"; fi
+  [[ -z "$FIRMWARE_BOARD_MAGIC" ]] || grep -aFq "$FIRMWARE_BOARD_MAGIC" "$raw" || die "Board-data file lacks required magic string: $FIRMWARE_BOARD_MAGIC"
+  if [[ -n "$FIRMWARE_BOARD_SUBSYSTEM" ]]; then local vendor="${FIRMWARE_BOARD_SUBSYSTEM%%:*}" device="${FIRMWARE_BOARD_SUBSYSTEM##*:}"; grep -aFq "subsystem-vendor=$vendor,subsystem-device=$device" "$raw" || die "Board-data file lacks required subsystem record: $FIRMWARE_BOARD_SUBSYSTEM"; fi
+  { printf '%s  %s\n' "$raw_sha" "$FIRMWARE_BOARD_RAW_PATH"; [[ -z "$compressed_sha" ]] || printf '%s  %s\n' "$compressed_sha" "$FIRMWARE_BOARD_COMPRESSED_PATH"; } > "$FIRMWARE_PROVENANCE_DIR/board-data.sha256"
   ok "Validated profile-declared board data under policy=$FIRMWARE_BOARD_POLICY."
 }
-
-# Compatibility function name; behavior is now entirely profile-driven.
-validate_hp_ath11k_board_data() {
-  validate_profile_board_data
-}
-
-validate_profile_firmware_layout() {
-  local probe path
-  : > "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"
-  for probe in "${PROFILE_FIRMWARE_PROBES[@]}"; do
-    [[ -n "$probe" ]] || continue
-    validate_relative_firmware_probe "$probe"
-    path="$STAGED_FIRMWARE_DIR/$probe"
-    [[ -f "$path" && ! -L "$path" && -s "$path" ]] || \
-      die "Required profile firmware path is absent, empty, or a symlink: $path"
-    printf '%s  %s\n' "$(sha256sum "$path" | awk '{print $1}')" "$probe" >> "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"
-  done
-  ok "Validated ${#PROFILE_FIRMWARE_PROBES[@]} profile-declared firmware paths."
-}
-
-# Compatibility name; no Adreno generation or path is globally assumed.
-validate_adreno_x145_firmware_layout() {
-  validate_profile_firmware_layout
-}
-
-validate_all_profile_firmware_probes() {
-  # Required probes are acceptance predicates, not advisory inventory entries.
-  # A dangling or compatibility symlink must not satisfy a probe because the
-  # immutable target verifier requires the same path to be a nonempty regular
-  # file after all package and profile layers have been merged.
-  local probe path
-  for probe in "${PROFILE_FIRMWARE_PROBES[@]}"; do
-    [[ -n "$probe" ]] || continue
-    validate_relative_firmware_probe "$probe"
-    path="$STAGED_FIRMWARE_DIR/$probe"
-    [[ -f "$path" && ! -L "$path" && -s "$path" ]] ||       die "Required profile firmware probe is absent, empty, or a symlink: $path"
-  done
-}
-
-write_staged_firmware_inventory() {
-  : > "$FIRMWARE_STAGED_INVENTORY"
-  local path rel
-  while IFS= read -r -d '' path; do
-    rel="${path#"$STAGED_FIRMWARE_DIR"/}"
-    printf '%s  %s\n' "$(sha256sum "$path" | awk '{print $1}')" "$rel" \
-      >> "$FIRMWARE_STAGED_INVENTORY"
-  done < <(find "$STAGED_FIRMWARE_DIR" -type f -print0 | LC_ALL=C sort -z)
-
-  find "$STAGED_FIRMWARE_DIR" -type l -printf '%P\t%l\n' | LC_ALL=C sort \
-    > "$FIRMWARE_PROVENANCE_DIR/staged-firmware-symlinks.tsv"
-}
-
-qcom_network_argument() {
-  case "${FIRMWARE_CONTAINER_NETWORK,,}" in
-    host) printf '%s' '--network=host'; return ;;
-    default|bridge) printf ''; return ;;
-    skip) printf 'SKIP'; return ;;
-  esac
-  local choice
-  choice="$(menu "Disposable Firmware Container Network\n\nTemporary package installation occurs only inside the extraction container." "1" \
-    "1|Use host networking [RECOMMENDED]|Avoid common Podman container DNS failures." \
-    "2|Use default container networking|Use when container DNS is already verified." \
-    "3|Open a shell before continuing|Inspect container networking." \
-    "4|Skip firmware extraction|Continue without firmware.")"
-  case "$choice" in
-    1) printf '%s' '--network=host' ;;
-    2) printf '' ;;
-    3) open_shell "$WORKDIR"; qcom_network_argument ;;
-    4) printf 'SKIP' ;;
-  esac
-}
-
+validate_hp_ath11k_board_data() { validate_profile_board_data; }
+validate_profile_firmware_layout() { local probe path; : > "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"; for probe in "${PROFILE_FIRMWARE_PROBES[@]}"; do [[ -n "$probe" ]] || continue; validate_relative_firmware_probe "$probe"; path="$STAGED_FIRMWARE_DIR/$probe"; [[ -f "$path" && ! -L "$path" && -s "$path" ]] || die "Required profile firmware path invalid: $path"; printf '%s  %s\n' "$(sha256sum "$path"|awk '{print $1}')" "$probe" >> "$FIRMWARE_PROVENANCE_DIR/required-firmware-paths.sha256"; done; ok "Validated ${#PROFILE_FIRMWARE_PROBES[@]} profile-declared firmware paths."; }
+validate_adreno_x145_firmware_layout() { validate_profile_firmware_layout; }
+validate_all_profile_firmware_probes() { validate_profile_firmware_layout; }
+write_staged_firmware_inventory() { : > "$FIRMWARE_STAGED_INVENTORY"; local path rel; while IFS= read -r -d '' path; do rel="${path#"$STAGED_FIRMWARE_DIR"/}"; printf '%s  %s\n' "$(sha256sum "$path"|awk '{print $1}')" "$rel" >> "$FIRMWARE_STAGED_INVENTORY"; done < <(find "$STAGED_FIRMWARE_DIR" -type f -print0 | LC_ALL=C sort -z); find "$STAGED_FIRMWARE_DIR" -type l -printf '%P\t%l\n' | LC_ALL=C sort > "$FIRMWARE_PROVENANCE_DIR/staged-firmware-symlinks.tsv"; }
+qcom_network_argument() { case "${FIRMWARE_CONTAINER_NETWORK,,}" in host) printf '%s' '--network=host';; default|bridge) printf '';; skip) printf SKIP;; *) printf '%s' '--network=host';; esac; }
 extract_qcom_firmware_isolated() {
   sync_repo "qcom-firmware-updater" "$QCOM_UPDATER_REPO_URL" "$QCOM_UPDATER_REF" "$QCOM_UPDATER_DIR"
-
-  local work="$TMP_ROOT/qcom-extract"
-  rm -rf "$work"
-  mkdir -p "$work/input" "$work/out"
-
-  if [[ "$FIRMWARE_MODE" == "archive" ]]; then
-    cp -a "$FIRMWARE_ARCHIVE" "$work/input/$(basename "$FIRMWARE_ARCHIVE")"
-  fi
-
+  local work="$TMP_ROOT/qcom-extract"; rm -rf "$work"; mkdir -p "$work/input" "$work/out"; [[ "$FIRMWARE_MODE" != archive ]] || cp -a "$FIRMWARE_ARCHIVE" "$work/input/$(basename "$FIRMWARE_ARCHIVE")"
   local runner="$work/run-qcom-extract.sh"
   cat > "$runner" <<'QCOM_RUNNER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-
-log() { printf 'qcom-container: %s\n' "$*"; }
-
-getent hosts deb.debian.org >/dev/null 2>&1 || {
-  log "DNS preflight failed for deb.debian.org"
-  exit 70
-}
-
+getent hosts deb.debian.org >/dev/null 2>&1 || exit 70
 apt-get update
-if ! apt-get install -y --no-install-recommends \
-  ca-certificates curl unzip msitools 7zip zstd rsync bash coreutils findutils file grep sed gawk; then
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl unzip msitools p7zip-full zstd rsync bash coreutils findutils file grep sed gawk
-fi
+apt-get install -y --no-install-recommends ca-certificates curl unzip msitools p7zip-full zstd rsync bash coreutils findutils file grep sed gawk
 printf '#!/usr/bin/env bash\nexec "$@"\n' > /usr/local/bin/sudo
 chmod 0755 /usr/local/bin/sudo
-
 mkdir -p /out/lib/firmware /out/logs /work
 cp -a /updater /work/qcom-firmware-updater
 cd /work/qcom-firmware-updater
-
-orig="$(cat ./qcom-firmware-updater.sh)"
-orig="${orig%$'\n'}"
-case "$orig" in
-  *'main "$@"') orig="${orig%main \"\$@\"}" ;;
-esac
+orig="$(cat ./qcom-firmware-updater.sh)"; orig="${orig%$'\n'}"; case "$orig" in *'main "$@"') orig="${orig%main \"\$@\"}" ;; esac
 printf '%s\n' "$orig" > /work/qcom-functions.sh
 cat >> /work/qcom-functions.sh <<'CAPTURE_EOF'
-
 capture_main() {
-  parse_args "$@"
-  check_deps
+  parse_args "$@"; check_deps
   if [[ -z "$DEVICE_PATH" ]]; then detect_device; else info "Using manual device path: $DEVICE_PATH"; fi
-  FIRMWARE_DIR="$FIRMWARE_BASE/$DEVICE_PATH"
-  TMPDIR=$(mktemp -d /tmp/qcom-fw-capture.XXXXXX)
-  local input_path=""
-  if [[ -n "$INPUT_URL" ]]; then
-    input_path="$TMPDIR/download.zip"
-    download_driver "$input_path"
-  else
-    [[ -f "$INPUT_FILE" ]] || die "File not found: $INPUT_FILE"
-    input_path="$INPUT_FILE"
-  fi
-  local extract_root fw_staging dest
-  extract_root=$(extract_exe "$input_path")
-  fw_staging=$(find_firmware "$extract_root")
-  dest="/out/lib/firmware/qcom/$DEVICE_PATH"
-  mkdir -p "$dest"
-  cp -a "$fw_staging"/. "$dest"/
-  chmod -R a+rX /out/lib/firmware || true
-  find "$dest" -type f | sort > /out/logs/captured-firmware-files.txt
-  info "Captured $(find "$dest" -type f | wc -l) firmware file(s) into $dest"
+  FIRMWARE_DIR="$FIRMWARE_BASE/$DEVICE_PATH"; TMPDIR=$(mktemp -d /tmp/qcom-fw-capture.XXXXXX); local input_path=""
+  if [[ -n "$INPUT_URL" ]]; then input_path="$TMPDIR/download.zip"; download_driver "$input_path"; else [[ -f "$INPUT_FILE" ]] || die "File not found: $INPUT_FILE"; input_path="$INPUT_FILE"; fi
+  local extract_root fw_staging dest; extract_root=$(extract_exe "$input_path"); fw_staging=$(find_firmware "$extract_root"); dest="/out/lib/firmware/qcom/$DEVICE_PATH"; mkdir -p "$dest"; cp -a "$fw_staging"/. "$dest"/; chmod -R a+rX /out/lib/firmware || true
 }
-
 capture_main "$@"
 CAPTURE_EOF
 chmod 0755 /work/qcom-functions.sh
-
-if [[ -n "${QCOM_URL:-}" ]]; then
-  bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" --url "$QCOM_URL" 2>&1 | tee /out/logs/qcom-capture.log
-else
-  input_file="$(find /input -maxdepth 1 -type f | sort | sed -n '1p')"
-  [[ -n "$input_file" ]] || { log "No firmware archive supplied"; exit 71; }
-  bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" "$input_file" 2>&1 | tee /out/logs/qcom-capture.log
-fi
+if [[ -n "${QCOM_URL:-}" ]]; then bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" --url "$QCOM_URL"; else input_file="$(find /input -maxdepth 1 -type f | sort | sed -n '1p')"; [[ -n "$input_file" ]] || exit 71; bash /work/qcom-functions.sh --device-path "$QCOM_DEVICE_PATH" "$input_file"; fi
 QCOM_RUNNER
   chmod 0755 "$runner"
-
-  local net_arg runtime="$OCI_RUNTIME" rc
-  net_arg="$(qcom_network_argument)"
-  [[ "$net_arg" != "SKIP" ]] || { FIRMWARE_MODE=skip; return 0; }
-
-  local -a cmd=("$runtime" run --rm --privileged)
-  [[ -n "$net_arg" ]] && cmd+=("$net_arg")
-  cmd+=(
-    -e "QCOM_URL=${FIRMWARE_URL:-}"
-    -e "QCOM_DEVICE_PATH=$QCOM_DEVICE_PATH"
-    -v "$QCOM_UPDATER_DIR:/updater:ro"
-    -v "$work/input:/input:ro"
-    -v "$work/out:/out"
-    -v "$runner:/run-qcom-extract.sh:ro"
-    debian:13 /bin/bash /run-qcom-extract.sh
-  )
-
-  set +e
-  "${cmd[@]}"
-  rc=$?
-  set -e
-
-  if (( rc != 0 )); then
-    warn "Isolated firmware extraction exited with status $rc."
-    if ! is_interactive; then die "Firmware extraction failed."; fi
-    local choice
-    choice="$(menu "Firmware Extraction Failure\n\nWorkspace retained at:\n  $work" "2" \
-      "1|Open a shell and inspect the workspace|Return after manual correction." \
-      "2|Choose a pre-staged firmware directory [RECOMMENDED]|Use an already extracted tree." \
-      "3|Continue without firmware|Skip firmware predicates." \
-      "4|Abort|Stop the build.")"
-    case "$choice" in
-      1) open_shell "$work"; extract_qcom_firmware_isolated; return ;;
-      2) FIRMWARE_MODE=prestaged; FIRMWARE_PRESTAGED="$(prompt_path "Pre-staged firmware directory" "$ARTIFACT_DIR/firmware")"; stage_firmware; return ;;
-      3) FIRMWARE_MODE=skip; return ;;
-      4) die "Firmware extraction failed." ;;
-    esac
-  fi
-
-  if [[ -d "$work/out/lib/firmware" ]]; then
-    FIRMWARE_PRESTAGED="$work/out/lib/firmware"
-    FIRMWARE_MODE="prestaged"
-  else
-    die "Isolated qcom-firmware-updater produced no firmware tree."
-  fi
+  local net_arg rc; net_arg="$(qcom_network_argument)"; [[ "$net_arg" != SKIP ]] || { FIRMWARE_MODE=skip; return 0; }
+  local -a cmd=("$OCI_RUNTIME" run --rm --privileged); [[ -n "$net_arg" ]] && cmd+=("$net_arg"); cmd+=(-e "QCOM_URL=${FIRMWARE_URL:-}" -e "QCOM_DEVICE_PATH=$QCOM_DEVICE_PATH" -v "$QCOM_UPDATER_DIR:/updater:ro" -v "$work/input:/input:ro" -v "$work/out:/out" -v "$runner:/run-qcom-extract.sh:ro" debian:13 /bin/bash /run-qcom-extract.sh)
+  set +e; "${cmd[@]}"; rc=$?; set -e; (( rc == 0 )) || die "Firmware extraction failed with status $rc"
+  [[ -d "$work/out/lib/firmware" ]] || die "Isolated updater produced no firmware tree"; FIRMWARE_PRESTAGED="$work/out/lib/firmware"; FIRMWARE_MODE=prestaged
 }
-
 stage_firmware() {
-  mkdir -p "$FIRMWARE_PROVENANCE_DIR"
-  rm -rf "$STAGED_FIRMWARE_DIR"
-  mkdir -p "$STAGED_FIRMWARE_DIR"
-  printf 'source\taction\trelative_path\tdetail\n' > "$FIRMWARE_MERGE_REPORT"
-
-  local required_package_count
-  required_package_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
-  case "${FIRMWARE_MODE,,}" in
-    skip)
-      if (( required_package_count > 0 || ${#PROFILE_FIRMWARE_PROBES[@]} > 0 )) || [[ "$FIRMWARE_BOARD_POLICY" == "required" ]]; then
-        die "FIRMWARE_MODE=skip is incompatible with required package, firmware-path, or board-data declarations."
-      fi
-      FIRMWARE_SOURCE=""
-      warn "Continuing without staged firmware under an explicitly requirement-free profile."
-      return
-      ;;
-    archive|url) extract_qcom_firmware_isolated ;;
-    ask|auto|existing) die "Firmware mode must be resolved before execution: $FIRMWARE_MODE" ;;
-    prestaged) : ;;
-    *) die "Unsupported firmware mode: $FIRMWARE_MODE" ;;
-  esac
-
-  # Package layers are generic and ordered exactly as declared in the profile.
+  mkdir -p "$FIRMWARE_PROVENANCE_DIR"; rm -rf "$STAGED_FIRMWARE_DIR"; mkdir -p "$STAGED_FIRMWARE_DIR"; printf 'source\taction\trelative_path\tdetail\n' > "$FIRMWARE_MERGE_REPORT"
+  local required_package_count; required_package_count="$(jq '[.[] | select(.required == true)] | length' "$FIRMWARE_PACKAGE_SPECS_FILE")"
+  case "${FIRMWARE_MODE,,}" in skip) (( required_package_count == 0 && ${#PROFILE_FIRMWARE_PROBES[@]} == 0 )) && [[ "$FIRMWARE_BOARD_POLICY" != required ]] || die "FIRMWARE_MODE=skip incompatible with required firmware"; FIRMWARE_SOURCE=""; return;; archive|url) extract_qcom_firmware_isolated;; ask|auto|existing) die "Firmware mode must be resolved before execution: $FIRMWARE_MODE";; prestaged) :;; *) die "Unsupported firmware mode: $FIRMWARE_MODE";; esac
   extract_resolved_firmware_package_trees
-
-  # The profile-specific/pre-staged tree is the final layer. Duplicate paths
-  # must remain byte-identical; differing content fails rather than overriding.
-  if [[ -n "$FIRMWARE_PRESTAGED" ]]; then
-    [[ -d "$FIRMWARE_PRESTAGED" ]] || die "Profile firmware source does not exist: $FIRMWARE_PRESTAGED"
-    local profile_normalized="$TMP_ROOT/profile-firmware-normalized"
-    normalize_firmware_source_tree "$FIRMWARE_PRESTAGED" "$profile_normalized"
-    merge_firmware_tree_fail_closed "$profile_normalized" "$STAGED_FIRMWARE_DIR" "profile:$PROFILE"
-  fi
-
-  if ! find "$STAGED_FIRMWARE_DIR" -type f -print -quit | grep -q .; then
-    if (( required_package_count == 0 && ${#PROFILE_FIRMWARE_PROBES[@]} == 0 )) && [[ "$FIRMWARE_BOARD_POLICY" != "required" ]]; then
-      warn "Firmware configuration produced no files, but the profile declares no mandatory firmware artifacts."
-      FIRMWARE_SOURCE=""
-      return
-    fi
-    die "Firmware configuration produced no staged files under $STAGED_FIRMWARE_DIR."
-  fi
-
-  validate_profile_firmware_layout
-  validate_profile_board_data
-  validate_all_profile_firmware_probes
-  write_staged_firmware_inventory
-  FIRMWARE_SOURCE="$STAGED_FIRMWARE_DIR"
-  FIRMWARE_PROBE_REL="$(printf '%s\n' "${PROFILE_FIRMWARE_PROBES[@]}" | sed '/^$/d' | sed -n '1p')"
-  [[ -n "$FIRMWARE_PROBE_REL" ]] || FIRMWARE_PROBE_REL="$(find "$FIRMWARE_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | sed -n '1p')"
-
-  write_resolved_profile
-  ok "Staged firmware root: $FIRMWARE_SOURCE"
-  ok "Resolved firmware packages: $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"
-  ok "Staged firmware files: $(wc -l < "$FIRMWARE_STAGED_INVENTORY")"
-  ok "Primary firmware probe: ${FIRMWARE_PROBE_REL:-none}"
+  if [[ -n "$FIRMWARE_PRESTAGED" ]]; then local profile_normalized="$TMP_ROOT/profile-firmware-normalized"; normalize_firmware_source_tree "$FIRMWARE_PRESTAGED" "$profile_normalized"; merge_firmware_tree_fail_closed "$profile_normalized" "$STAGED_FIRMWARE_DIR" "profile:$PROFILE"; fi
+  if ! find "$STAGED_FIRMWARE_DIR" -type f -print -quit | grep -q .; then (( required_package_count == 0 && ${#PROFILE_FIRMWARE_PROBES[@]} == 0 )) && [[ "$FIRMWARE_BOARD_POLICY" != required ]] && { FIRMWARE_SOURCE=""; return; }; die "Firmware configuration produced no staged files"; fi
+  validate_profile_firmware_layout; validate_profile_board_data; write_staged_firmware_inventory; FIRMWARE_SOURCE="$STAGED_FIRMWARE_DIR"; FIRMWARE_PROBE_REL="$(printf '%s\n' "${PROFILE_FIRMWARE_PROBES[@]}" | sed '/^$/d' | sed -n '1p')"; [[ -n "$FIRMWARE_PROBE_REL" ]] || FIRMWARE_PROBE_REL="$(find "$FIRMWARE_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | sed -n '1p')"; write_resolved_profile
+  ok "Staged firmware root: $FIRMWARE_SOURCE"; ok "Resolved firmware packages: $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")"; ok "Staged firmware files: $(wc -l < "$FIRMWARE_STAGED_INVENTORY")"
 }
 
-# ---------------------------- build plan --------------------------------
-
-peek_next_release_id() {
-  local current=0
-  [[ -f "$BUILD_COUNTER_FILE" ]] && read -r current < "$BUILD_COUNTER_FILE" || true
-  [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  printf 'r%04d' $((current + 1))
-}
-
-reserve_release_id() {
-  local current=0
-  [[ -f "$BUILD_COUNTER_FILE" ]] && read -r current < "$BUILD_COUNTER_FILE" || true
-  [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  current=$((current + 1))
-  printf '%s\n' "$current" > "$BUILD_COUNTER_FILE"
-  printf 'r%04d' "$current"
-}
+peek_next_release_id() { local current=0; [[ -f "$BUILD_COUNTER_FILE" ]] && read -r current < "$BUILD_COUNTER_FILE" || true; [[ "$current" =~ ^[0-9]+$ ]] || current=0; printf 'r%04d' $((current + 1)); }
+reserve_release_id() { local current=0; [[ -f "$BUILD_COUNTER_FILE" ]] && read -r current < "$BUILD_COUNTER_FILE" || true; [[ "$current" =~ ^[0-9]+$ ]] || current=0; current=$((current+1)); printf '%s\n' "$current" > "$BUILD_COUNTER_FILE"; printf 'r%04d' "$current"; }
 
 print_plan() {
-  local preview_id
-  preview_id="$(peek_next_release_id)"
-  cat <<EOF
+  local preview_id; preview_id="$(peek_next_release_id)"
+  cat <<EOF_PLAN
 
-Resolved v$SCRIPT_VERSION plan
---------------------
+Resolved v$SCRIPT_VERSION plan — MILESTONE: Reunion stable-release convergence
+--------------------------------------------------------------------------
 Work directory:             $WORKDIR
-Profile:                    $PROFILE
+Profile:                    $PROFILE ($PROFILE_DISPLAY_NAME)
 Artifact directory:         $ARTIFACT_DIR
 Kernel release requested:   ${KERNEL_RELEASE_REQUESTED:-none}
 Kernel release policy:      $KERNEL_RELEASE_POLICY
 Kernel release selected:    $KERNEL_RELEASE
-Kernel image package:       $(package_field "$KERNEL_IMAGE_DEB" Package)=$(package_field "$KERNEL_IMAGE_DEB" Version)
 Kernel image source:        $KERNEL_IMAGE_DEB
-Supplied unique .debs:      ${#KERNEL_DEBS[@]}
 Target OCI closure .debs:   ${#TARGET_KERNEL_DEBS[@]}
 Reference-only .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
-Target OCI archived .debs:  ${#KERNEL_DEBS[@]}
-Live extraction closure:    ${#LIVE_KERNEL_DEBS[@]}
 DTB:                        $DTB_FILE
 Firmware mode:              $FIRMWARE_MODE
 Firmware source:            ${FIRMWARE_SOURCE:-to be staged during execution}
-Firmware package specs:     $(jq 'length' "$FIRMWARE_PACKAGE_SPECS_FILE")
-Firmware packages resolved: $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")
-Firmware required paths:    ${PROFILE_FIRMWARE_PROBES[*]:-none}
 Board-data policy:          $FIRMWARE_BOARD_POLICY
-Kernel command additions:   ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
-Target /root source:        ${ROOT_SOURCE:-none}
+Legacy root overlay source: ${ROOT_SOURCE:-none}
+Legacy root overlay target: /usr/lib/vanillaos-snapdragonx/root-source-overlay
 Repository policy:          $REPO_POLICY
-Sources synchronized:       $SOURCES_SYNCHRONIZED
 custom-image source:        $CUSTOM_IMAGE_REPO_URL @ $CUSTOM_IMAGE_REF
-custom-image checkout:      $(repo_state "$CUSTOM_IMAGE_SOURCE")
-custom-image commit date:   $(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")
 live-iso source:            $LIVE_ISO_REPO_URL @ $LIVE_ISO_REF
-live-iso checkout:          $(source_checkout_summary "$LIVE_ISO_SOURCE")
-live-iso commit date:       $(repo_commit_iso_date "$LIVE_ISO_SOURCE")
-core-image source role:     not cloned; consumed through published OCI lineage
-desktop-image source role:  not cloned; canonical target base is $CUSTOM_IMAGE_BASE
-qcom updater checkout:      $(source_checkout_summary "$QCOM_UPDATER_DIR")
 Target OCI base:            $CUSTOM_IMAGE_BASE
+VSO native image:           $VSO_NATIVE_IMAGE
+VSO native stack/instance:  $VSO_NATIVE_STACK / $VSO_NATIVE_INSTANCE
+VSO source base contract:   $VSO_NATIVE_UPSTREAM_BASE
 Target OCI reference:       $TARGET_IMAGE_REF
 ABRoot image name:          $ABROOT_IMAGE_NAME
-Installer delivery:        $DELIVERY_MODE
+Installer delivery:         $DELIVERY_MODE
 Installer storage guard:    $INSTALLER_STORAGE_GUARD_POLICY
-ISO OCI layout path:       $ISO_IMAGE_LAYOUT_PATH
+ISO OCI layout path:        $ISO_IMAGE_LAYOUT_PATH
 Logical registry host:      $LOCAL_REGISTRY_LOGICAL_HOST
 Physical registry endpoint: $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
-Registry fallback:         ${REGISTRY_IMAGE_REF:-none}
-Profile source:            $PROFILE_FILE_SOURCE
-Profile normalized:        $PROFILE_FILE_RESOLVED
-Kernel package directory:  $KERNEL_DEB_DIR
 Push target OCI:            $PUSH_TARGET_IMAGE
+OCI runtime:                $OCI_RUNTIME
+Live ISO runtime:           $LIVE_ISO_RUNTIME
 Live build image:           $LIVE_ISO_CONTAINER_IMAGE
 Live ARM64 package policy:  $LIVE_ARM64_PACKAGE_POLICY
-Upstream package-list suffix:${LIVE_PACKAGE_LIST_SOURCE_SUFFIX:-pending source validation}
-Legacy package-list suffix: $LIVE_ARM64_PACKAGE_LIST_SUFFIX
-Legacy package exclusions:  $LIVE_ARM64_EXCLUDE_PACKAGES
 Live GDM timed-login delay: ${LIVE_GDM_TIMED_LOGIN_DELAY}s
 Requested Vib version:      $VIB_VERSION
 Vib recipe version:         $VIB_RECIPE_VERSION
-FsGuard plugin request:     $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_VERSION
+FsGuard:                    removed by Reunion; no harness plugin stage
 Expected release ID:        $preview_id
-Minimum graphical packages: $MIN_GRAPHICAL_PACKAGE_COUNT
 
-Safety invariants:
-  - No host initramfs implementation is installed or replaced.
-  - dpkg-deb archive listings complete before any grep validation.
-  - Kernel selection is independent of binary package names and filenames.
-  - A regular /boot/vmlinuz-<release> owns boot identity; regular runtime .ko
-    payloads and supplied local Depends/Pre-Depends form the install closure.
-  - Duplicate image ownership, overlapping boot-critical payloads, mixed
-    architectures, and conflicting package identities fail closed.
-  - Firmware package filenames are irrelevant; Package/Architecture metadata,
-    SHA-256 pins, required_paths, and board_data policy define acceptance.
-  - Package registration is attested during the unlocked build stage; the final
-    immutable target is not expected to retain apt, dpkg, or dpkg-query.
-  - /lib/modules/<release>/build and source symlinks never qualify as modules.
-  - Optional tools, headers, development, and metadata .debs are reference-only.
-  - Official live package-list source files remain byte-identical.
-  - upstream-native requires Reunion 3 architecture conditionals and the
-    architecture-aware upstream build.sh; no package projection is performed.
-  - legacy-projection retains the r4.1 explicit exclusion allowlist and direct
-    package candidate preflight for historical source refs only.
-  - The upstream-derived ARM64 graphical manifest is accepted before remastering.
-  - The finished target must expose current Reunion VSO native semantics through
-    canonical /usr/bin/distrobox without post-install compatibility shims.
-  - Live GDM timing policy is confined to the installer squashfs and verified
-    semantically in the final ISO; the target OCI is not modified by it.
-  - Final filesystem.packages and filesystem.packages-remove are byte-identical
-    to the accepted ARM64 baseline ISO.
-  - Only boot-critical hardware payload is added to the live filesystem.
-  - The external storage guard validates one and only one /var target, keeps
-    automatic vos-var/var LVM topology unchanged, repairs only missing manual
-    GPT PARTLABEL metadata, and fails before destructive setup on ambiguity.
+Stable-Reunion invariants:
+  - gnome:latest is the published stable GNOME target base.
+  - pico:latest remains the live/build substrate; VSO is not substituted for Pico.
+  - vso-native / vso:latest / apx-vso-native is the installed-system operator contract.
+  - Distrobox v2 coherence validation remains fail-closed while accepting valid opaque source-build version tokens.
+  - Project-owned immutable payload is not installed beneath /opt, /usr/local, /root, or /var/root.
+  - Kernel, DTB, firmware, GDM timing, storage guard, embedded OCI bridge, canonical Installer recipe, autostart convergence and digest binding remain project-owned and preserved.
 
 Exact non-interactive execute command:
   sudo env WORKDIR=$(printf '%q' "$WORKDIR") PROFILE=$(printf '%q' "$PROFILE") \
     ARTIFACT_DIR=$(printf '%q' "$ARTIFACT_DIR") ROOT_SOURCE=$(printf '%q' "$ROOT_SOURCE") \
-    KERNEL_DEB_DIR=$(printf '%q' "$KERNEL_DEB_DIR") \
-    EXPECTED_CUSTOM_KERNEL_RELEASE=$(printf '%q' "$KERNEL_RELEASE") \
-    KERNEL_RELEASE_POLICY=require \
-    KERNEL_IMAGE_DEB_OVERRIDE=$(printf '%q' "$KERNEL_IMAGE_DEB") \
+    KERNEL_DEB_DIR=$(printf '%q' "$KERNEL_DEB_DIR") EXPECTED_CUSTOM_KERNEL_RELEASE=$(printf '%q' "$KERNEL_RELEASE") \
+    KERNEL_RELEASE_POLICY=require KERNEL_IMAGE_DEB_OVERRIDE=$(printf '%q' "$KERNEL_IMAGE_DEB") \
     FIRMWARE_MODE=$(printf '%q' "$FIRMWARE_MODE") FIRMWARE_PRESTAGED=$(printf '%q' "$FIRMWARE_PRESTAGED") \
     FIRMWARE_PACKAGE_OVERRIDES_JSON=$(printf '%q' "$FIRMWARE_PACKAGE_OVERRIDES_JSON") \
-    REPO_POLICY=$(printf '%q' "$REPO_POLICY") INSTALLER_STORAGE_GUARD_POLICY=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY") \
-    CUSTOM_IMAGE_BASE=$(printf '%q' "$CUSTOM_IMAGE_BASE") LIVE_ISO_CONTAINER_IMAGE=$(printf '%q' "$LIVE_ISO_CONTAINER_IMAGE") \
-    LIVE_ARM64_PACKAGE_POLICY=$(printf '%q' "$LIVE_ARM64_PACKAGE_POLICY") LIVE_GDM_TIMED_LOGIN_DELAY=$(printf '%q' "$LIVE_GDM_TIMED_LOGIN_DELAY") \
-    TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") \
-    ABROOT_IMAGE_NAME=$(printf '%q' "$ABROOT_IMAGE_NAME") \
+    REPO_POLICY=$(printf '%q' "$REPO_POLICY") CUSTOM_IMAGE_BASE=$(printf '%q' "$CUSTOM_IMAGE_BASE") \
+    OCI_RUNTIME=$(printf '%q' "$OCI_RUNTIME") LIVE_ISO_RUNTIME=$(printf '%q' "$LIVE_ISO_RUNTIME") \
+    LIVE_ISO_CONTAINER_IMAGE=$(printf '%q' "$LIVE_ISO_CONTAINER_IMAGE") LIVE_ARM64_PACKAGE_POLICY=$(printf '%q' "$LIVE_ARM64_PACKAGE_POLICY") \
+    TARGET_IMAGE_REF=$(printf '%q' "$TARGET_IMAGE_REF") ABROOT_IMAGE_NAME=$(printf '%q' "$ABROOT_IMAGE_NAME") \
     $(printf '%q' "$SCRIPT_PATH") --execute --non-interactive
-EOF
+EOF_PLAN
 }
 
-prepare_custom_image_worktree() {
-  rm -rf "$CUSTOM_PROJECT"
-  git -C "$CUSTOM_IMAGE_SOURCE" worktree add --detach "$CUSTOM_PROJECT" "$CUSTOM_SOURCE_COMMIT"
-  [[ -f "$CUSTOM_PROJECT/recipe.yml" ]] || die "Official custom-image worktree is incomplete."
-  ok "Clean custom-image worktree prepared at commit $CUSTOM_SOURCE_COMMIT."
-}
+prepare_custom_image_worktree() { rm -rf "$CUSTOM_PROJECT"; git -C "$CUSTOM_IMAGE_SOURCE" worktree add --detach "$CUSTOM_PROJECT" "$CUSTOM_SOURCE_COMMIT"; [[ -f "$CUSTOM_PROJECT/recipe.yml" ]] || die "Official custom-image worktree is incomplete."; ok "Clean custom-image worktree prepared at commit $CUSTOM_SOURCE_COMMIT."; }
 
 # ---------------------------- Vib tooling --------------------------------
-
-host_arch() {
-  case "$(uname -m)" in
-    aarch64|arm64) printf arm64 ;;
-    x86_64|amd64) printf amd64 ;;
-    *) die "Unsupported host architecture for Vib: $(uname -m)" ;;
-  esac
-}
-
-normalize_version_tag() {
-  local version="$1"
-  [[ "$version" == v* ]] && printf '%s' "$version" || printf 'v%s' "$version"
-}
-
-version_ge() {
-  local actual="$1" required="$2"
-  [[ -n "$actual" && -n "$required" ]] || return 1
-  [[ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | sed -n '1p')" == "$required" ]]
-}
-
-download_atomic() {
-  local url="$1" destination="$2"
-  local partial="${destination}.partial"
-  mkdir -p "$(dirname "$destination")"
-  rm -f "$partial"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 \
-    "$url" -o "$partial"
-  [[ -s "$partial" ]] || die "Downloaded file is empty: $url"
-  mv -f "$partial" "$destination"
-}
-
-github_api_curl() {
-  local -a args=(
-    -fsSL
-    --retry 3
-    --retry-delay 2
-    --connect-timeout 30
-    -H "Accept: application/vnd.github+json"
-    -H "X-GitHub-Api-Version: 2022-11-28"
-  )
-  [[ -n "${GITHUB_TOKEN:-}" ]] && \
-    args+=( -H "Authorization: Bearer $GITHUB_TOKEN" )
-  curl "${args[@]}" "$@"
-}
-
-resolve_fsguard_release_asset() {
-  local arch="$1"
-  local asset_name="fsguard-$arch.so"
-  local metadata selection available
-  local requested="${FSGUARD_PLUGIN_VERSION}"
-
-  if [[ "${requested,,}" == "auto" || "${requested,,}" == "latest-compatible" ]]; then
-    metadata="$TMP_ROOT/vib-fsguard-releases.json"
-    info "Querying $FSGUARD_PLUGIN_REPO releases for newest asset: $asset_name"
-    github_api_curl \
-      "https://api.github.com/repos/$FSGUARD_PLUGIN_REPO/releases?per_page=100" \
-      -o "$metadata" || die "Unable to query FsGuard release metadata."
-
-    selection="$(
-      jq -r --arg asset "$asset_name" '
-        [
-          .[]
-          | select(.draft == false)
-          | select(.prerelease == false)
-          | . as $release
-          | $release.assets[]?
-          | select(.name == $asset)
-          | [$release.tag_name, .browser_download_url]
-        ][0] // empty
-        | @tsv
-      ' "$metadata"
-    )"
-  else
-    local tag
-    tag="$(normalize_version_tag "$requested")"
-    metadata="$TMP_ROOT/vib-fsguard-release-${tag}.json"
-    info "Querying $FSGUARD_PLUGIN_REPO release $tag for asset: $asset_name"
-    github_api_curl \
-      "https://api.github.com/repos/$FSGUARD_PLUGIN_REPO/releases/tags/$tag" \
-      -o "$metadata" || die "Unable to query FsGuard release metadata for $tag."
-
-    selection="$(
-      jq -r --arg asset "$asset_name" '
-        . as $release
-        | [
-            $release.assets[]?
-            | select(.name == $asset)
-            | [$release.tag_name, .browser_download_url]
-          ][0] // empty
-        | @tsv
-      ' "$metadata"
-    )"
-  fi
-
-  if [[ -z "$selection" ]]; then
-    available="$(
-      jq -r '
-        if type == "array" then
-          .[] | .tag_name as $tag | .assets[]? | "\($tag):\(.name)"
-        else
-          .tag_name as $tag | .assets[]? | "\($tag):\(.name)"
-        end
-      ' "$metadata" | sed -n '1,80p'
-    )"
-    fail "No exact FsGuard release asset was found for architecture $arch: $asset_name"
-    fail "Requested selector: $requested"
-    if [[ -n "$available" ]]; then
-      fail "Available release assets examined:"
-      printf '%s\n' "$available" >&2
-    fi
-    return 1
-  fi
-
-  FSGUARD_PLUGIN_RESOLVED_TAG="${selection%%$'\t'*}"
-  FSGUARD_PLUGIN_ASSET_URL="${selection#*$'\t'}"
-  FSGUARD_PLUGIN_RELEASE_METADATA="$metadata"
-
-  [[ -n "$FSGUARD_PLUGIN_RESOLVED_TAG" ]] || return 1
-  [[ -n "$FSGUARD_PLUGIN_ASSET_URL" ]] || return 1
-
-  ok "Resolved FsGuard plugin: $FSGUARD_PLUGIN_REPO $FSGUARD_PLUGIN_RESOLVED_TAG / $asset_name"
-}
-
-vib_exec() {
-  # Vib requires sudo identity variables whenever it detects uid 0. Direct root
-  # shells do not provide them, so use a deterministic build-only root context.
-  local vib_home="/home/root"
-  local vib_cache="$CACHE_DIR/vib-root"
-  [[ "$(id -u)" -eq 0 ]] && mkdir -p "$vib_home"
-  mkdir -p "$vib_cache"
-
-  env \
-    SUDO_UID=0 \
-    SUDO_GID=0 \
-    SUDO_USER=root \
-    HOME="$vib_home" \
-    XDG_CACHE_HOME="$vib_cache" \
-    "$VIB_BIN" "$@"
-}
-
-probe_vib_binary() {
-  local output rc detected
-  set +e
-  output="$(vib_exec --version 2>&1)"
-  rc=$?
-  set -e
-
-  if (( rc != 0 )); then
-    warn "Vib preflight failed with exit status $rc: $VIB_BIN"
-    [[ -n "$output" ]] && warn "$output" || warn "Vib produced no diagnostic output."
-    return 1
-  fi
-
-  detected="$(printf '%s\n' "$output" | grep -Eo '[0-9]+(\.[0-9]+){2}' | sed -n '1p' || true)"
-  [[ -n "$detected" ]] || {
-    warn "Unable to parse a semantic version from Vib output: ${output:-<empty>}"
-    return 1
-  }
-
-  version_ge "$detected" "$VIB_RECIPE_VERSION" || {
-    warn "Selected Vib version $detected is older than recipe requirement $VIB_RECIPE_VERSION."
-    return 1
-  }
-
-  VIB_DETECTED_VERSION="$detected"
-  info "Vib version output: $output"
-  ok "Vib preflight passed with normalized root execution context."
-}
-
-download_builder_local_vib() {
-  local arch="$1" tag
-  tag="$(normalize_version_tag "$VIB_VERSION")"
-  VIB_BIN="$WORKDIR/tools/vib"
-  mkdir -p "$(dirname "$VIB_BIN")"
-  info "Downloading Vib $tag for $arch to $VIB_BIN"
-  download_atomic \
-    "https://github.com/Vanilla-OS/Vib/releases/download/$tag/vib-$arch" \
-    "$VIB_BIN"
-  chmod 0755 "$VIB_BIN"
-}
-
-verify_plugin_elf_architecture() {
-  local plugin="$1" arch="$2" description
-  [[ -s "$plugin" ]] || die "Required Vib plugin is absent or empty: $plugin"
-
-  description="$(file -b "$plugin")"
-  printf '%s\n' "$description" | grep -Fq 'ELF 64-bit' || \
-    die "Vib plugin is not a 64-bit ELF object: $plugin ($description)"
-  printf '%s\n' "$description" | grep -Fq 'shared object' || \
-    die "Vib plugin is not an ELF shared object: $plugin ($description)"
-
-  case "$arch" in
-    arm64)
-      printf '%s\n' "$description" | grep -Eq 'ARM aarch64|ARM64|AArch64' || \
-        die "Vib plugin architecture mismatch; expected arm64: $plugin ($description)"
-      ;;
-    amd64)
-      printf '%s\n' "$description" | grep -Eq 'x86-64|x86_64|AMD x86-64' || \
-        die "Vib plugin architecture mismatch; expected amd64: $plugin ($description)"
-      ;;
-    *) die "Unsupported Vib plugin architecture: $arch" ;;
-  esac
-}
-
-install_core_vib_plugins() {
-  # Official Vib release archives contain build/plugins. Official vib-gh-action
-  # extracts the archive and moves build/plugins to project-local plugins.
-  local arch="$1" tag archive extract_root source_dir plugin_dir
-  tag="$(normalize_version_tag "$VIB_DETECTED_VERSION")"
-  archive="$CACHE_DIR/vib-$tag-plugins-$arch.tar.gz"
-  extract_root="$TMP_ROOT/vib-core-plugins-extract"
-  source_dir="$extract_root/build/plugins"
-  plugin_dir="$CUSTOM_PROJECT/plugins"
-
-  if [[ ! -s "$archive" ]]; then
-    info "Downloading Vib core plugin bundle $tag for $arch."
-    download_atomic \
-      "https://github.com/Vanilla-OS/Vib/releases/download/$tag/plugins-$arch.tar.gz" \
-      "$archive"
-  else
-    info "Using cached Vib core plugin bundle: $archive"
-  fi
-
-  tar -tzf "$archive" > "$TMP_ROOT/vib-core-plugin-archive.inventory"
-  grep -Eq '^build/plugins/' "$TMP_ROOT/vib-core-plugin-archive.inventory" || \
-    die "Unexpected Vib core plugin archive layout: $archive"
-
-  rm -rf "$extract_root" "$plugin_dir"
-  mkdir -p "$extract_root" "$plugin_dir"
-  tar -xzf "$archive" -C "$extract_root"
-
-  [[ -d "$source_dir" ]] || die "Core plugin extraction did not produce $source_dir"
-  find "$source_dir" -maxdepth 1 -type f -name '*.so' -print -quit | grep -q . || \
-    die "Core Vib plugin bundle contains no shared objects."
-
-  rsync -a "$source_dir/" "$plugin_dir/"
-  ok "Installed Vib core plugins from $tag."
-}
-
-install_fsguard_vib_plugin() {
-  # FsGuard is external to the core Vib plugin archive. Resolve an exact
-  # architecture-specific release asset from GitHub metadata and install it
-  # under the module loader name plugins/fsguard.so.
-  local arch="$1"
-  local asset_name cached_asset plugin_dir final_plugin cache_tag
-
-  resolve_fsguard_release_asset "$arch" || \
-    die "Unable to resolve a compatible FsGuard Vib plugin."
-
-  asset_name="fsguard-$arch.so"
-  cache_tag="${FSGUARD_PLUGIN_RESOLVED_TAG//\//-}"
-  cached_asset="$CACHE_DIR/vib-fsguard-$cache_tag-$arch.so"
-  plugin_dir="$CUSTOM_PROJECT/plugins"
-  final_plugin="$plugin_dir/fsguard.so"
-
-  if [[ ! -s "$cached_asset" ]]; then
-    info "Downloading external FsGuard plugin $FSGUARD_PLUGIN_RESOLVED_TAG for $arch."
-    download_atomic "$FSGUARD_PLUGIN_ASSET_URL" "$cached_asset"
-  else
-    info "Using cached external FsGuard plugin: $cached_asset"
-  fi
-
-  verify_plugin_elf_architecture "$cached_asset" "$arch"
-  install -m 0644 "$cached_asset" "$final_plugin"
-  verify_plugin_elf_architecture "$final_plugin" "$arch"
-
-  FSGUARD_PLUGIN_FILE="$final_plugin"
-  ok "Installed FsGuard plugin with exact Vib loader name: $final_plugin"
-}
-
-
-verify_vib_plugin_set() {
-  local arch="$1" plugin_dir="$CUSTOM_PROJECT/plugins"
-  local inventory="$TMP_ROOT/vib-plugin-inventory.txt"
-  local count
-
-  [[ -s "$plugin_dir/fsguard.so" ]] || \
-    die "Required external Vib plugin is absent: $plugin_dir/fsguard.so"
-  verify_plugin_elf_architecture "$plugin_dir/fsguard.so" "$arch"
-
-  find "$plugin_dir" -maxdepth 1 -type f -name '*.so' \
-    -printf '%f\t%s bytes\n' | LC_ALL=C sort > "$inventory"
-  count="$(wc -l < "$inventory" | tr -d '[:space:]')"
-  [[ "$count" =~ ^[0-9]+$ ]] || die "Unable to count installed Vib plugins."
-  (( count > 0 )) || die "No Vib plugins were installed."
-
-  sha256sum "$plugin_dir"/*.so > "$TMP_ROOT/vib-plugin-checksums.sha256"
-  ok "Validated $count project-local Vib plugin shared object(s)."
-  info "Required plugin present: $plugin_dir/fsguard.so"
-}
-
-capture_vib_diagnostics() {
-  local reason="$1"
-  local diag="$LOG_DIR/${SESSION_ID}-vib-diagnostics"
-  mkdir -p "$diag"
-
-  printf '%s\n' "$reason" > "$diag/FAILURE.txt"
-  printf '%s\n' "$VIB_BIN" > "$diag/vib-executable.path"
-  file "$VIB_BIN" > "$diag/vib-executable.file" 2>&1 || true
-  sha256sum "$VIB_BIN" > "$diag/vib-executable.sha256" 2>/dev/null || true
-
-  set +e
-  vib_exec --version > "$diag/vib-version.txt" 2>&1
-  printf '%s\n' "$?" > "$diag/vib-version.exit-status"
-  set -e
-
-  for f in \
-    "$CUSTOM_PROJECT/recipe.yml" \
-    "$CUSTOM_PROJECT/Containerfile" \
-    "$CUSTOM_PROJECT/VanillaOS-SnapdragonX-INPUTS.txt" \
-    "$TMP_ROOT/target-installed-kernel-packages.actual.tsv" \
-    "$TMP_ROOT/target-installed-package-expectations.tsv" \
-    "$SOURCE_PROVENANCE_MANIFEST" \
-    "$LIVE_PACKAGE_LIST_PACKAGE_INVENTORY" \
-    "$LIVE_PACKAGE_CANDIDATE_REPORT" \
-    "$TMP_ROOT/vib-core-plugin-archive.inventory" \
-    "$TMP_ROOT/vib-plugin-inventory.txt" \
-    "$TMP_ROOT/vib-plugin-checksums.sha256" \
-    "$FSGUARD_PLUGIN_RELEASE_METADATA"
-  do
-    [[ -f "$f" ]] && cp -a "$f" "$diag/"
-  done
-
-  if [[ -d "$CUSTOM_PROJECT/modules" ]]; then
-    mkdir -p "$diag/modules"
-    cp -a "$CUSTOM_PROJECT/modules/." "$diag/modules/"
-  fi
-  if [[ -d "$CUSTOM_PROJECT/plugins" ]]; then
-    mkdir -p "$diag/plugins"
-    cp -a "$CUSTOM_PROJECT/plugins/." "$diag/plugins/"
-    find "$CUSTOM_PROJECT/plugins" -printf '%M %u:%g %s %p\n' \
-      > "$diag/plugin-filesystem-inventory.txt" 2>&1 || true
-  fi
-
-  (
-    printf 'uid=%s gid=%s user=%s\n' "$(id -u)" "$(id -g)" "$(id -un)"
-    printf 'SUDO_UID=%q\n' "${SUDO_UID:-}"
-    printf 'SUDO_GID=%q\n' "${SUDO_GID:-}"
-    printf 'SUDO_USER=%q\n' "${SUDO_USER:-}"
-    printf 'PWD=%q\n' "$PWD"
-    printf 'CUSTOM_PROJECT=%q\n' "$CUSTOM_PROJECT"
-    printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
-    printf 'VIB_DETECTED_VERSION=%q\n' "$VIB_DETECTED_VERSION"
-    printf 'FSGUARD_PLUGIN_REPO=%q\n' "$FSGUARD_PLUGIN_REPO"
-    printf 'FSGUARD_PLUGIN_VERSION=%q\n' "$FSGUARD_PLUGIN_VERSION"
-    printf 'FSGUARD_PLUGIN_RESOLVED_TAG=%q\n' "$FSGUARD_PLUGIN_RESOLVED_TAG"
-    printf 'FSGUARD_PLUGIN_ASSET_URL=%q\n' "$FSGUARD_PLUGIN_ASSET_URL"
-    printf 'FSGUARD_PLUGIN_FILE=%q\n' "$FSGUARD_PLUGIN_FILE"
-  ) > "$diag/execution-context.txt"
-
-  warn "Vib diagnostic bundle retained at: $diag"
-}
-
-run_logged_vib() {
-  local name="$1"; shift
-  local rc
-  CURRENT_LOG="$LOG_DIR/${SESSION_ID}-${name}.log"
-  mkdir -p "$LOG_DIR"
-  info "Log: $CURRENT_LOG"
-
-  set +e
-  vib_exec "$@" 2>&1 | tee "$CURRENT_LOG"
-  rc=${PIPESTATUS[0]}
-  set -e
-
-  if (( rc != 0 )); then
-    [[ -s "$CURRENT_LOG" ]] || {
-      fail "Vib exited with status $rc and produced no output."
-      fail "This is consistent with failure before Cobra command execution."
-    }
-    capture_vib_diagnostics "Vib command failed: $*; exit status: $rc"
-    return "$rc"
-  fi
-}
-
-install_vib_and_plugins() {
-  local arch choice selected_system=0
-  arch="$(host_arch)"
-
-  if command_exists vib && [[ ! -x "$VIB_BIN" ]]; then
-    if is_interactive; then
-      choice="$(menu "Vib Executable Selection\n\nSystem Vib detected:\n  $(command -v vib)\nBuilder-local default:\n  $WORKDIR/tools/vib\n\nThe selected binary and exact plugin set are validated before recipe generation." "1" \
-        "1|Use and validate the existing system Vib|Use its exact detected version for the matching core plugin bundle." \
-        "2|Download the official pinned builder-local Vib|Use version $(normalize_version_tag "$VIB_VERSION")." \
-        "3|Open a shell|Inspect Vib and plugin versions manually." \
-        "4|Abort|Stop.")"
-      case "$choice" in
-        1) VIB_BIN="$(command -v vib)"; selected_system=1 ;;
-        2) VIB_BIN="$WORKDIR/tools/vib" ;;
-        3) open_shell "$WORKDIR"; install_vib_and_plugins; return ;;
-        4) die "Vib selection aborted." ;;
-      esac
-    else
-      VIB_BIN="$(command -v vib)"
-      selected_system=1
-    fi
-  fi
-
-  [[ -n "$VIB_BIN" ]] || VIB_BIN="$WORKDIR/tools/vib"
-  [[ -x "$VIB_BIN" ]] || download_builder_local_vib "$arch"
-
-  if ! probe_vib_binary; then
-    if (( selected_system == 1 )); then
-      if is_interactive; then
-        choice="$(menu "System Vib Validation Failed\n\nThe existing system Vib could not pass the normalized version preflight." "1" \
-          "1|Download pinned builder-local Vib [RECOMMENDED]|Use official Vib $(normalize_version_tag "$VIB_VERSION")." \
-          "2|Open a shell|Inspect the system Vib manually." \
-          "3|Abort|Stop.")"
-        case "$choice" in
-          1) download_builder_local_vib "$arch" ;;
-          2) open_shell "$WORKDIR"; install_vib_and_plugins; return ;;
-          3) die "Vib validation failed." ;;
-        esac
-      else
-        warn "System Vib validation failed; switching to pinned builder-local Vib."
-        download_builder_local_vib "$arch"
-      fi
-      probe_vib_binary || die "Builder-local Vib failed validation."
-    else
-      die "Selected Vib executable failed validation: $VIB_BIN"
-    fi
-  fi
-
-  install_core_vib_plugins "$arch"
-  install_fsguard_vib_plugin "$arch"
-  verify_vib_plugin_set "$arch"
-
-  ok "Vib executable: $VIB_BIN"
-  ok "Vib detected version: $VIB_DETECTED_VERSION"
-  ok "Vib execution identity: uid=0 gid=0 user=root through normalized SUDO_* context"
-  ok "Project-local Vib plugins: $CUSTOM_PROJECT/plugins"
-  ok "FsGuard plugin: $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG"
-}
-
+host_arch() { case "$(uname -m)" in aarch64|arm64) printf arm64;; x86_64|amd64) printf amd64;; *) die "Unsupported host architecture for Vib: $(uname -m)";; esac; }
+normalize_version_tag() { [[ "$1" == v* ]] && printf '%s' "$1" || printf 'v%s' "$1"; }
+version_ge() { local actual="$1" required="$2"; [[ -n "$actual" && -n "$required" ]] || return 1; [[ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | sed -n '1p')" == "$required" ]]; }
+download_atomic() { local url="$1" destination="$2" partial="${2}.partial"; mkdir -p "$(dirname "$destination")"; rm -f "$partial"; curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 "$url" -o "$partial"; [[ -s "$partial" ]] || die "Downloaded file is empty: $url"; mv -f "$partial" "$destination"; }
+vib_exec() { local vib_home="/home/root" vib_cache="$CACHE_DIR/vib-root"; [[ "$(id -u)" -ne 0 ]] || mkdir -p "$vib_home"; mkdir -p "$vib_cache"; env SUDO_UID=0 SUDO_GID=0 SUDO_USER=root HOME="$vib_home" XDG_CACHE_HOME="$vib_cache" "$VIB_BIN" "$@"; }
+probe_vib_binary() { local output rc detected; set +e; output="$(vib_exec --version 2>&1)"; rc=$?; set -e; (( rc == 0 )) || { warn "Vib preflight failed: $VIB_BIN"; return 1; }; detected="$(printf '%s\n' "$output" | grep -Eo '[0-9]+(\.[0-9]+){2}' | sed -n '1p' || true)"; [[ -n "$detected" ]] || { warn "Unable to parse Vib semantic version: $output"; return 1; }; version_ge "$detected" "$VIB_RECIPE_VERSION" || { warn "Vib $detected is older than recipe $VIB_RECIPE_VERSION"; return 1; }; VIB_DETECTED_VERSION="$detected"; ok "Vib preflight passed: $output"; }
+download_builder_local_vib() { local arch="$1" tag; tag="$(normalize_version_tag "$VIB_VERSION")"; VIB_BIN="$WORKDIR/tools/vib"; mkdir -p "$(dirname "$VIB_BIN")"; download_atomic "https://github.com/Vanilla-OS/Vib/releases/download/$tag/vib-$arch" "$VIB_BIN"; chmod 0755 "$VIB_BIN"; }
+install_core_vib_plugins() { local arch="$1" tag archive extract_root source_dir plugin_dir; tag="$(normalize_version_tag "$VIB_DETECTED_VERSION")"; archive="$CACHE_DIR/vib-$tag-plugins-$arch.tar.gz"; extract_root="$TMP_ROOT/vib-core-plugins-extract"; source_dir="$extract_root/build/plugins"; plugin_dir="$CUSTOM_PROJECT/plugins"; [[ -s "$archive" ]] || download_atomic "https://github.com/Vanilla-OS/Vib/releases/download/$tag/plugins-$arch.tar.gz" "$archive"; rm -rf "$extract_root" "$plugin_dir"; mkdir -p "$extract_root" "$plugin_dir"; tar -xzf "$archive" -C "$extract_root"; [[ -d "$source_dir" ]] || die "Core plugin extraction did not produce $source_dir"; rsync -a "$source_dir/" "$plugin_dir/"; ok "Installed Vib core plugins from $tag; Reunion requires no external FsGuard plugin."; }
+verify_vib_plugin_set() { local plugin_dir="$CUSTOM_PROJECT/plugins" count inventory="$TMP_ROOT/vib-plugin-inventory.txt"; find "$plugin_dir" -maxdepth 1 -type f -name '*.so' -printf '%f\t%s bytes\n' | LC_ALL=C sort > "$inventory"; count="$(wc -l < "$inventory" | tr -d '[:space:]')"; (( count > 0 )) || die "No Vib core plugins were installed."; sha256sum "$plugin_dir"/*.so > "$TMP_ROOT/vib-plugin-checksums.sha256"; ok "Validated $count project-local Vib core plugin(s); no FsGuard plugin present or required."; }
+capture_vib_diagnostics() { local reason="$1" diag="$LOG_DIR/${SESSION_ID}-vib-diagnostics"; mkdir -p "$diag"; printf '%s\n' "$reason" > "$diag/FAILURE.txt"; printf '%s\n' "$VIB_BIN" > "$diag/vib-executable.path"; file "$VIB_BIN" > "$diag/vib-executable.file" 2>&1 || true; sha256sum "$VIB_BIN" > "$diag/vib-executable.sha256" 2>/dev/null || true; [[ ! -f "$CUSTOM_PROJECT/recipe.yml" ]] || cp -a "$CUSTOM_PROJECT/recipe.yml" "$diag/"; [[ ! -d "$CUSTOM_PROJECT/modules" ]] || cp -a "$CUSTOM_PROJECT/modules" "$diag/"; [[ ! -d "$CUSTOM_PROJECT/plugins" ]] || cp -a "$CUSTOM_PROJECT/plugins" "$diag/"; { printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"; printf 'VIB_DETECTED_VERSION=%q\n' "$VIB_DETECTED_VERSION"; printf 'REUNION_FSGUARD=absent\n'; } > "$diag/execution-context.txt"; warn "Vib diagnostic bundle retained at: $diag"; }
+run_logged_vib() { local name="$1"; shift; local rc; CURRENT_LOG="$LOG_DIR/${SESSION_ID}-${name}.log"; mkdir -p "$LOG_DIR"; info "Log: $CURRENT_LOG"; set +e; vib_exec "$@" 2>&1 | tee "$CURRENT_LOG"; rc=${PIPESTATUS[0]}; set -e; if (( rc != 0 )); then capture_vib_diagnostics "Vib command failed: $*; exit status: $rc"; return "$rc"; fi; }
+install_vib_and_plugins() { local arch; arch="$(host_arch)"; [[ -n "$VIB_BIN" ]] || VIB_BIN="$WORKDIR/tools/vib"; if [[ ! -x "$VIB_BIN" ]] && command_exists vib; then VIB_BIN="$(command -v vib)"; fi; [[ -x "$VIB_BIN" ]] || download_builder_local_vib "$arch"; probe_vib_binary || { download_builder_local_vib "$arch"; probe_vib_binary || die "Builder-local Vib failed validation."; }; install_core_vib_plugins "$arch"; verify_vib_plugin_set; ok "Vib executable: $VIB_BIN"; ok "Vib detected version: $VIB_DETECTED_VERSION"; }
 # ------------------------ custom target OCI ------------------------------
 
 generate_root_overlay_inventory() {
@@ -4650,7 +2596,7 @@ generate_root_overlay_inventory() {
     local rel hash
     rel="${file#"$ROOT_SOURCE"/}"
     hash="$(sha256sum "$file" | awk '{print $1}')"
-    printf '%s  /root/%s\n' "$hash" "$rel" >> "$ROOT_OVERLAY_INVENTORY"
+    printf '%s  /usr/lib/vanillaos-snapdragonx/root-source-overlay/%s\n' "$hash" "$rel" >> "$ROOT_OVERLAY_INVENTORY"
   done < <(find "$ROOT_SOURCE" -type f -print0 | sort -z)
 }
 
@@ -4669,10 +2615,8 @@ prepare_custom_image_project() {
 
   rm -rf \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
-    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages" \
     "$CUSTOM_PROJECT/includes.container/usr/lib/firmware" \
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
-    "$CUSTOM_PROJECT/includes.container/root" \
     "$CUSTOM_PROJECT/includes.container/image-info" \
     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE" \
     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance" \
@@ -4680,15 +2624,14 @@ prepare_custom_image_project() {
 
   mkdir -p \
     "$CUSTOM_PROJECT/includes.container/deb-pkgs" \
-    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages" \
     "$CUSTOM_PROJECT/includes.container/usr/lib/firmware" \
     "$CUSTOM_PROJECT/includes.container/boot/dtbs" \
-    "$CUSTOM_PROJECT/includes.container/root" \
     "$CUSTOM_PROJECT/includes.container/image-info" \
-    "$CUSTOM_PROJECT/includes.container/usr/local/sbin" \
+    "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx" \
     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/profiles/$PROFILE" \
     "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance" \
     "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx" \
+    "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx/root-source-overlay" \
     "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants" \
     "$CUSTOM_PROJECT/modules"
 
@@ -4717,7 +2660,7 @@ prepare_custom_image_project() {
   cp -a "$DTB_FILE" "$CUSTOM_PROJECT/includes.container/boot/dtbs/$DTB_NAME"
 
   if [[ -n "$ROOT_SOURCE" ]]; then
-    rsync -aHAX "$ROOT_SOURCE/" "$CUSTOM_PROJECT/includes.container/root/"
+    rsync -aHAX "$ROOT_SOURCE/" "$CUSTOM_PROJECT/includes.container/usr/lib/vanillaos-snapdragonx/root-source-overlay/"
     ROOT_PROBE_REL="$(find "$ROOT_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | sed -n '1p' || true)"
   else
     ROOT_PROBE_REL=""
@@ -4732,27 +2675,9 @@ prepare_custom_image_project() {
       "$CUSTOM_PROJECT/includes.container/usr/share/vanillaos-snapdragonx/firmware-provenance/"
   fi
 
-  # Preserve every supplied package without forcing optional build artifacts
-  # into the immutable runtime package transaction.
-  mkdir -p "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages"
-  for deb in "${KERNEL_DEBS[@]}"; do
-    staged_name="$(kernel_deb_canonical_name "$deb")"
-    [[ ! -e "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/$staged_name" ]] || \
-      die "Canonical archived package name collision: $staged_name"
-    cp -a "$deb" "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/$staged_name"
-  done
-  cp -a "$TMP_ROOT/kernel-package-selection.tsv" \
-    "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/PACKAGE-SELECTION.tsv"
-  cat > "$CUSTOM_PROJECT/includes.container/root/custom-kernel-packages/README.txt" <<'PACKAGE_ARCHIVE_README'
-These Debian packages are retained as build and diagnostic artifacts.
-
-Only packages marked target_install=yes in PACKAGE-SELECTION.tsv were installed
-into the immutable target image. Selection is based on conventional kernel
-payloads plus the deterministic local Depends/Pre-Depends closure, not on a
-linux-image, linux-modules, Ubuntu, Armbian, or private-fork package name.
-Reference-only headers, tools, development packages, metadata, and unrelated
-packages remain archived here.
-PACKAGE_ARCHIVE_README
+  # r5 intentionally does not embed the supplied .deb archive in the target.
+  # kernel-package-selection.tsv, kernel-package-closure.json, the installed-package
+  # receipt, and release SHA256SUMS are the authoritative package evidence.
 
   printf '%s' "$CUSTOM_IMAGE_BASE" > "$CUSTOM_PROJECT/includes.container/image-info/base-image-name"
   printf '%s' "$ABROOT_IMAGE_NAME" > "$CUSTOM_PROJECT/includes.container/image-info/image-name"
@@ -4785,8 +2710,8 @@ apt-get update
 
 # The target transaction contains the payload-selected kernel image/modules,
 # release-bound auxiliary packages, a release-specific orchestrator when one is
-# supplied, and local Depends/Pre-Depends needed by that closure. Unrelated
-# packages remain archived under /root/custom-kernel-packages.
+# supplied, and local Depends/Pre-Depends needed by that closure. Reference-only
+# packages are retained only in release-side selection/closure evidence, not in the target.
 printf 'Installing selected local kernel package closure:\n'
 printf '  %s\n' "${packages[@]}"
 apt-get install -y "${packages[@]}"
@@ -4847,7 +2772,7 @@ INSTALL_DEBS_EOF
   installed_array="$(shell_array_literal "${PROFILE_INSTALLED_PATH_PROBES[@]}")"
   cmdline_array="$(shell_array_literal "${PROFILE_KERNEL_CMDLINE_APPEND[@]}")"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize" <<EOF_FINALIZE
+  cat > "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/hardware-finalize" <<EOF_FINALIZE
 #!/usr/bin/env bash
 set -Eeuo pipefail
 release=$(printf '%q' "$KERNEL_RELEASE")
@@ -4880,9 +2805,9 @@ done
 
 test -s /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
 EOF_FINALIZE
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/hardware-finalize"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot" <<EOF_INSTALLED_VERIFY
+  cat > "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/verify-installed-boot" <<EOF_INSTALLED_VERIFY
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -4991,9 +2916,9 @@ done
 require_nonempty_file \
   /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256 \
   "staged firmware provenance" 132
-[[ -x /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence ]] || \
+[[ -x /usr/libexec/vanillaos-snapdragonx/record-boot-evidence ]] || \
   fail_verify 133 "Boot evidence recorder is absent or not executable"
-[[ -x /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics ]] || \
+[[ -x /usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics ]] || \
   fail_verify 134 "Hardware diagnostics collector is absent or not executable"
 
 for path in "\${installed_paths[@]}"; do
@@ -5010,10 +2935,6 @@ esac
 require_nonempty_file \
   /usr/lib/vanillaos-snapdragonx/relocated-var-payload.status \
   "relocated payload status" 126
-require_nonempty_file \
-  /root/custom-kernel-packages/PACKAGE-SELECTION.tsv \
-  "preserved custom-kernel package selection archive" 127
-
 if (( \${#initramfs_probes[@]} > 0 )); then
   command -v lsinitramfs >/dev/null 2>&1 || \
     fail_verify 128 "lsinitramfs is required for configured initramfs probes"
@@ -5036,7 +2957,7 @@ if [[ -s /usr/lib/vanillaos-snapdragonx/root-overlay.sha256 ]]; then
     cat "\$checksum_output" >&2 || true
     rm -f "\$checksum_output"
     fail_verify 131 \
-      "Root overlay checksum validation failed after Vanilla /root relocation"
+      "Immutable legacy root-source checksum validation failed"
   fi
   cat "\$checksum_output"
   rm -f "\$checksum_output"
@@ -5052,26 +2973,24 @@ mkdir -p /usr/lib/vanillaos-snapdragonx
   printf 'abroot_a\tpass\t%s\n' "\$cfg"
   printf 'initramfs\tpass\t%s\n' "\$state/initrd.img-\$release"
   printf 'root_relocation\tpass\t%s\n' "\$root_link"
-  printf 'root_overlay\t%s\t%s\n' "\$root_overlay_status" \
+  printf 'root_source_overlay\t%s\t%s\n' "\$root_overlay_status" \
     /usr/lib/vanillaos-snapdragonx/root-overlay.sha256
-  printf 'package_archive\tpass\t%s\n' \
-    /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
   printf 'firmware_provenance\tpass\t%s\n' \
     /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
   printf 'boot_evidence_collector\tpass\t%s\n' \
-    /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
+    /usr/libexec/vanillaos-snapdragonx/record-boot-evidence
   printf 'hardware_diagnostics\tpass\t%s\n' \
-    /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+    /usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics
 } > /usr/lib/vanillaos-snapdragonx/installed-boot-validation.tsv
 
 printf 'VanillaOS-SnapdragonX installed-boot verification passed for profile %s.\n' "\$profile"
 EOF_INSTALLED_VERIFY
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/verify-installed-boot"
 
   # Vanilla installations may not retain a conventional dmesg text file. This
   # oneshot records the boot's kernel journal, command line, Adreno messages,
   # firmware inventory, and DRM nodes into writable /var after each boot.
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence" <<'BOOT_EVIDENCE_EOF'
+  cat > "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/record-boot-evidence" <<'BOOT_EVIDENCE_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -5097,7 +3016,6 @@ find /usr/lib/firmware/qcom -maxdepth 4 \
   \( -name 'gen71500*' -o -name '*8380*' \) \
   -printf '%M\t%u:%g\t%s\t%p\t%l\n' 2>/dev/null | LC_ALL=C sort \
   > "$work/qcom-firmware-files.tsv" || true
-
 sha256sum \
   /usr/lib/firmware/qcom/gen71500_sqe.fw \
   /usr/lib/firmware/qcom/gen71500_gmu.bin \
@@ -5112,9 +3030,9 @@ rm -rf "$final"
 mv "$work" "$final"
 ln -sfn "$(basename "$final")" "$out/current"
 BOOT_EVIDENCE_EOF
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/record-boot-evidence"
 
-  cat > "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics" <<'HW_COLLECT_EOF'
+  cat > "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics" <<'HW_COLLECT_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -5127,7 +3045,7 @@ work="${TMPDIR:-/tmp}/$name"
 archive="${1:-$PWD/$name.tar.gz}"
 mkdir -p "$work"
 
-/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence || true
+/usr/libexec/vanillaos-snapdragonx/record-boot-evidence || true
 cp -a /var/log/vanillaos-snapdragonx "$work/" 2>/dev/null || true
 cp -a /usr/share/vanillaos-snapdragonx/firmware-provenance "$work/" 2>/dev/null || true
 cp -a /usr/share/vanillaos-snapdragonx/profiles "$work/" 2>/dev/null || true
@@ -5146,7 +3064,7 @@ tar -C "$(dirname "$work")" -czf "$archive" "$(basename "$work")"
 sha256sum "$archive"
 printf 'Diagnostic archive: %s\n' "$archive"
 HW_COLLECT_EOF
-  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics"
+  chmod 0755 "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics"
 
   cat > "$CUSTOM_PROJECT/includes.container/etc/systemd/system/vanillaos-snapdragonx-boot-evidence.service" <<'BOOT_SERVICE_EOF'
 [Unit]
@@ -5156,7 +3074,7 @@ Wants=systemd-journald.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
+ExecStart=/usr/libexec/vanillaos-snapdragonx/record-boot-evidence
 RemainAfterExit=yes
 
 [Install]
@@ -5166,10 +3084,10 @@ BOOT_SERVICE_EOF
     "$CUSTOM_PROJECT/includes.container/etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-boot-evidence.service"
 
   bash -n "$CUSTOM_PROJECT/includes.container/deb-pkgs/install-debs.sh"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-hardware-finalize"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence"
-  bash -n "$CUSTOM_PROJECT/includes.container/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/hardware-finalize"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/verify-installed-boot"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/record-boot-evidence"
+  bash -n "$CUSTOM_PROJECT/includes.container/usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics"
 
   cat > "$CUSTOM_PROJECT/modules/50-install-hardware-debs.yml" <<'MODULE_DEBS_EOF'
 name: install-hardware-debs
@@ -5183,7 +3101,7 @@ MODULE_DEBS_EOF
 name: select-hardware-kernel
 type: shell
 commands:
-  - /usr/local/sbin/vanillaos-snapdragonx-hardware-finalize
+  - /usr/libexec/vanillaos-snapdragonx/hardware-finalize
 MODULE_HW_EOF
 
   cat > "$CUSTOM_PROJECT/recipe.yml" <<EOF_RECIPE
@@ -5236,20 +3154,6 @@ stages:
           - apt-get clean
           - lpkg --lock
 
-      - name: fsguard
-        type: fsguard
-        CustomFsGuard: false
-        FsGuardLocation: "/usr/sbin/FsGuard"
-        GenerateKey: true
-        FilelistPaths: ["/usr/bin"]
-        modules:
-          - name: remove-prev-fsguard
-            type: shell
-            commands:
-              - rm -rf /FsGuard
-              - rm -f ./minisign.pub ./minisign.key
-              - chmod +x /usr/sbin/init
-
       - name: cleanup2
         type: shell
         commands:
@@ -5267,8 +3171,8 @@ Package handling:
   Target installed: ${#TARGET_KERNEL_DEBS[@]} payload/dependency closure packages
   Live extracted:   ${#LIVE_KERNEL_DEBS[@]} image/module/auxiliary packages
   Target excluded:  ${#TARGET_EXCLUDED_KERNEL_DEBS[@]} reference-only packages
-  Target archived:  all supplied packages under /root/custom-kernel-packages
-  Selection record: /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
+  Target archive:   none (retired in r5; redundant target-side historical payload)
+  Selection record: release evidence kernel-package-selection.tsv
   Closure record:   kernel-package-closure.json in release evidence
 
 Selected release:
@@ -5283,7 +3187,7 @@ Selected DTB:
 Firmware source copied as paths relative to /usr/lib/firmware:
   ${FIRMWARE_SOURCE:-none}
 
-Target /root overlay:
+Legacy root-source input (stored immutable; not installed beneath /root):
   ${ROOT_SOURCE:-none}
 
 ABRoot image name:
@@ -5296,28 +3200,73 @@ EOF_INPUTS
   ok "Prepared official custom-image-derived Vib project: $CUSTOM_PROJECT"
 }
 
-validate_target_base_arm64() {
-  # Resolve the selected upstream base for ARM64 before Vib emits a derived
-  # Containerfile. This is a taxonomy/existence check, not installation
-  # provenance: the resulting custom target is still built locally and, in
-  # iso-oci mode, installed from the ISO-embedded OCI layout.
-  case "$CUSTOM_IMAGE_BASE" in
+inspect_stable_reunion_oci() {
+  local role="$1" reference="$2" destination="$3"
+  case "$reference" in
     ghcr.io/*|docker.io/*|quay.io/*)
-      info "Resolving ARM64 target-base descriptor: $CUSTOM_IMAGE_BASE"
-      skopeo --override-arch arm64 inspect "docker://$CUSTOM_IMAGE_BASE" \
-        > "$TARGET_BASE_INSPECT_JSON" || \
-        die "Unable to resolve an ARM64 descriptor for target base: $CUSTOM_IMAGE_BASE"
-      jq -e '.Architecture == "arm64" or .Architecture == "aarch64"' \
-        "$TARGET_BASE_INSPECT_JSON" >/dev/null || \
-        die "Resolved target base is not ARM64: $CUSTOM_IMAGE_BASE"
-      ok "Target base ARM64 descriptor resolved: $(jq -r '.Digest // "digest-unreported"' "$TARGET_BASE_INSPECT_JSON")"
+      info "Resolving stable Reunion ARM64 OCI descriptor: role=$role reference=$reference"
+      skopeo --override-arch arm64 inspect "docker://$reference" > "$destination" ||
+        die "Unable to resolve ARM64 OCI descriptor for $role: $reference"
+      jq -e '.Architecture == "arm64" or .Architecture == "aarch64"' "$destination" >/dev/null ||
+        die "Resolved $role descriptor is not ARM64: $reference"
+      local digest
+      digest="$(jq -r '.Digest // empty' "$destination")"
+      [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+        die "Resolved $role descriptor lacks a canonical SHA-256 digest: $reference"
+      ok "Resolved $role: $reference@$digest"
       ;;
     *)
-      warn "Target base is not a recognized remote registry reference; skipping remote ARM64 descriptor preflight: $CUSTOM_IMAGE_BASE"
-      printf '{"reference":%s,"remote_inspect":"skipped"}\n' \
-        "$(jq -Rn --arg v "$CUSTOM_IMAGE_BASE" '$v')" > "$TARGET_BASE_INSPECT_JSON"
+      # Preserve the historical explicit local/custom-image override surface.
+      # Stable upstream defaults always take the content-addressed path above;
+      # a deliberate non-registry override is recorded but cannot honestly be
+      # represented as a remote manifest digest by skopeo.
+      warn "$role uses a non-registry override; remote moving-tag digest resolution is not applicable: $reference"
+      jq -n --arg reference "$reference" \
+        '{Name:$reference, Architecture:"override-unverified", Digest:null,
+          ReunionResolution:"explicit-non-registry-override"}' > "$destination"
       ;;
   esac
+}
+
+resolve_stable_reunion_oci_provenance() {
+  local live_inspect="$TMP_ROOT/live-builder-inspect.json"
+  local vso_inspect="$TMP_ROOT/vso-native-inspect.json"
+
+  inspect_stable_reunion_oci target-base "$CUSTOM_IMAGE_BASE" "$TARGET_BASE_INSPECT_JSON"
+  inspect_stable_reunion_oci live-builder "$LIVE_ISO_CONTAINER_IMAGE" "$live_inspect"
+  inspect_stable_reunion_oci vso-native "$VSO_NATIVE_IMAGE" "$vso_inspect"
+
+  jq -n \
+    --arg target_ref "$CUSTOM_IMAGE_BASE" \
+    --arg target_digest "$(jq -r '.Digest // empty' "$TARGET_BASE_INSPECT_JSON")" \
+    --arg target_arch "$(jq -r '.Architecture' "$TARGET_BASE_INSPECT_JSON")" \
+    --arg live_ref "$LIVE_ISO_CONTAINER_IMAGE" \
+    --arg live_digest "$(jq -r '.Digest // empty' "$live_inspect")" \
+    --arg live_arch "$(jq -r '.Architecture' "$live_inspect")" \
+    --arg vso_ref "$VSO_NATIVE_IMAGE" \
+    --arg vso_digest "$(jq -r '.Digest // empty' "$vso_inspect")" \
+    --arg vso_arch "$(jq -r '.Architecture' "$vso_inspect")" \
+    --arg vso_base "$VSO_NATIVE_UPSTREAM_BASE" \
+    '{schema:1, architecture:"arm64", resolved_at_utc:(now|todateiso8601),
+      inputs:[
+        {role:"target-base", requested_reference:$target_ref, resolved_digest:$target_digest, architecture:$target_arch, required_for_build:true},
+        {role:"live-builder", requested_reference:$live_ref, resolved_digest:$live_digest, architecture:$live_arch, required_for_build:true},
+        {role:"vso-native", requested_reference:$vso_ref, resolved_digest:$vso_digest, architecture:$vso_arch, required_for_build:false, upstream_base_contract:$vso_base}
+      ]}' > "$UPSTREAM_OCI_PROVENANCE_JSON"
+
+  jq -e '.inputs | length == 3 and all(.[];
+      if (.requested_reference | test("^(ghcr\\.io|docker\\.io|quay\\.io)/"))
+      then (.resolved_digest | test("^sha256:[0-9a-f]{64}$"))
+      else (.resolved_digest == "") end)' \
+    "$UPSTREAM_OCI_PROVENANCE_JSON" >/dev/null ||
+    die "Stable Reunion OCI provenance manifest failed validation."
+
+  # Refresh convergence evidence now that moving stable tags have concrete digests.
+  write_reunion_convergence_manifest
+}
+
+validate_target_base_arm64() {
+  resolve_stable_reunion_oci_provenance
 }
 
 build_target_oci() {
@@ -5371,9 +3320,8 @@ dtb="$2"
 abroot_name="$3"
 firmware_probe="$4"
 root_probe="$5"
-expected_archive_count="$6"
-expected_package_file="$7"
-expected_profile="$8"
+expected_package_file="$6"
+expected_profile="$7"
 
 receipt=/usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv
 receipt_checksum=/usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv.sha256
@@ -5403,8 +3351,8 @@ grep -Fq '/dev/disk/by-partlabel/vos-var' "$unlock_hook"
 grep -Fq '/dev/disk/by-label/vos-var' "$unlock_hook"
 
 test -s /usr/share/vanillaos-snapdragonx/firmware-provenance/staged-firmware.sha256
-test -x /usr/local/sbin/vanillaos-snapdragonx-record-boot-evidence
-test -x /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+test -x /usr/libexec/vanillaos-snapdragonx/record-boot-evidence
+test -x /usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics
 test -f /etc/systemd/system/vanillaos-snapdragonx-boot-evidence.service
 test -L /etc/systemd/system/multi-user.target.wants/vanillaos-snapdragonx-boot-evidence.service
 
@@ -5417,7 +3365,7 @@ for core_firmware in \
   test -s "$core_firmware"
 done
 
-# The official custom-image cleanup locks the package layer before FsGuard.
+# The official custom-image cleanup locks the package layer before final image verification.
 # Do not require apt, dpkg, or dpkg-query in the finished immutable image.
 # Protect the graphical desktop by checking the actual runtime executables.
 test -x /usr/bin/gnome-shell
@@ -5555,8 +3503,15 @@ for hook in pre-init-hook init-hook; do
   }
 done
 
+vso_service=/usr/lib/systemd/user/apx-vso-native.service
+test -f "$vso_service" && test ! -L "$vso_service" || {
+  echo "Reunion managed VSO user service is absent or not a regular file: $vso_service" >&2
+  exit 1
+}
+
 printf 'REUNION-COHERENCE: distrobox=%s\n' "$distrobox_version"
 printf 'REUNION-COHERENCE: vso-native=present\n'
+printf 'REUNION-COHERENCE: vso-instance=apx-vso-native\n'
 printf 'REUNION-COHERENCE: vso-hooks=pre-init-hook,init-hook\n'
 printf 'REUNION-COHERENCE: distrobox-path=/usr/bin/distrobox\n'
 
@@ -5605,23 +3560,12 @@ while IFS=$'\t' read -r package requested_version architecture; do
     }
 done < "$expected_package_file"
 
-test -s /root/custom-kernel-packages/PACKAGE-SELECTION.tsv
-test -s /root/custom-kernel-packages/README.txt
-actual_archive_count="$(
-  find /root/custom-kernel-packages -maxdepth 1 -type f -name '*.deb' |
-    wc -l |
-    tr -d '[:space:]'
-)"
-[[ "$actual_archive_count" == "$expected_archive_count" ]] || {
-  echo "Archived package count mismatch: expected=$expected_archive_count actual=$actual_archive_count" >&2
-  exit 1
-}
 
 if [[ -n "$firmware_probe" ]]; then
   test -s "/usr/lib/firmware/$firmware_probe" || test -s "/lib/firmware/$firmware_probe"
 fi
 if [[ -n "$root_probe" ]]; then
-  test -e "/root/$root_probe"
+  test -e "/usr/lib/vanillaos-snapdragonx/root-source-overlay/$root_probe"
 fi
 
 if command -v dpkg-query >/dev/null 2>&1; then
@@ -5637,7 +3581,7 @@ VERIFY_OCI_EOF
     -v "$expected_packages:/expected-target-packages.tsv:ro" \
     --entrypoint /bin/bash "$TARGET_IMAGE_REF" \
     /verify-target-oci.sh "$KERNEL_RELEASE" "$DTB_NAME" "$ABROOT_IMAGE_NAME" \
-    "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL" "${#KERNEL_DEBS[@]}" \
+    "$FIRMWARE_PROBE_REL" "$ROOT_PROBE_REL" \
     /expected-target-packages.tsv "$PROFILE"
 
   # Export the exact receipt from the verified image into release evidence.
@@ -5660,7 +3604,7 @@ VERIFY_OCI_EOF
 
   local verify_target_log="$LOG_DIR/${SESSION_ID}-verify-target-oci.log"
   grep '^REUNION-COHERENCE:' "$verify_target_log" > "$TARGET_USERLAND_COHERENCE_REPORT" ||     die "Target verification did not emit Reunion userland coherence evidence."
-  [[ "$(wc -l < "$TARGET_USERLAND_COHERENCE_REPORT")" -ge 4 ]] ||     die "Target userland coherence report is incomplete."
+  [[ "$(wc -l < "$TARGET_USERLAND_COHERENCE_REPORT")" -ge 5 ]] ||     die "Target userland coherence report is incomplete."
   cp -a "$TARGET_USERLAND_COHERENCE_REPORT" "$RELEASE_DIR/target-userland-coherence.txt"
   [[ -s "$TARGET_BASE_INSPECT_JSON" ]] && cp -a "$TARGET_BASE_INSPECT_JSON" "$RELEASE_DIR/target-base-inspect.json"
 
@@ -6384,6 +4328,16 @@ validate_upstream_reunion_arm64_live_source() {
   LIVE_PACKAGE_CANDIDATE_REPORT=""
 
   hash_directory_tree "$source_dir" > "$TMP_ROOT/upstream-package-lists.original.before.sha256"
+  {
+    printf 'Vanilla OS 3 Reunion architecture-name audit\n'
+    printf 'Target image: %s\n' "$CUSTOM_IMAGE_BASE"
+    printf 'Live builder: %s\n' "$LIVE_ISO_CONTAINER_IMAGE"
+    printf 'ARM64 package tokens verified in upstream package lists:\n'
+    printf '  grub-efi-arm64\n  grub-efi-arm64-bin\n  grub-efi-arm64-signed\n  shim-helpers-arm64-signed\n'
+    printf 'AMD64 alternatives verified as architecture-guarded, not projected into canonical ARM64 policy.\n'
+    printf 'Kernel intake remains Debian-control/payload-semantic and independent of input filename.\n'
+    printf 'Firmware package intake remains Debian-control metadata based and independent of input filename.\n'
+  } > "$REUNION_ARCHITECTURE_NAME_AUDIT"
   ok "Current Reunion native ARM64 live-source contract validated."
   info "Upstream package-list suffix: $source_suffix"
 }
@@ -6497,7 +4451,6 @@ build_arm64_live_iso() {
   verify_arm64_graphical_iso
 }
 
-
 extract_iso_file() {
   local iso="$1" iso_path="$2" destination="$3"
   rm -f "$destination"
@@ -6549,7 +4502,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r4.
+# Managed by VanillaOS-SnapdragonX v8.5-r5.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -6623,7 +4576,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r4-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r5-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
@@ -7321,9 +5274,9 @@ PY_VALIDATE_REGISTRY_SERVER
 
 write_installer_storage_guard() {
   local root="$1"
-  local guard="$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard"
-  local validator="$root/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage"
-  local wrapper="$root/usr/local/sbin/albius"
+  local guard="$root/usr/libexec/vanillaos-snapdragonx/storage-guard"
+  local validator="$root/usr/libexec/vanillaos-snapdragonx/validate-installed-storage"
+  local wrapper="$root/usr/libexec/vanillaos-snapdragonx/guarded-albius"
   local real_albius=""
   local candidate
 
@@ -7373,7 +5326,7 @@ DEFAULT_GENERATED_EVIDENCE = Path(
     "/tmp/vanillaos-snapdragonx-albius-install-recipe.generated.json"
 )
 DEFAULT_REPORT = Path("/tmp/vanillaos-snapdragonx-storage-guard.json")
-DEFAULT_VALIDATOR = "/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage"
+DEFAULT_VALIDATOR = "/usr/libexec/vanillaos-snapdragonx/validate-installed-storage"
 
 
 class GuardError(RuntimeError):
@@ -8212,8 +6165,8 @@ SH_STORAGE_VALIDATOR
 # VANILLAOS_SNAPDRAGONX_ALBIUS_STORAGE_GUARD
 set -Eeuo pipefail
 real_albius=$(printf '%q' "$real_albius")
-guard=/usr/local/libexec/vanillaos-snapdragonx-storage-guard
-validator=/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage
+guard=/usr/libexec/vanillaos-snapdragonx/storage-guard
+validator=/usr/libexec/vanillaos-snapdragonx/validate-installed-storage
 policy=$(printf '%q' "$INSTALLER_STORAGE_GUARD_POLICY")
 
 [[ \$# -ge 1 ]] || {
@@ -8434,7 +6387,7 @@ move_anchor = '''                "update-initramfs -c -k all",
 '''
 move_replacement = '''                "update-initramfs -c -k all",
                 "mv /boot/config* /boot/initrd.img* /boot/System.map* /boot/vmlinuz* /boot/init/vos-a",
-                "/usr/local/sbin/vanillaos-snapdragonx-verify-installed-boot",
+                "/usr/libexec/vanillaos-snapdragonx/verify-installed-boot",
 '''
 if move_anchor not in data:
     raise SystemExit("unable to locate installed-initramfs validation anchor")
@@ -8513,7 +6466,7 @@ spawn_replacement = '''        # VANILLAOS_SNAPDRAGONX_V8_ALBIUS_LOG_CAPTURE
             'install -d -m 0755 "$(dirname "$log_path")"; '
             'printf "%s\\\\n" "# Vanilla Installer Log" '
             '"Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$log_path"; '
-            '/usr/local/sbin/albius "$1" 2>&1 | tee -a "$log_path"'
+            '/usr/libexec/vanillaos-snapdragonx/guarded-albius "$1" 2>&1 | tee -a "$log_path"'
         )
         self.__terminal.spawn_async(
             Vte.PtyFlags.DEFAULT,
@@ -8573,7 +6526,7 @@ PATCH_INSTALLER_COMPONENTS
     die "Patched installer processor lacks redacted generated-recipe evidence."
   grep -Fq "VANILLAOS_SNAPDRAGONX_V8_ALBIUS_LOG_CAPTURE" "$progress" || \
     die "Patched installer progress view lacks Albius log capture."
-  grep -Fq "/usr/local/sbin/albius" "$progress" || \
+  grep -Fq "/usr/libexec/vanillaos-snapdragonx/guarded-albius" "$progress" || \
     die "Patched installer progress view bypasses the external storage guard."
 
   ok "Patched Vanilla Installer processor and VTE logging for profile installation."
@@ -8583,15 +6536,15 @@ install_profile_aware_installer_overlay() {
   local recipe_source="$root/etc/vanilla-installer/recipe.json"
   local profile_dir="$root/etc/vanilla-installer/profiles/$PROFILE"
   local recipe_target="$profile_dir/recipe.json"
-  local wrapper="$root/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE"
+  local wrapper="$root/usr/libexec/vanillaos-snapdragonx/installer-$PROFILE"
   local installer_dispatch="$root/usr/bin/vanilla-installer"
   local installer_real="$root/usr/libexec/vanilla-installer.real"
-  local registry_server="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry.py"
-  local registry_service_launcher="$root/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE"
+  local registry_server="$root/usr/libexec/vanillaos-snapdragonx/oci-registry.py"
+  local registry_service_launcher="$root/usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE"
   local registry_unit_name="vanillaos-snapdragonx-oci-registry.service"
   local registry_unit="$root/etc/systemd/system/$registry_unit_name"
   local registry_wants="$root/etc/systemd/system/multi-user.target.wants/$registry_unit_name"
-  local collector="$root/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics"
+  local collector="$root/usr/libexec/vanillaos-snapdragonx/collect-installer-diagnostics"
   local upstream_autostart="$root/home/vanilla/.config/autostart/org.vanillaos.Installer.desktop"
   local fallback_autostart="$root/etc/xdg/autostart/vanillaos-snapdragonx-installer-$PROFILE.desktop"
   local autostart_evidence="$root/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/installer-autostart-path"
@@ -8600,8 +6553,7 @@ install_profile_aware_installer_overlay() {
   [[ -s "$recipe_source" ]] || \
     die "Live filesystem lacks Vanilla Installer recipe.json."
 
-  mkdir -p "$profile_dir" "$root/usr/local/libexec" \
-    "$root/usr/local/sbin" \
+  mkdir -p "$profile_dir" "$root/usr/libexec/vanillaos-snapdragonx" \
     "$root/etc/xdg/autostart" "$root/usr/share/applications" \
     "$root/etc/containers/registries.conf.d" \
     "$root/etc/systemd/system/multi-user.target.wants" \
@@ -8701,7 +6653,7 @@ done
 layout="$medium/${layout_path#/}"
 printf 'Embedded OCI medium: %s\n' "$medium"
 printf 'Embedded OCI layout: %s\n' "$layout"
-exec /usr/bin/python3 /usr/local/libexec/vanillaos-snapdragonx-oci-registry.py \
+exec /usr/bin/python3 /usr/libexec/vanillaos-snapdragonx/oci-registry.py \
   --layout "$layout" --tag "$tag" --repository "$repository" \
   --host "$host" --port "$port"
 EOF_REGISTRY_SERVICE_RUNTIME
@@ -8716,7 +6668,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=vanilla
-ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE
+ExecStart=/usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE
 Restart=always
 RestartSec=1
 KillMode=control-group
@@ -8922,7 +6874,7 @@ EOF_INSTALLER_WRAPPER_END
 # All live installer entrypoints must traverse the profile wrapper so the
 # embedded OCI registry bridge is active before Vanilla Installer resolves its
 # canonical ISO-local recipe.
-exec /usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE "\$@"
+exec /usr/libexec/vanillaos-snapdragonx/installer-$PROFILE "\$@"
 EOF_INSTALLER_DISPATCH
   chmod 0755 "$installer_dispatch"
 
@@ -8956,7 +6908,7 @@ copy_if_present /etc/vanilla-installer/recipe.json installer-recipe-canonical.js
 copy_if_present /etc/vanilla-installer/profiles/$profile/recipe.json installer-recipe-profile.json
 copy_if_present /etc/vanilla-installer/profiles/$profile/recipe.upstream.json installer-recipe-upstream.json
 copy_if_present /usr/bin/vanilla-installer installer-dispatch
-copy_if_present /usr/local/libexec/vanillaos-snapdragonx-installer-$profile installer-wrapper
+copy_if_present /usr/libexec/vanillaos-snapdragonx/installer-$profile installer-wrapper
 copy_if_present /tmp/vanillaos-snapdragonx-storage-guard.json
 copy_if_present /tmp/vanillaos-snapdragonx-installed-storage-validation.txt
 copy_if_present /etc/containers/registries.conf.d/90-vanillaos-snapdragonx-local.conf
@@ -9138,7 +7090,7 @@ EOF_INSTALLER_DESKTOP
       die "ISO-local OCI registry systemd service was not installed/enabled."
     grep -Fq 'VANILLAOS_SNAPDRAGONX_OCI_REGISTRY_SERVICE_V1' "$registry_service_launcher" || \
       die "OCI registry service launcher lacks its ownership marker."
-    grep -Fq "ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" "$registry_unit" || \
+    grep -Fq "ExecStart=/usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE" "$registry_unit" || \
       die "OCI registry systemd service targets the wrong profile launcher."
     grep -Fq 'VANILLAOS_SNAPDRAGONX_REGISTRY_SERVICE_CLIENT_V1' "$wrapper" || \
       die "Installer wrapper does not consume the systemd-owned OCI bridge."
@@ -9164,7 +7116,7 @@ EOF_INSTALLER_DESKTOP
       "$(sha256sum "$installer_real" | awk '{print $1}')"
     if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
       printf 'local-oci-registry-service-launcher\t%s\tnot-applicable\t%s\tgenerated-supervised-bridge\n' \
-        "/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+        "/usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE" \
         "$(sha256sum "$registry_service_launcher" | awk '{print $1}')"
       printf 'local-oci-registry-systemd-unit\t%s\tnot-applicable\t%s\tgenerated-supervised-bridge\n' \
         "/etc/systemd/system/$registry_unit_name" \
@@ -9174,14 +7126,14 @@ EOF_INSTALLER_DESKTOP
       "/usr/share/vanillaos-snapdragonx/profiles/$PROFILE/installer-autostart-path" \
       "$(sha256sum "$autostart_evidence" | awk '{print $1}')"
     printf 'external-storage-guard\t%s\tnot-applicable\t%s\tgenerated\n' \
-      "/usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
-      "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-storage-guard" | awk '{print $1}')"
+      "/usr/libexec/vanillaos-snapdragonx/storage-guard" \
+      "$(sha256sum "$root/usr/libexec/vanillaos-snapdragonx/storage-guard" | awk '{print $1}')"
     printf 'external-storage-validator\t%s\tnot-applicable\t%s\tgenerated\n' \
-      "/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" \
-      "$(sha256sum "$root/usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" | awk '{print $1}')"
+      "/usr/libexec/vanillaos-snapdragonx/validate-installed-storage" \
+      "$(sha256sum "$root/usr/libexec/vanillaos-snapdragonx/validate-installed-storage" | awk '{print $1}')"
     printf 'guarded-albius-launcher\t%s\tnot-applicable\t%s\tgenerated\n' \
-      "/usr/local/sbin/albius" \
-      "$(sha256sum "$root/usr/local/sbin/albius" | awk '{print $1}')"
+      "/usr/libexec/vanillaos-snapdragonx/guarded-albius" \
+      "$(sha256sum "$root/usr/libexec/vanillaos-snapdragonx/guarded-albius" | awk '{print $1}')"
   } >> "$INSTALLER_PATCH_MANIFEST"
 
   jq -n \
@@ -9206,8 +7158,8 @@ EOF_INSTALLER_DESKTOP
       storage_guard_policy:$storage_guard_policy,
       local_oci_registry_service:"vanillaos-snapdragonx-oci-registry.service",
       local_oci_registry_endpoint:$registry_endpoint,
-      diagnostics_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-installer-diagnostics",
-      installed_hardware_collector:"/usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics",
+      diagnostics_collector:"/usr/libexec/vanillaos-snapdragonx/collect-installer-diagnostics",
+      installed_hardware_collector:"/usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics",
       installed_boot_evidence:"/var/log/vanillaos-snapdragonx/current",
       required_markers:[
         "/usr/lib/vanillaos-snapdragonx-profile",
@@ -9498,7 +7450,7 @@ verify_final_release() {
     "canonical Vanilla Installer dispatch"
   grep -Fq 'VANILLAOS_SNAPDRAGONX_INSTALLER_DISPATCH_V2' "$verify_dir/installer-dispatch" || \
     die "Final ISO /usr/bin/vanilla-installer does not dispatch through the profile wrapper."
-  grep -Fq "/usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" "$verify_dir/installer-dispatch" || \
+  grep -Fq "/usr/libexec/vanillaos-snapdragonx/installer-$PROFILE" "$verify_dir/installer-dispatch" || \
     die "Final ISO installer dispatch targets the wrong profile wrapper."
   extract_required_squashfs_file "$final_squash" \
     "usr/libexec/vanilla-installer.real" \
@@ -9507,12 +7459,12 @@ verify_final_release() {
   [[ -s "$verify_dir/installer-real" ]] || \
     die "Final ISO private real Vanilla Installer entrypoint is empty."
   extract_required_squashfs_file "$final_squash" \
-    "usr/local/libexec/vanillaos-snapdragonx-installer-$PROFILE" \
+    "usr/libexec/vanillaos-snapdragonx/installer-$PROFILE" \
     "$verify_dir/installer-wrapper" \
     "profile installer wrapper"
   if [[ "$DELIVERY_MODE" == "iso-oci" ]]; then
     extract_required_squashfs_file "$final_squash" \
-      "usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+      "usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE" \
       "$verify_dir/registry-service-launcher" \
       "OCI registry service launcher"
     extract_required_squashfs_file "$final_squash" \
@@ -9522,12 +7474,12 @@ verify_final_release() {
     grep -Fq 'VANILLAOS_SNAPDRAGONX_OCI_REGISTRY_SERVICE_V1' \
       "$verify_dir/registry-service-launcher" || \
       die "Final ISO OCI registry service launcher lacks its ownership marker."
-    grep -Fq "ExecStart=/usr/local/libexec/vanillaos-snapdragonx-oci-registry-service-$PROFILE" \
+    grep -Fq "ExecStart=/usr/libexec/vanillaos-snapdragonx/oci-registry-service-$PROFILE" \
       "$verify_dir/registry-service.unit" || \
       die "Final ISO OCI registry unit targets the wrong profile launcher."
     grep -Fq 'Restart=always' "$verify_dir/registry-service.unit" || \
       die "Final ISO OCI registry unit is not configured for supervised restart."
-    # v8.5-r4: reuse the complete squashfs listing captured above instead of
+    # r4-inherited correction: reuse the complete squashfs listing captured above instead of
     # piping a second unsquashfs process into grep -q. With global pipefail,
     # grep -q may exit as soon as it finds the match, causing unsquashfs to
     # receive SIGPIPE and the otherwise-successful pipeline to be reported as
@@ -9582,15 +7534,15 @@ verify_final_release() {
   fi
 
   extract_required_squashfs_file "$final_squash" \
-    "usr/local/libexec/vanillaos-snapdragonx-storage-guard" \
+    "usr/libexec/vanillaos-snapdragonx/storage-guard" \
     "$verify_dir/storage-guard" \
     "external storage guard"
   extract_required_squashfs_file "$final_squash" \
-    "usr/local/libexec/vanillaos-snapdragonx-validate-installed-storage" \
+    "usr/libexec/vanillaos-snapdragonx/validate-installed-storage" \
     "$verify_dir/storage-validator" \
     "installed-storage validator"
   extract_required_squashfs_file "$final_squash" \
-    "usr/local/sbin/albius" \
+    "usr/libexec/vanillaos-snapdragonx/guarded-albius" \
     "$verify_dir/albius-wrapper" \
     "Albius guard launcher"
   grep -Fq "VANILLA_CUSTOM_RECIPE" "$verify_dir/installer-wrapper" || \
@@ -9644,6 +7596,10 @@ verify_final_release() {
   fi
   [[ -n "$SOURCE_PROVENANCE_MANIFEST" && -f "$SOURCE_PROVENANCE_MANIFEST" ]] &&     cp -a "$SOURCE_PROVENANCE_MANIFEST" "$RELEASE_DIR/"
   [[ -n "$REUNION_CONVERGENCE_MANIFEST" && -f "$REUNION_CONVERGENCE_MANIFEST" ]] &&     cp -a "$REUNION_CONVERGENCE_MANIFEST" "$RELEASE_DIR/"
+  [[ -s "$UPSTREAM_OCI_PROVENANCE_JSON" ]] && cp -a "$UPSTREAM_OCI_PROVENANCE_JSON" "$RELEASE_DIR/upstream-oci-provenance.json"
+  [[ -s "$TMP_ROOT/live-builder-inspect.json" ]] && cp -a "$TMP_ROOT/live-builder-inspect.json" "$RELEASE_DIR/live-builder-inspect.json"
+  [[ -s "$TMP_ROOT/vso-native-inspect.json" ]] && cp -a "$TMP_ROOT/vso-native-inspect.json" "$RELEASE_DIR/vso-native-inspect.json"
+  [[ -s "$REUNION_ARCHITECTURE_NAME_AUDIT" ]] && cp -a "$REUNION_ARCHITECTURE_NAME_AUDIT" "$RELEASE_DIR/reunion-architecture-name-audit.txt"
   cp -a "$TMP_ROOT/upstream-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/upstream-remove-manifest.sha256" "$RELEASE_DIR/"
   cp -a "$TMP_ROOT/debian-package-inventory.tsv" "$RELEASE_DIR/"
@@ -9678,8 +7634,6 @@ verify_final_release() {
   cp -a "$TMP_ROOT/deb-listings/." "$RELEASE_DIR/deb-listings/"
   [[ -f "$TMP_ROOT/vib-plugin-inventory.txt" ]] && cp -a "$TMP_ROOT/vib-plugin-inventory.txt" "$RELEASE_DIR/"
   [[ -f "$TMP_ROOT/vib-plugin-checksums.sha256" ]] && cp -a "$TMP_ROOT/vib-plugin-checksums.sha256" "$RELEASE_DIR/"
-  [[ -n "$FSGUARD_PLUGIN_RELEASE_METADATA" && -f "$FSGUARD_PLUGIN_RELEASE_METADATA" ]] && \
-    cp -a "$FSGUARD_PLUGIN_RELEASE_METADATA" "$RELEASE_DIR/"
   printf '%s\n' "$CUSTOM_SOURCE_COMMIT" > "$RELEASE_DIR/custom-image-source.commit"
   printf '%s\n' "$LIVE_SOURCE_COMMIT" > "$RELEASE_DIR/live-iso-source.commit"
 
@@ -9691,6 +7645,7 @@ Manifest digest:          $TARGET_IMAGE_MANIFEST_DIGEST
 Storage hook evidence:    target-storage-hook-evidence.json
 ABRoot image name:        $ABROOT_IMAGE_NAME
 Upstream base image:      $CUSTOM_IMAGE_BASE
+Upstream base digest:     $(jq -r '.inputs[] | select(.role == "target-base") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")
 Local target build ref:   $TARGET_IMAGE_REF
 ABRoot logical identity:  $ABROOT_IMAGE_NAME
 ABRoot future locator:    $(jq -r '[(.registry // ""),(.name // ""),(.tag // "")] | join(" / ")' "$TARGET_ABROOT_CONFIG_EVIDENCE")
@@ -9707,7 +7662,7 @@ Firmware package lock:   firmware-provenance/firmware-package-lock.json
 Firmware packages:       $(jq 'length' "$FIRMWARE_PACKAGES_RESOLVED_FILE")
 Firmware required paths: ${PROFILE_FIRMWARE_PROBES[*]:-none}
 Board-data policy:       $FIRMWARE_BOARD_POLICY
-Hardware diagnostics:    /usr/local/sbin/vanillaos-snapdragonx-collect-hardware-diagnostics
+Hardware diagnostics:    /usr/libexec/vanillaos-snapdragonx/collect-hardware-diagnostics
 Boot evidence:           /var/log/vanillaos-snapdragonx/current
 Installer delivery:       $DELIVERY_MODE
 Storage guard policy:     $INSTALLER_STORAGE_GUARD_POLICY
@@ -9719,7 +7674,7 @@ Installer image source:   $INSTALLER_DEFAULT_IMAGE_REF
 Physical bridge endpoint: http://$(local_registry_physical_prefix)
 Installer transcript:     /etc/vanilla/installer.log
 Persistent Albius recipe: /tmp/vanillaos-snapdragonx-albius-install-recipe.json
-Root payload migration:   OCI /home,/mnt,/root,/srv -> installed /var paths
+Root payload policy:      no project archive under /root; ABRoot /root symlink topology retained
 ISO OCI layout:           $ISO_IMAGE_LAYOUT_PATH
 Registry fallback:        ${REGISTRY_IMAGE_REF:-none}
 Built:                    $(date -u --iso-8601=seconds)
@@ -9745,7 +7700,7 @@ Kernel closure record:       kernel-package-closure.json
 Supplied unique .debs:       ${#KERNEL_DEBS[@]}
 Target-installed closure:    ${#TARGET_KERNEL_DEBS[@]}
 Target-excluded .debs:       ${#TARGET_EXCLUDED_KERNEL_DEBS[@]}
-Target archive location:     /root/custom-kernel-packages
+Target package archive:      retired in r5; release evidence only
 Installed package receipt:   /usr/lib/vanillaos-snapdragonx/target-installed-kernel-packages.tsv
 Runtime dpkg-query required: no
 Live extraction closure:     ${#LIVE_KERNEL_DEBS[@]}
@@ -9758,7 +7713,7 @@ Firmware required paths:     ${PROFILE_FIRMWARE_PROBES[*]:-none}
 Firmware board-data policy:  $FIRMWARE_BOARD_POLICY
 Kernel command additions:    ${PROFILE_KERNEL_CMDLINE_APPEND[*]:-none}
 Firmware provenance:         firmware-provenance/
-Target /root source:         ${ROOT_SOURCE:-none}
+Legacy root-source input:    ${ROOT_SOURCE:-none} (immutable /usr/lib reference payload)
 Target OCI:                  $TARGET_IMAGE_REF
 Target OCI manifest digest:  $TARGET_IMAGE_MANIFEST_DIGEST
 Target storage hook evidence: target-storage-hook-evidence.json
@@ -9774,8 +7729,15 @@ Logical registry reference:  $LOCAL_INSTALL_IMAGE_REF
 Physical registry bridge:      $LOCAL_REGISTRY_HOST:$LOCAL_REGISTRY_PORT
 Registry fallback:           ${REGISTRY_IMAGE_REF:-none}
 Target OCI base:             $CUSTOM_IMAGE_BASE
+Target base digest:          $(jq -r '.inputs[] | select(.role == "target-base") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")
+Live builder image:          $LIVE_ISO_CONTAINER_IMAGE
+Live builder digest:         $(jq -r '.inputs[] | select(.role == "live-builder") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")
+VSO native image:            $VSO_NATIVE_IMAGE
+VSO native digest:           $(jq -r '.inputs[] | select(.role == "vso-native") | .resolved_digest' "$UPSTREAM_OCI_PROVENANCE_JSON")
+VSO managed instance:        $VSO_NATIVE_INSTANCE
+VSO upstream base contract:  $VSO_NATIVE_UPSTREAM_BASE
 Vib version:                 $VIB_DETECTED_VERSION
-FsGuard plugin:              $FSGUARD_PLUGIN_REPO @ $FSGUARD_PLUGIN_RESOLVED_TAG
+FsGuard:                     absent by stable Reunion design
 custom-image source ref:     $CUSTOM_IMAGE_REF
 custom-image source commit:  $CUSTOM_SOURCE_COMMIT
 custom-image commit date:    $(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE")
