@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r5.1
+# Version 8.5-r5.2
 #
-# v8.5-r5.1 Stage-1 dispatcher restoration
-# --------------------------------------------
+# v8.5-r5.2 preflight status-safety correction
+# ---------------------------------------------
 # Corrective point revision to the v8.5-r5 stable-Reunion convergence milestone.
-# The delivered r5 transformation inadvertently omitted print_builder_banner()
-# and configure_repository_interactively(), even though main() still invoked the
-# latter at Stage 1. The omission caused an immediate exit 127 before any source
-# synchronization, host dependency installation, firmware staging, OCI build, or
-# ISO build. r5.1 restores the exact accepted r4 Stage-1 wrapper semantics:
-# print the builder banner, then invoke choose_repo_policy(). No Reunion, hardware,
-# storage, Installer, OCI, firmware, kernel, GDM, or live-ISO behavior is changed.
-# r5.1 also adds a pure-Bash internal Stage 1-13 function-contract gate before
-# profile discovery so a future structurally incomplete artifact fails explicitly.
+# r5.1 restored the Stage-1 repository-policy dispatcher omitted from the initial
+# r5 artifact. Field preflight then exposed a second generation defect at Stage 3:
+# report_source_provenance() used false stale-age predicates as its final command,
+# so fresh source checkouts returned status 1 under global set -e. r5.2 rewrites
+# those informational warnings as explicit if-blocks and returns success after
+# reporting. No source-selection, Reunion, hardware, storage, Installer, OCI,
+# firmware, kernel, GDM, GRUB, or live-ISO build semantics are otherwise changed.
+# The r5.1 Stage 1-13 internal function-contract gate is retained unchanged.
 #
 # ==== MILESTONE ==============================================================
 # v8.5-r5 — Vanilla OS 3.0 "Reunion" stable-release convergence
@@ -68,7 +67,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r5.1"
+SCRIPT_VERSION="8.5-r5.2"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -2332,7 +2331,7 @@ write_reunion_convergence_manifest() {
   {
     printf 'component\tselection\tbasis\n'
     printf 'milestone\tv8.5-r5\tformal Vanilla OS 3 Reunion stable-release convergence\n'
-    printf 'corrective_revision\tv8.5-r5.1\trestore Stage-1 repository-policy dispatcher omitted from r5 artifact\n'
+    printf 'corrective_revision\tv8.5-r5.2\trestore Stage-1 dispatcher and make fresh source-age reporting status-safe under set -e\n'
     printf 'live-iso-ref\t%s@%s\tupstream branch identifier; content codename=%s version=%s\n' "$LIVE_ISO_REF" "$LIVE_SOURCE_COMMIT" "$live_codename" "$live_version"
     printf 'live-package-lists\t%s\tupstream PACKAGE_LISTS_SUFFIX\n' "$live_suffix"
     printf 'live-package-policy\t%s\tupstream-native is canonical; r4.1 projection retained only for compatibility\n' "$LIVE_ARM64_PACKAGE_POLICY"
@@ -2357,10 +2356,25 @@ write_reunion_convergence_manifest() {
 }
 
 report_source_provenance() {
-  local custom_age live_age; custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"; live_age="$(repo_commit_age_days "$LIVE_ISO_SOURCE")"
-  info "Source-reference strategy:"; info "  custom-image: ref=$CUSTOM_IMAGE_REF kind=$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF") commit=$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE") age=${custom_age}d tags=$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")"; info "  live-iso: ref=$LIVE_ISO_REF kind=$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF") commit=$(git -C "$LIVE_ISO_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$LIVE_ISO_SOURCE") age=${live_age}d tags=$(repo_exact_tags "$LIVE_ISO_SOURCE")"; info "  target base: $CUSTOM_IMAGE_BASE"; info "  live builder: $LIVE_ISO_CONTAINER_IMAGE"
-  [[ "$live_age" =~ ^[0-9]+$ ]] && (( live_age > SOURCE_STALE_WARN_DAYS )) && warn "live-iso is older than ${SOURCE_STALE_WARN_DAYS} days."
-  [[ "$custom_age" =~ ^[0-9]+$ ]] && (( custom_age > SOURCE_STALE_WARN_DAYS )) && warn "custom-image is older than ${SOURCE_STALE_WARN_DAYS} days."
+  local custom_age live_age
+  custom_age="$(repo_commit_age_days "$CUSTOM_IMAGE_SOURCE")"
+  live_age="$(repo_commit_age_days "$LIVE_ISO_SOURCE")"
+
+  info "Source-reference strategy:"
+  info "  custom-image: ref=$CUSTOM_IMAGE_REF kind=$(repo_ref_kind "$CUSTOM_IMAGE_SOURCE" "$CUSTOM_IMAGE_REF") commit=$(git -C "$CUSTOM_IMAGE_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$CUSTOM_IMAGE_SOURCE") age=${custom_age}d tags=$(repo_exact_tags "$CUSTOM_IMAGE_SOURCE")"
+  info "  live-iso: ref=$LIVE_ISO_REF kind=$(repo_ref_kind "$LIVE_ISO_SOURCE" "$LIVE_ISO_REF") commit=$(git -C "$LIVE_ISO_SOURCE" rev-parse --short HEAD) date=$(repo_commit_iso_date "$LIVE_ISO_SOURCE") age=${live_age}d tags=$(repo_exact_tags "$LIVE_ISO_SOURCE")"
+  info "  target base: $CUSTOM_IMAGE_BASE"
+  info "  live builder: $LIVE_ISO_CONTAINER_IMAGE"
+
+  # Fresh source checkouts are the normal success case.  Do not let a false
+  # stale-age predicate become the function status under global `set -e`.
+  if [[ "$live_age" =~ ^[0-9]+$ ]] && (( live_age > SOURCE_STALE_WARN_DAYS )); then
+    warn "live-iso is older than ${SOURCE_STALE_WARN_DAYS} days."
+  fi
+  if [[ "$custom_age" =~ ^[0-9]+$ ]] && (( custom_age > SOURCE_STALE_WARN_DAYS )); then
+    warn "custom-image is older than ${SOURCE_STALE_WARN_DAYS} days."
+  fi
+  return 0
 }
 
 repo_action_menu() {
@@ -4540,7 +4554,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r5.1.
+# Managed by VanillaOS-SnapdragonX v8.5-r5.2.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -4614,7 +4628,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r5.1-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r5.2-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
