@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # VanillaOS-SnapdragonX ARM64 Builder
-# Version 8.5-r5
+# Version 8.5-r5.1
+#
+# v8.5-r5.1 Stage-1 dispatcher restoration
+# --------------------------------------------
+# Corrective point revision to the v8.5-r5 stable-Reunion convergence milestone.
+# The delivered r5 transformation inadvertently omitted print_builder_banner()
+# and configure_repository_interactively(), even though main() still invoked the
+# latter at Stage 1. The omission caused an immediate exit 127 before any source
+# synchronization, host dependency installation, firmware staging, OCI build, or
+# ISO build. r5.1 restores the exact accepted r4 Stage-1 wrapper semantics:
+# print the builder banner, then invoke choose_repo_policy(). No Reunion, hardware,
+# storage, Installer, OCI, firmware, kernel, GDM, or live-ISO behavior is changed.
+# r5.1 also adds a pure-Bash internal Stage 1-13 function-contract gate before
+# profile discovery so a future structurally incomplete artifact fails explicitly.
 #
 # ==== MILESTONE ==============================================================
 # v8.5-r5 — Vanilla OS 3.0 "Reunion" stable-release convergence
@@ -55,7 +68,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SCRIPT_VERSION="8.5-r5"
+SCRIPT_VERSION="8.5-r5.1"
 
 # Resolve the real script location before any path defaults are constructed.
 # This deliberately does not depend on PWD, HOME, or the account selected by
@@ -1755,6 +1768,30 @@ choose_target_image() {
   [[ "$ABROOT_IMAGE_NAME" == */* ]] || warn "ABROOT_IMAGE_NAME normally has owner/image form: $ABROOT_IMAGE_NAME"
 }
 
+print_builder_banner() {
+  cat >&2 <<EOF
+
+${C_BOLD}VanillaOS-SnapdragonX ARM64 Container-Model Builder${C_RESET}
+Version: $SCRIPT_VERSION
+
+Work directory:   $WORKDIR
+Profile:          $PROFILE ($PROFILE_DISPLAY_NAME)
+Profile source:   $PROFILE_FILE_SOURCE
+Profile normalized:$PROFILE_FILE_RESOLVED
+Artifact default: $ARTIFACT_DIR
+Sources:          $SOURCES_DIR
+
+v$SCRIPT_VERSION applies the selected Git source action before the remaining
+artifact, firmware, target-image, and build-confirmation questions. --execute
+does not suppress interactive questions.
+EOF
+}
+
+configure_repository_interactively() {
+  print_builder_banner
+  choose_repo_policy
+}
+
 choose_installer_delivery() {
   if is_interactive; then
     local choice default_choice=1
@@ -2295,6 +2332,7 @@ write_reunion_convergence_manifest() {
   {
     printf 'component\tselection\tbasis\n'
     printf 'milestone\tv8.5-r5\tformal Vanilla OS 3 Reunion stable-release convergence\n'
+    printf 'corrective_revision\tv8.5-r5.1\trestore Stage-1 repository-policy dispatcher omitted from r5 artifact\n'
     printf 'live-iso-ref\t%s@%s\tupstream branch identifier; content codename=%s version=%s\n' "$LIVE_ISO_REF" "$LIVE_SOURCE_COMMIT" "$live_codename" "$live_version"
     printf 'live-package-lists\t%s\tupstream PACKAGE_LISTS_SUFFIX\n' "$live_suffix"
     printf 'live-package-policy\t%s\tupstream-native is canonical; r4.1 projection retained only for compatibility\n' "$LIVE_ARM64_PACKAGE_POLICY"
@@ -4502,7 +4540,7 @@ configure_live_gdm_timed_login() {
 
   mkdir -p "$(dirname "$live_config")"
   cat > "$live_config" <<'LIVE_CONFIG_EOF'
-# Managed by VanillaOS-SnapdragonX v8.5-r5.
+# Managed by VanillaOS-SnapdragonX v8.5-r5.1.
 # Keep Debian live-config responsible for the live user, but prevent its gdm3
 # component from racing the explicit GDM timed-login policy below.
 LIVE_CONFIG_NOCOMPONENTS="gdm3"
@@ -4576,7 +4614,7 @@ else:
 
 result = "".join(lines)
 st = path.stat()
-fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r5-", dir=str(path.parent))
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.v8.5-r5.1-", dir=str(path.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(result)
@@ -7777,9 +7815,60 @@ EOF_MANIFEST
   ok "Both live package manifests remained byte-identical."
 }
 
+# Fail closed if artifact generation ever omits a main-stage internal driver.
+# This is intentionally pure Bash and runs before profile discovery or any host
+# mutation so a structurally incomplete harness cannot enter Stage 1.
+validate_internal_stage_driver_contract() {
+  local fn
+  local -a required=(
+    preparse_profile_args
+    recompute_paths
+    require_root
+    setup_directories
+    load_hardware_profile
+    parse_args
+    normalize_live_arm64_package_policy
+    validate_live_gdm_timed_login_settings
+    write_resolved_profile
+    setup_logging
+    stage
+    configure_repository_interactively
+    print_builder_banner
+    choose_repo_policy
+    install_host_dependencies_safely
+    check_free_space
+    report_repository_plan_state
+    sync_required_repositories
+    configure_build_inputs_interactively
+    resolve_firmware_packages
+    discover_kernel_and_dtb_inputs
+    print_plan
+    confirm_or_abort
+    reserve_release_id
+    stage_firmware
+    prepare_custom_image_worktree
+    install_vib_and_plugins
+    prepare_custom_image_project
+    build_target_oci
+    export_target_oci_for_installer
+    prepare_arm64_live_worktree
+    build_arm64_live_iso
+    remaster_boot_hardware_only
+    verify_final_release
+  )
+
+  for fn in "${required[@]}"; do
+    if ! declare -F "$fn" >/dev/null; then
+      printf 'FAIL Internal harness function contract is incomplete: %s is undefined.\n' "$fn" >&2
+      return 127
+    fi
+  done
+}
+
 # ------------------------------- main -----------------------------------
 
 main() {
+  validate_internal_stage_driver_contract
   preparse_profile_args "$@"
   recompute_paths
   require_root
